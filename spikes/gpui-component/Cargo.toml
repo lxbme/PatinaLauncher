@@ -1,7 +1,7 @@
 [package]
 name = "gpui-component-spike"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 # Mirrors crypto_pro: gpui-kit 0.8 (-> gpui-component 0.8.0) + gpui-pre =0.3.9.
@@ -13,7 +13,7 @@ gpui = { package = "gpui-pre", version = "=0.3.9" }
 
 [[bin]]
 name = "component"
-path = "src/bin/component.rs"
+path = "src/main.rs"
 
 [profile.dev]
 opt-level = 1
