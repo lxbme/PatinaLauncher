@@ -1,0 +1,14 @@
+[package]
+name = "gpui-bare-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+gpui = "0.2.2"
+
+[[bin]]
+name = "bare"
+path = "src/bin/bare.rs"
