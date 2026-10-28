@@ -6,5 +6,6 @@ pub mod jvm;
 pub mod meta;
 pub mod paths;
 pub mod platform;
+pub mod prepare;
 pub mod resolve;
 pub mod launch;

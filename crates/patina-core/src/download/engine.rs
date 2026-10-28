@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::{StreamExt, TryStreamExt};
@@ -36,6 +37,7 @@ pub struct Downloader {
     concurrency: usize,
     attempts: u32,
     base_delay: Duration,
+    fallbacks: AtomicUsize,
 }
 
 /// SHA-1 of a file as lowercase hex.
@@ -68,6 +70,7 @@ impl Downloader {
             concurrency: 16,
             attempts: 3,
             base_delay: Duration::from_millis(300),
+            fallbacks: AtomicUsize::new(0),
         }
     }
 
@@ -88,6 +91,11 @@ impl Downloader {
 
     pub fn client(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    /// Fetches that failed on the mirror and succeeded on the official URL.
+    pub fn fallback_count(&self) -> usize {
+        self.fallbacks.load(Ordering::Relaxed)
     }
 
     pub async fn run(
@@ -184,10 +192,15 @@ impl Downloader {
             candidates.push(url.to_string());
         }
         let mut last = String::from("no attempt made");
-        for cand in &candidates {
+        for (i, cand) in candidates.iter().enumerate() {
             for n in 1..=self.attempts {
                 match self.attempt(cand, sha1, size, part).await {
-                    Ok(bytes) => return Ok(bytes),
+                    Ok(bytes) => {
+                        if i > 0 {
+                            self.fallbacks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(bytes);
+                    }
                     Err(e) => {
                         if let Some(p) = part {
                             let _ = tokio::fs::remove_file(p).await;
@@ -352,8 +365,10 @@ mod tests {
         let (d, orig) = setup(&server);
         let dir = tempfile::tempdir().unwrap();
         let j = job(&orig, dir.path());
+        assert_eq!(d.fallback_count(), 0);
         d.run(vec![j.clone()], None).await.unwrap();
         assert_eq!(std::fs::read(&j.dest).unwrap(), b"hello");
+        assert_eq!(d.fallback_count(), 1);
     }
 
     #[tokio::test]
