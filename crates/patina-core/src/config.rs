@@ -1,6 +1,6 @@
 //! Global configuration (`config.toml`).
 
-use crate::jvm::GcPreset;
+use crate::jvm::{default_max_mem_mib, GcPreset};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -54,6 +54,13 @@ impl Default for JavaSettings {
             extra_jvm_args: String::new(),
             low_mem_warning: true,
         }
+    }
+}
+
+impl JavaSettings {
+    /// Explicit `max_mem_mib` wins; otherwise derive from physical memory.
+    pub fn effective_max_mem(&self, total_mib: u64) -> u32 {
+        self.max_mem_mib.unwrap_or_else(|| default_max_mem_mib(total_mib))
     }
 }
 
@@ -120,6 +127,14 @@ mod tests {
         assert_eq!(c.java.max_mem_mib, Some(2048));
         assert_eq!(c.java.min_mem_mib, 512);
         assert!(c.java.low_mem_warning);
+    }
+
+    #[test]
+    fn effective_max_mem_explicit_wins_else_default() {
+        let mut j = JavaSettings::default();
+        assert_eq!(j.effective_max_mem(4096), 2730);
+        j.max_mem_mib = Some(1024);
+        assert_eq!(j.effective_max_mem(32768), 1024);
     }
 
     #[test]
