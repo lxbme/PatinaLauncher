@@ -43,9 +43,10 @@ mod tests {
     use super::*;
     use crate::download::DownloadError;
     use crate::jvm::JvmArgsError;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    fn flatten(prefix: &str, v: &serde_json::Value, out: &mut BTreeSet<String>) {
+    /// Leaf key → its text.
+    fn flatten(prefix: &str, v: &serde_json::Value, out: &mut BTreeMap<String, String>) {
         match v {
             serde_json::Value::Object(m) => {
                 for (k, v) in m {
@@ -60,19 +61,50 @@ mod tests {
                     flatten(&key, v, out);
                 }
             }
-            _ => {
-                out.insert(prefix.to_owned());
+            serde_json::Value::String(t) => {
+                out.insert(prefix.to_owned(), t.clone());
+            }
+            other => {
+                out.insert(prefix.to_owned(), other.to_string());
             }
         }
     }
 
-    fn keys(file: &str) -> BTreeSet<String> {
+    fn entries(file: &str) -> BTreeMap<String, String> {
         let path = format!("{}/locales/{file}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_saphyr::from_str(&text).unwrap();
-        let mut out = BTreeSet::new();
+        let mut out = BTreeMap::new();
         flatten("", &v, &mut out);
         out
+    }
+
+    fn keys(file: &str) -> BTreeSet<String> {
+        entries(file).into_keys().collect()
+    }
+
+    fn placeholders(text: &str) -> BTreeSet<String> {
+        let re = regex::Regex::new(r"%\{(\w+)\}").unwrap();
+        re.captures_iter(text).map(|c| c[1].to_string()).collect()
+    }
+
+    #[test]
+    fn locales_have_same_placeholders() {
+        let en = entries("en.yml");
+        let zh = entries("zh-CN.yml");
+        let mut bad = Vec::new();
+        for (key, en_text) in &en {
+            let Some(zh_text) = zh.get(key) else { continue };
+            let (a, b) = (placeholders(en_text), placeholders(zh_text));
+            if a != b {
+                bad.push(format!("{key}: en {a:?} vs zh-CN {b:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "placeholder mismatch:\n{}", bad.join("\n"));
+        assert_eq!(
+            placeholders("a %{url}: %{reason} %{url}"),
+            BTreeSet::from(["url".to_string(), "reason".to_string()])
+        );
     }
 
     #[test]
@@ -97,7 +129,7 @@ mod tests {
         let _locale = locale_lock();
         let download = || DownloadError::Failed {
             url: "https://example.com/a".into(),
-            reason: "timeout".into(),
+            reason: crate::download::FailReason::Network("timeout".into()),
         };
         let jvm = || JvmArgsError::MemoryFlag("-Xmx2G".into());
 

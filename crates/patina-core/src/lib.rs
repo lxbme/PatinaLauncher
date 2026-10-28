@@ -2,6 +2,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod config;
 pub mod download;
+pub mod fsutil;
 pub mod i18n;
 pub mod instance;
 pub mod java;

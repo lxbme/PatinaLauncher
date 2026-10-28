@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use patina_core::config::{GlobalConfig, SourceChoice};
-use patina_core::download::{Downloader, Mirror, PROBE_URL, Progress, measure};
+use patina_core::download::{Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT, fastest, measure_all};
 use patina_core::instance::{InstanceStore, effective_java};
 use patina_core::java::{ManagedRuntimes, detect_all};
 use patina_core::launch::{GameProcess, LogLine, dev_offline_account};
@@ -129,14 +129,14 @@ impl Ctx {
     async fn launcher(&mut self) -> Result<Launcher> {
         let client = http_client()?;
         let before = self.config.download.auto_pick.clone();
-        let mirror = resolve_mirror(&client, &mut self.config).await;
+        let source = resolve_mirror(&client, &mut self.config).await;
         if self.config.download.auto_pick != before {
-            println!("Speed test picked download source: {}", mirror.id);
+            println!("Speed test picked download source: {}", source.mirror.id);
             self.save()?;
         }
         Ok(Launcher {
             data: self.data.clone(),
-            downloader: Downloader::new(client, mirror),
+            downloader: source.downloader(client),
         })
     }
 }
@@ -257,23 +257,22 @@ async fn source(ctx: &mut Ctx, cmd: SourceCmd) -> Result<()> {
         }
         SourceCmd::Speedtest => {
             let client = http_client()?;
-            let mut best: Option<(Mirror, Duration)> = None;
-            for m in [Mirror::official(), Mirror::bmclapi()] {
-                let t = measure(&client, &m, PROBE_URL, Duration::from_secs(5)).await;
+            let builtin = [Mirror::official(), Mirror::bmclapi()];
+            let results = measure_all(&client, &builtin, PROBE_URL, SPEEDTEST_TIMEOUT).await;
+            for (m, t) in &results {
                 match t {
                     Some(t) => println!("  {:<10} {} ms", m.id, t.as_millis()),
                     None => println!("  {:<10} failed or timed out", m.id),
                 }
-                if let Some(t) = t
-                    && best.as_ref().is_none_or(|(_, b)| t < *b)
-                {
-                    best = Some((m, t));
-                }
             }
-            let pick = best.map_or_else(Mirror::official, |(m, _)| m);
-            ctx.config.download.auto_pick = Some(pick.id.clone());
-            ctx.save()?;
-            println!("Auto mode will use: {}", pick.id);
+            match fastest(&results) {
+                Some(pick) => {
+                    ctx.config.download.auto_pick = Some(pick.id.clone());
+                    ctx.save()?;
+                    println!("Auto mode will use: {}", pick.id);
+                }
+                None => println!("Every source failed; nothing stored, auto mode will test again"),
+            }
         }
     }
     Ok(())
@@ -356,7 +355,7 @@ async fn launch(ctx: &mut Ctx, id: &str, player: &str) -> Result<()> {
     let _ = printer.await;
     let prepared = result?;
     println!(
-        "Prepared in {:.1}s; {} download(s) fell back to the official source",
+        "Prepared in {:.1}s; {} download(s) fell back to another source",
         start.elapsed().as_secs_f64(),
         launcher.downloader.fallback_count()
     );

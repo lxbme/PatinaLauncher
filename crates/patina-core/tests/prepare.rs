@@ -54,6 +54,11 @@ struct Fake {
 /// Serves manifest, version JSON (java major `java_major`), client jar, the two
 /// Linux libraries, asset index with one object, the object and logging config.
 async fn fake_mojang(java_major: u32) -> Fake {
+    fake_mojang_with(java_major, |_| {}).await
+}
+
+/// Like [`fake_mojang`], with `edit` applied to the version JSON last.
+async fn fake_mojang_with(java_major: u32, edit: impl FnOnce(&mut Value)) -> Fake {
     let server = MockServer::start().await;
     let mut v: Value = serde_json::from_str(MODERN).unwrap();
     v["javaVersion"]["majorVersion"] = json!(java_major);
@@ -89,6 +94,7 @@ async fn fake_mojang(java_major: u32) -> Fake {
     .unwrap();
     serve_ref(&server, &mut v["assetIndex"], &index).await;
 
+    edit(&mut v);
     let version_bytes = serde_json::to_vec(&v).unwrap();
     let version_url = "https://piston-meta.mojang.com/v1/packages/abc/26.3.json";
     serve(&server, &url_path(version_url), version_bytes.clone()).await;
@@ -317,4 +323,54 @@ async fn prepare_reports_missing_java() {
         "{:?}",
         r.err()
     );
+}
+
+#[tokio::test]
+async fn prepare_rejects_unsafe_asset_index_id() {
+    let fake = fake_mojang_with(8, |v| v["assetIndex"]["id"] = json!("../../evil")).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    let inst = InstanceStore::new(l.data.instances())
+        .create("x", "26.3")
+        .unwrap();
+    let r = l.prepare(&inst, &s.global, &account(), None).await;
+    assert!(
+        matches!(&r, Err(PrepareError::UnsafeMetadata(n)) if n == "../../evil"),
+        "{:?}",
+        r.err()
+    );
+    assert!(!s.data.join("evil.json").exists());
+}
+
+#[tokio::test]
+async fn prepare_rejects_unsafe_version_id() {
+    let fake = fake_mojang_with(8, |v| v["id"] = json!("../../evil")).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    let inst = InstanceStore::new(l.data.instances())
+        .create("x", "26.3")
+        .unwrap();
+    let r = l.prepare(&inst, &s.global, &account(), None).await;
+    assert!(
+        matches!(&r, Err(PrepareError::UnsafeMetadata(n)) if n == "../../evil"),
+        "{:?}",
+        r.err()
+    );
+}
+
+#[tokio::test]
+async fn client_jar_is_keyed_on_requested_id() {
+    let fake = fake_mojang_with(8, |v| v["id"] = json!("26.3-renamed")).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    let inst = InstanceStore::new(l.data.instances())
+        .create("x", "26.3")
+        .unwrap();
+    let prepared = l.prepare(&inst, &s.global, &account(), None).await.unwrap();
+    assert!(s.data.join("versions/26.3/26.3.jar").is_file());
+    assert!(s.data.join("versions/26.3/26.3.json").is_file());
+    assert!(!s.data.join("versions/26.3-renamed").exists());
+    let args = &prepared.command.args;
+    let cp = &args[args.iter().position(|a| a == "-cp").unwrap() + 1];
+    assert!(cp.ends_with("versions/26.3/26.3.jar"), "{cp}");
 }

@@ -14,6 +14,13 @@ errors:
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"
   download:
     failed: "Download failed %{url}: %{reason}"
+    reason:
+      http: "the server returned HTTP status %{status}"
+      hash_mismatch: "file checksum mismatch (expected %{expected}, got %{actual})"
+      size_mismatch: "file size mismatch (expected %{expected} bytes, got %{actual} bytes)"
+      network: "network error: %{error}"
+      io: "could not write the file: %{error}"
+      no_attempt: "no download source was tried"
   runtime:
     unavailable: "Component %{component} is unavailable: this platform has no official Java runtime; please set the Java path manually in the settings"
     invalid_component: "Invalid runtime component name: %{component}"
@@ -26,6 +33,12 @@ errors:
     download: "Failed to download game files: %{error}"
     io: "File operation failed: %{error}"
     json: "Failed to parse version data: %{error}"
+    unsafe_metadata: "Version data contains an unsafe file name: %{name}"
+gc_preset:
+  none: "Default (no GC flags)"
+  g1_aikar: "Tuned G1 (Aikar's flags)"
+  generational_zgc: "Generational ZGC"
+  custom: "Custom"
 warnings:
   low_memory: "Not enough free memory: %{requested} MiB requested, %{available} MiB available; the game may stutter or crash"
   gc_preset_ignored: "GC preset %{preset} needs Java %{required} or newer, but the current Java is %{found}; the preset was ignored"

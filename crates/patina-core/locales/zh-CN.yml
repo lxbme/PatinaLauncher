@@ -14,6 +14,13 @@ errors:
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
   download:
     failed: "下载失败 %{url}：%{reason}"
+    reason:
+      http: "服务器返回状态码 %{status}"
+      hash_mismatch: "文件校验值不符（应为 %{expected}，实际为 %{actual}）"
+      size_mismatch: "文件大小不符（应为 %{expected} 字节，实际为 %{actual} 字节）"
+      network: "网络错误：%{error}"
+      io: "无法写入文件：%{error}"
+      no_attempt: "没有尝试任何下载源"
   runtime:
     unavailable: "组件 %{component} 不可用：当前平台没有可用的官方 Java 运行时，请在设置中手动指定 Java 路径"
     invalid_component: "非法的运行时组件名：%{component}"
@@ -26,6 +33,12 @@ errors:
     download: "下载游戏文件失败：%{error}"
     io: "文件操作失败：%{error}"
     json: "解析版本数据失败：%{error}"
+    unsafe_metadata: "版本数据中包含不安全的文件名：%{name}"
+gc_preset:
+  none: "默认（不加 GC 参数）"
+  g1_aikar: "G1 调优（Aikar's Flags）"
+  generational_zgc: "分代 ZGC"
+  custom: "自定义"
 warnings:
   low_memory: "可用内存不足：请求 %{requested} MiB，当前可用 %{available} MiB，游戏可能卡顿或崩溃"
   gc_preset_ignored: "GC 预设 %{preset} 需要 Java %{required} 及以上，当前 Java %{found}，已忽略该预设"

@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::download::{DownloadError, DownloadJob, Downloader};
+use crate::fsutil::{is_safe_name, is_safe_rel};
 use crate::meta::FileRef;
 use crate::platform;
 
@@ -61,19 +62,6 @@ pub struct InstallPlan {
     pub dirs: Vec<PathBuf>,
     pub links: Vec<(PathBuf, String)>,
     pub executables: Vec<PathBuf>,
-}
-
-/// A manifest path is safe if it is relative and has only normal components.
-fn is_safe_rel(p: &str) -> bool {
-    !p.is_empty()
-        && Path::new(p)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-}
-
-/// A component name must be exactly one normal path component.
-fn is_safe_component(c: &str) -> bool {
-    is_safe_rel(c) && Path::new(c).components().count() == 1
 }
 
 /// A link target is safe if, resolved lexically against the link's parent
@@ -172,11 +160,11 @@ impl ManagedRuntimes {
     }
 
     pub fn is_installed(&self, component: &str) -> bool {
-        is_safe_component(component) && self.home(component).join(MARKER).is_file()
+        is_safe_name(component) && self.home(component).join(MARKER).is_file()
     }
 
     pub async fn install(&self, dl: &Downloader, component: &str) -> Result<PathBuf, RuntimeError> {
-        if !is_safe_component(component) {
+        if !is_safe_name(component) {
             return Err(RuntimeError::InvalidComponent(component.to_string()));
         }
         // A failed (re)install must not leave a stale marker behind.
@@ -239,7 +227,7 @@ impl ManagedRuntimes {
     }
 
     pub fn remove(&self, component: &str) -> io::Result<()> {
-        if !is_safe_component(component) {
+        if !is_safe_name(component) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 rust_i18n::t!(

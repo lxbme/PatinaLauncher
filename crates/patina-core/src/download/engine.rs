@@ -23,10 +23,50 @@ pub struct Progress {
     pub total: usize,
 }
 
+/// Why the last attempt of a download failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailReason {
+    /// Non-success HTTP status.
+    Http(u16),
+    /// The body's SHA-1 differs from the metadata.
+    HashMismatch { expected: String, actual: String },
+    /// The body's length differs from the metadata (no SHA-1 known).
+    SizeMismatch { expected: u64, actual: u64 },
+    /// Request or transfer error; the third-party error text, verbatim.
+    Network(String),
+    /// Writing the file failed; the OS error text, verbatim.
+    Io(String),
+    /// No candidate URL was tried.
+    NoAttempt,
+}
+
+impl std::fmt::Display for FailReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use rust_i18n::t;
+        let s = match self {
+            FailReason::Http(status) => t!("errors.download.reason.http", status = status),
+            FailReason::HashMismatch { expected, actual } => t!(
+                "errors.download.reason.hash_mismatch",
+                expected = expected,
+                actual = actual
+            ),
+            FailReason::SizeMismatch { expected, actual } => t!(
+                "errors.download.reason.size_mismatch",
+                expected = expected,
+                actual = actual
+            ),
+            FailReason::Network(e) => t!("errors.download.reason.network", error = e),
+            FailReason::Io(e) => t!("errors.download.reason.io", error = e),
+            FailReason::NoAttempt => t!("errors.download.reason.no_attempt"),
+        };
+        f.write_str(&s)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
     #[error("{}", rust_i18n::t!("errors.download.failed", url = .url, reason = .reason))]
-    Failed { url: String, reason: String },
+    Failed { url: String, reason: FailReason },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -34,6 +74,7 @@ pub enum DownloadError {
 pub struct Downloader {
     client: reqwest::Client,
     mirror: Mirror,
+    fallback: Option<Mirror>,
     concurrency: usize,
     attempts: u32,
     base_delay: Duration,
@@ -67,6 +108,7 @@ impl Downloader {
         Self {
             client,
             mirror,
+            fallback: None,
             concurrency: 16,
             attempts: 3,
             base_delay: Duration::from_millis(300),
@@ -85,15 +127,26 @@ impl Downloader {
         self
     }
 
+    /// A mirror tried after the primary mirror and the original URL.
+    pub fn with_fallback(mut self, fallback: Option<Mirror>) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
     pub fn mirror(&self) -> &Mirror {
         &self.mirror
+    }
+
+    pub fn fallback_mirror(&self) -> Option<&Mirror> {
+        self.fallback.as_ref()
     }
 
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }
 
-    /// Fetches that failed on the mirror and succeeded on the official URL.
+    /// Fetches that failed on the primary mirror and succeeded on a later
+    /// candidate (the official URL or the fallback mirror).
     pub fn fallback_count(&self) -> usize {
         self.fallbacks.load(Ordering::Relaxed)
     }
@@ -187,12 +240,8 @@ impl Downloader {
         size: Option<u64>,
         part: Option<&Path>,
     ) -> Result<Vec<u8>, DownloadError> {
-        let mut candidates = vec![self.mirror.rewrite(url)];
-        if candidates[0] != url {
-            candidates.push(url.to_string());
-        }
-        let mut last = String::from("no attempt made");
-        for (i, cand) in candidates.iter().enumerate() {
+        let mut last = FailReason::NoAttempt;
+        for (i, cand) in self.candidates(url).iter().enumerate() {
             for n in 1..=self.attempts {
                 match self.attempt(cand, sha1, size, part).await {
                     Ok(bytes) => {
@@ -205,7 +254,12 @@ impl Downloader {
                         if let Some(p) = part {
                             let _ = tokio::fs::remove_file(p).await;
                         }
-                        last = format!("{cand}: {e}");
+                        // Wrong content from this URL will not change on retry.
+                        let final_for_candidate = matches!(e, FailReason::HashMismatch { .. });
+                        last = e;
+                        if final_for_candidate {
+                            break;
+                        }
                         if n < self.attempts {
                             tokio::time::sleep(self.base_delay * n).await;
                         }
@@ -219,29 +273,41 @@ impl Downloader {
         })
     }
 
+    /// `[mirror.rewrite(url), url, fallback.rewrite(url)]`, deduplicated.
+    fn candidates(&self, url: &str) -> Vec<String> {
+        let mut out = Vec::with_capacity(3);
+        let fallback = self.fallback.as_ref().map(|m| m.rewrite(url));
+        for c in [
+            Some(self.mirror.rewrite(url)),
+            Some(url.to_string()),
+            fallback,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     async fn attempt(
         &self,
         url: &str,
         sha1: Option<&str>,
         size: Option<u64>,
         part: Option<&Path>,
-    ) -> Result<Vec<u8>, String> {
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+    ) -> Result<Vec<u8>, FailReason> {
+        let net = |e: reqwest::Error| FailReason::Network(e.to_string());
+        let io = |e: std::io::Error| FailReason::Io(e.to_string());
+        let resp = self.client.get(url).send().await.map_err(net)?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("HTTP {status}"));
+            return Err(FailReason::Http(status.as_u16()));
         }
         let mut file = match part {
-            Some(p) => Some(
-                tokio::fs::File::create(p)
-                    .await
-                    .map_err(|e| e.to_string())?,
-            ),
+            Some(p) => Some(tokio::fs::File::create(p).await.map_err(io)?),
             None => None,
         };
         let mut mem = Vec::new();
@@ -249,26 +315,32 @@ impl Downloader {
         let mut len = 0u64;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| e.to_string())?;
+            let chunk = chunk.map_err(net)?;
             len += chunk.len() as u64;
             hasher.update(&chunk);
             match file.as_mut() {
-                Some(f) => f.write_all(&chunk).await.map_err(|e| e.to_string())?,
+                Some(f) => f.write_all(&chunk).await.map_err(io)?,
                 None => mem.extend_from_slice(&chunk),
             }
         }
         if let Some(mut f) = file {
-            f.flush().await.map_err(|e| e.to_string())?;
+            f.flush().await.map_err(io)?;
         }
         if let Some(expected) = sha1 {
             let actual = hex::encode(hasher.finalize());
             if !actual.eq_ignore_ascii_case(expected) {
-                return Err(format!("sha1 mismatch: expected {expected}, got {actual}"));
+                return Err(FailReason::HashMismatch {
+                    expected: expected.to_string(),
+                    actual,
+                });
             }
         } else if let Some(expected) = size
             && len != expected
         {
-            return Err(format!("size mismatch: expected {expected}, got {len}"));
+            return Err(FailReason::SizeMismatch {
+                expected,
+                actual: len,
+            });
         }
         Ok(mem)
     }
@@ -360,7 +432,13 @@ mod tests {
     #[tokio::test]
     async fn mirror_hash_mismatch_falls_back_to_original() {
         let server = MockServer::start().await;
-        serve(&server, "/mirror/a", 200, b"stale").await;
+        // A hash mismatch is final for that candidate: no retry on the mirror.
+        Mock::given(method("GET"))
+            .and(path("/mirror/a"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"stale".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
         serve(&server, "/orig/a", 200, b"hello").await;
         let (d, orig) = setup(&server);
         let dir = tempfile::tempdir().unwrap();
@@ -369,6 +447,131 @@ mod tests {
         d.run(vec![j.clone()], None).await.unwrap();
         assert_eq!(std::fs::read(&j.dest).unwrap(), b"hello");
         assert_eq!(d.fallback_count(), 1);
+    }
+
+    #[test]
+    fn candidates_are_mirror_original_fallback_deduplicated() {
+        let url = "https://piston-data.mojang.com/v1/objects/abc/client.jar";
+        let bm = "https://bmclapi2.bangbang93.com/v1/objects/abc/client.jar";
+        let c = reqwest::Client::new;
+        // Explicit Official: strict, no third candidate.
+        let d = Downloader::new(c(), Mirror::official());
+        assert_eq!(d.candidates(url), vec![url.to_string()]);
+        let d = Downloader::new(c(), Mirror::official()).with_fallback(Some(Mirror::bmclapi()));
+        assert_eq!(d.candidates(url), vec![url.to_string(), bm.to_string()]);
+        let d = Downloader::new(c(), Mirror::bmclapi()).with_fallback(Some(Mirror::official()));
+        assert_eq!(d.candidates(url), vec![bm.to_string(), url.to_string()]);
+        let d = Downloader::new(c(), Mirror::bmclapi());
+        assert_eq!(d.candidates(url), vec![bm.to_string(), url.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn official_failure_falls_back_to_fallback_mirror() {
+        let server = MockServer::start().await;
+        serve(&server, "/orig/a", 500, b"").await;
+        serve(&server, "/bm/a", 200, b"hello").await;
+        let orig = format!("{}/orig", server.uri());
+        let fallback = Mirror {
+            id: "bmclapi".into(),
+            rules: vec![(orig.clone(), format!("{}/bm", server.uri()))],
+        };
+        let d = Downloader::new(reqwest::Client::new(), Mirror::official())
+            .with_fallback(Some(fallback))
+            .with_retry(2, Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let j = job(&orig, dir.path());
+        d.run(vec![j.clone()], None).await.unwrap();
+        assert_eq!(std::fs::read(&j.dest).unwrap(), b"hello");
+        assert_eq!(d.fallback_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_fallback_mirror_official_failure_is_final() {
+        let server = MockServer::start().await;
+        serve(&server, "/orig/a", 500, b"").await;
+        Mock::given(method("GET"))
+            .and(path("/bm/a"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let orig = format!("{}/orig", server.uri());
+        let d = Downloader::new(reqwest::Client::new(), Mirror::official())
+            .with_retry(2, Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let r = d.run(vec![job(&orig, dir.path())], None).await;
+        assert!(
+            matches!(
+                r,
+                Err(DownloadError::Failed {
+                    reason: FailReason::Http(500),
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn hash_mismatch_message_is_fully_localized() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let url = "https://piston-data.mojang.com/v1/objects/abc/client.jar";
+        let (expected, actual) = (hello_sha1(), hex::encode(Sha1::digest(b"stale")));
+        let e = DownloadError::Failed {
+            url: url.into(),
+            reason: FailReason::HashMismatch {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+        };
+        set_language(Language::ZhCn);
+        let msg = e.to_string();
+        assert!(msg.contains(url) && msg.contains(&expected) && msg.contains(&actual));
+        let rest = msg
+            .replace(url, "")
+            .replace(&expected, "")
+            .replace(&actual, "");
+        assert!(
+            !rest.chars().any(|c| c.is_ascii_alphabetic()),
+            "English left in zh-CN message: {msg}"
+        );
+        set_language(Language::En);
+        let msg = e.to_string();
+        assert!(msg.is_ascii() && msg.contains(&expected), "{msg}");
+        set_language(Language::ZhCn);
+    }
+
+    #[test]
+    fn every_reason_renders_from_the_locale_files() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let reasons = [
+            FailReason::Http(404),
+            FailReason::HashMismatch {
+                expected: "aa".into(),
+                actual: "bb".into(),
+            },
+            FailReason::SizeMismatch {
+                expected: 5,
+                actual: 3,
+            },
+            FailReason::Network("connection reset".into()),
+            FailReason::Io("disk full".into()),
+            FailReason::NoAttempt,
+        ];
+        for lang in [Language::ZhCn, Language::En] {
+            set_language(lang);
+            for r in &reasons {
+                let msg = r.to_string();
+                assert!(!msg.is_empty() && !msg.contains("errors."), "{msg}");
+            }
+        }
+        set_language(Language::En);
+        assert!(reasons[0].to_string().contains("404"));
+        assert!(reasons[3].to_string().contains("connection reset"));
+        assert!(reasons[4].to_string().contains("disk full"));
+        set_language(Language::ZhCn);
     }
 
     #[tokio::test]

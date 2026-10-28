@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::download::DownloadJob;
+use crate::fsutil::safe_join;
 
 pub const RESOURCES_URL: &str = "https://resources.download.minecraft.net";
 
@@ -30,6 +31,11 @@ pub enum AssetLayout {
     Resources(PathBuf),
 }
 
+/// Object hashes are SHA-1: exactly 40 ASCII hex characters.
+fn is_valid_hash(hash: &str) -> bool {
+    hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn object_path(assets_dir: &Path, hash: &str) -> PathBuf {
     assets_dir.join("objects").join(&hash[..2]).join(hash)
 }
@@ -38,7 +44,7 @@ pub fn asset_jobs(index: &AssetIndex, assets_dir: &Path) -> Vec<DownloadJob> {
     index
         .objects
         .values()
-        .filter(|o| o.hash.len() >= 2 && o.hash.is_ascii())
+        .filter(|o| is_valid_hash(&o.hash))
         .map(|o| DownloadJob {
             url: format!("{RESOURCES_URL}/{}/{}", &o.hash[..2], o.hash),
             dest: object_path(assets_dir, &o.hash),
@@ -73,18 +79,13 @@ pub fn materialize_legacy(
         AssetLayout::Virtual(p) | AssetLayout::Resources(p) => p,
     };
     for (name, obj) in &index.objects {
-        if obj.hash.len() < 2 || !obj.hash.is_ascii() {
+        if !is_valid_hash(&obj.hash) {
             continue;
         }
         // Reject names that would escape the target root.
-        let rel = Path::new(name);
-        if rel
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
+        let Some(target) = safe_join(root, name) else {
             continue;
-        }
-        let target = root.join(rel);
+        };
         if std::fs::metadata(&target).is_ok_and(|m| m.len() == obj.size) {
             continue;
         }
@@ -160,5 +161,38 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         materialize_legacy(&index(false, false), tmp.path(), &AssetLayout::Modern).unwrap();
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn only_40_hex_char_hashes_are_accepted() {
+        let json = format!(
+            r#"{{"objects":{{
+            "good":{{"hash":"{HASH}","size":3}},
+            "short":{{"hash":"bd","size":3}},
+            "traversal":{{"hash":"../../../../etc/passwd/aaaaaaaaaaaaaaaaaaaa","size":3}},
+            "nonhex":{{"hash":"zzf48ef6b5d0d23bbb02e17d04865216179f510a","size":3}},
+            "long":{{"hash":"{HASH}00","size":3}},
+            "sep":{{"hash":"bd/48ef6b5d0d23bbb02e17d04865216179f510a","size":3}}
+            }},"virtual":true}}"#
+        );
+        let index: AssetIndex = serde_json::from_str(&json).unwrap();
+        let jobs = asset_jobs(&index, Path::new("/assets"));
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].sha1.as_deref(), Some(HASH));
+
+        // Legacy materialization ignores the bad entries instead of copying them.
+        let tmp = tempfile::tempdir().unwrap();
+        let assets = tmp.path().join("assets");
+        let obj = assets.join("objects/bd").join(HASH);
+        std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+        std::fs::write(&obj, b"abc").unwrap();
+        let layout = asset_layout(&index, "legacy", &assets, tmp.path());
+        materialize_legacy(&index, &assets, &layout).unwrap();
+        let virt = assets.join("virtual/legacy");
+        let names: Vec<_> = std::fs::read_dir(&virt)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("good")]);
     }
 }

@@ -65,7 +65,7 @@ pub fn java_candidates() -> Vec<PathBuf> {
         raw.push(PathBuf::from(home).join("bin").join("java"));
     }
     if let Some(path) = std::env::var_os("PATH") {
-        raw.extend(std::env::split_paths(&path).map(|d| d.join("java")));
+        raw.extend(path_java_candidates(&path));
     }
     let mut out: Vec<PathBuf> = Vec::new();
     for p in raw {
@@ -77,6 +77,15 @@ pub fn java_candidates() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// `java` in each `$PATH` entry. Empty and relative entries are skipped: they
+/// mean the current directory, which must not pick the Java to run.
+fn path_java_candidates(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join("java"))
+        .collect()
 }
 
 pub fn set_executable(path: &Path) -> io::Result<()> {
@@ -108,5 +117,22 @@ pub fn mojang_runtime_key() -> Option<&'static str> {
         Some("linux-i386")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_candidates_skip_empty_and_relative_entries() {
+        let path = std::ffi::OsString::from("/usr/bin::bin:./x:/opt/jdk/bin:");
+        assert_eq!(
+            path_java_candidates(&path),
+            vec![
+                PathBuf::from("/usr/bin/java"),
+                PathBuf::from("/opt/jdk/bin/java")
+            ]
+        );
     }
 }

@@ -4,6 +4,8 @@ use super::mirror::Mirror;
 use crate::config::{DownloadConfig, SourceChoice};
 
 pub const PROBE_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+/// Per-mirror probe timeout used by the launcher and the dev CLI.
+pub const SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Time a full GET of the rewritten probe URL; `None` on non-2xx, error or timeout.
 pub async fn measure(
@@ -26,26 +28,39 @@ pub async fn measure(
     Some(start.elapsed())
 }
 
-/// Measure all candidates concurrently; fastest wins, all-fail yields official.
-pub async fn pick_fastest(
+/// Measure all candidates concurrently, in candidate order.
+pub async fn measure_all(
     client: &reqwest::Client,
     candidates: &[Mirror],
     probe_url: &str,
     timeout: Duration,
-) -> Mirror {
+) -> Vec<(Mirror, Option<Duration>)> {
     let times = futures::future::join_all(
         candidates
             .iter()
             .map(|m| measure(client, m, probe_url, timeout)),
     )
     .await;
-    candidates
+    candidates.iter().cloned().zip(times).collect()
+}
+
+/// The fastest successful measurement; `None` if every probe failed.
+pub fn fastest(results: &[(Mirror, Option<Duration>)]) -> Option<Mirror> {
+    results
         .iter()
-        .zip(times)
         .filter_map(|(m, t)| t.map(|t| (m, t)))
         .min_by_key(|(_, t)| *t)
         .map(|(m, _)| m.clone())
-        .unwrap_or_else(Mirror::official)
+}
+
+/// Measure all candidates concurrently; fastest wins, `None` if all fail.
+pub async fn pick_fastest(
+    client: &reqwest::Client,
+    candidates: &[Mirror],
+    probe_url: &str,
+    timeout: Duration,
+) -> Option<Mirror> {
+    fastest(&measure_all(client, candidates, probe_url, timeout).await)
 }
 
 /// `None` means Auto without a stored pick: the caller must speed-test first.
@@ -93,12 +108,17 @@ mod tests {
         let mf = mirror("fast", &fast);
         let c = reqwest::Client::new();
         let t = Duration::from_secs(2);
-        assert_eq!(pick_fastest(&c, &[ms, mf], probe, t).await.id, "fast");
+        let picked = pick_fastest(&c, &[ms.clone(), mf.clone()], probe, t).await;
+        assert_eq!(picked.unwrap().id, "fast");
+        let all = measure_all(&c, &[ms, mf], probe, t).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0.id, "slow");
+        assert!(all.iter().all(|(_, t)| t.is_some()));
 
         let bad1 = server(500, Duration::ZERO).await;
         let bad2 = server(500, Duration::ZERO).await;
         let cands = [mirror("b1", &bad1), mirror("b2", &bad2)];
-        assert_eq!(pick_fastest(&c, &cands, probe, t).await.id, "official");
+        assert_eq!(pick_fastest(&c, &cands, probe, t).await, None);
     }
 
     #[tokio::test]

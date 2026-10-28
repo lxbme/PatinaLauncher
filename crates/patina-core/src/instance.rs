@@ -54,7 +54,16 @@ impl Instance {
 
 const CONFIG_FILE: &str = "instance.toml";
 
+/// Longest directory name `create` derives from a display name, before any
+/// ` (n)` dedup suffix. Well under the usual 255-byte file name limit.
+const MAX_DIR_NAME_BYTES: usize = 200;
+
+/// Safe directory name for a display name, at most [`MAX_DIR_NAME_BYTES`] bytes.
 pub fn sanitize_dir_name(name: &str) -> String {
+    clean_dir_name(name, MAX_DIR_NAME_BYTES)
+}
+
+fn clean_dir_name(name: &str, max_bytes: usize) -> String {
     let replaced: String = name
         .chars()
         .map(|c| match c {
@@ -63,7 +72,15 @@ pub fn sanitize_dir_name(name: &str) -> String {
             c => c,
         })
         .collect();
-    let trimmed = replaced.trim_matches(|c| c == ' ' || c == '.');
+    let is_trim = |c: char| c == ' ' || c == '.';
+    let mut trimmed = replaced.trim_matches(is_trim);
+    if trimmed.len() > max_bytes {
+        let mut end = max_bytes;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        trimmed = trimmed[..end].trim_end_matches(is_trim);
+    }
     if trimmed.is_empty() {
         return "instance".to_string();
     }
@@ -101,7 +118,8 @@ impl InstanceStore {
     }
 
     fn check_id(id: &str) -> Result<(), InstanceError> {
-        if id.is_empty() || id != sanitize_dir_name(id) {
+        // No length cap here: ids may carry a dedup suffix past the cap.
+        if id.is_empty() || id != clean_dir_name(id, usize::MAX) {
             return Err(InstanceError::InvalidId(id.to_string()));
         }
         Ok(())
@@ -231,6 +249,27 @@ mod tests {
         assert!(a.game_dir().is_dir());
         let b = store.create("我的 生存/服", "1.21.4").unwrap();
         assert_eq!(b.id, "我的 生存_服 (2)");
+    }
+
+    #[test]
+    fn long_names_are_capped_on_a_char_boundary() {
+        let name = "长".repeat(120);
+        let id = sanitize_dir_name(&name);
+        assert!(id.len() <= 200, "{} bytes", id.len());
+        assert!(!id.is_empty() && name.starts_with(&id));
+        assert_eq!(sanitize_dir_name(&id), id);
+        // A cut that lands on a trailing space or dot is trimmed again.
+        let spaced = format!("{} x", "a".repeat(199));
+        assert_eq!(sanitize_dir_name(&spaced), "a".repeat(199));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let a = store.create(&name, "1.21.4").unwrap();
+        let b = store.create(&name, "1.21.4").unwrap();
+        assert_eq!(a.id, id);
+        assert_eq!(b.id, format!("{id} (2)"));
+        assert_eq!(store.load(&b.id).unwrap().config.name, name);
+        assert_eq!(store.list().unwrap().len(), 2);
     }
 
     #[test]

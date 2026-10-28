@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::download::DownloadJob;
+use crate::fsutil::safe_join;
 use crate::meta::{FileRef, Library, RuleEnv, maven_path, rules_allow};
 
 pub const LIBRARIES_URL: &str = "https://libraries.minecraft.net/";
@@ -35,9 +36,8 @@ pub fn resolve_libraries(
         match lib.downloads.as_ref() {
             Some(downloads) => {
                 if let Some(artifact) = &downloads.artifact
-                    && let Some(rel) = artifact_path(artifact, &lib.name)
+                    && let Some(dest) = artifact_dest(artifact, &lib.name, libraries_dir)
                 {
-                    let dest = libraries_dir.join(rel);
                     out.jobs.push(job_from(artifact, dest.clone()));
                     out.classpath.push(dest);
                 }
@@ -46,8 +46,10 @@ pub fn resolve_libraries(
                 let Some(rel) = maven_path(&lib.name) else {
                     continue;
                 };
+                let Some(dest) = safe_join(libraries_dir, &rel) else {
+                    continue;
+                };
                 let base = lib.url.as_deref().unwrap_or(LIBRARIES_URL);
-                let dest = libraries_dir.join(&rel);
                 out.jobs.push(DownloadJob {
                     url: format!("{base}{rel}"),
                     dest: dest.clone(),
@@ -61,8 +63,11 @@ pub fn resolve_libraries(
     out
 }
 
-fn artifact_path(file: &FileRef, name: &str) -> Option<String> {
-    file.path.clone().or_else(|| maven_path(name))
+/// Destination of `file` under `libraries_dir`: its own `path`, else the maven
+/// path of `name`. `None` (skip the library) when the path would escape.
+fn artifact_dest(file: &FileRef, name: &str, libraries_dir: &Path) -> Option<PathBuf> {
+    let rel = file.path.clone().or_else(|| maven_path(name))?;
+    safe_join(libraries_dir, &rel)
 }
 
 fn job_from(file: &FileRef, dest: PathBuf) -> DownloadJob {
@@ -93,10 +98,9 @@ fn resolve_old_native(
     else {
         return;
     };
-    let Some(rel) = artifact_path(file, &lib.name) else {
+    let Some(dest) = artifact_dest(file, &lib.name, libraries_dir) else {
         return;
     };
-    let dest = libraries_dir.join(rel);
     out.jobs.push(job_from(file, dest.clone()));
     out.natives.push(NativeJar {
         path: dest,
@@ -221,5 +225,31 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar"))
         );
+    }
+
+    #[test]
+    fn unsafe_library_paths_are_skipped() {
+        let libs: Vec<Library> = serde_json::from_str(
+            r#"[
+            {"name":"a:rel:1","downloads":{"artifact":{"url":"https://x/e","sha1":"00","size":1,"path":"../../evil.jar"}}},
+            {"name":"a:abs:1","downloads":{"artifact":{"url":"https://x/f","sha1":"00","size":1,"path":"/etc/evil.jar"}}},
+            {"name":"a:b:../../x"},
+            {"name":"a:nat:1","natives":{"linux":"natives-linux"},
+             "downloads":{"classifiers":{"natives-linux":{"url":"https://x/n","sha1":"00","size":1,"path":"../../n.jar"}}}},
+            {"name":"a:nat2:../../y","natives":{"linux":"natives-linux"},
+             "downloads":{"classifiers":{"natives-linux":{"url":"https://x/m","sha1":"00","size":1}}}},
+            {"name":"ok:good:1"}
+        ]"#,
+        )
+        .unwrap();
+        let root = Path::new("/L");
+        let r = resolve_libraries(&libs, &linux(), root);
+        assert_eq!(r.classpath, vec![root.join("ok/good/1/good-1.jar")]);
+        assert!(r.natives.is_empty(), "{:?}", r.natives);
+        assert_eq!(r.jobs.len(), 1, "{:?}", r.jobs);
+        assert_eq!(r.jobs[0].dest, root.join("ok/good/1/good-1.jar"));
+        for p in r.classpath.iter().chain(r.jobs.iter().map(|j| &j.dest)) {
+            assert!(p.starts_with(root), "{} escapes the root", p.display());
+        }
     }
 }

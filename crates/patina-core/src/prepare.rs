@@ -1,16 +1,17 @@
 //! Launch orchestration: version metadata, Java, memory, downloads, command.
 
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{GlobalConfig, write_atomic};
+use crate::config::{GlobalConfig, SourceChoice, write_atomic};
 use crate::download::{
-    DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, Progress, pick_fastest,
-    resolve_choice, sha1_file,
+    DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT,
+    pick_fastest, resolve_choice, sha1_file,
 };
+use crate::fsutil::{is_safe_name, safe_join};
 use crate::instance::{Instance, effective_java};
 use crate::java::{JavaInstall, ManagedRuntimes, RuntimeError, probe};
 use crate::jvm::{
@@ -29,7 +30,6 @@ use crate::resolve::{
 
 /// Max heap used when physical memory cannot be read.
 const UNKNOWN_TOTAL_MAX_MEM_MIB: u32 = 4096;
-const SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareWarning {
@@ -54,7 +54,7 @@ impl std::fmt::Display for PrepareWarning {
             )),
             PrepareWarning::GcPresetIgnored { preset, java_major } => f.write_str(&rust_i18n::t!(
                 "warnings.gc_preset_ignored",
-                preset = format!("{preset:?}"),
+                preset = preset.display_name(),
                 required = preset.min_java_major(),
                 found = java_major
             )),
@@ -80,6 +80,9 @@ pub enum PrepareError {
     Io(#[from] io::Error),
     #[error("{}", rust_i18n::t!("errors.prepare.json", error = .0))]
     Json(#[from] serde_json::Error),
+    /// A file name from downloaded metadata would escape its directory.
+    #[error("{}", rust_i18n::t!("errors.prepare.unsafe_metadata", name = .0))]
+    UnsafeMetadata(String),
 }
 
 #[derive(Debug)]
@@ -103,27 +106,69 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Mirror from the config; with Auto and no stored pick, speed-tests the
-/// built-in mirrors and stores the winner in `cfg.download.auto_pick`.
-pub async fn resolve_mirror(client: &reqwest::Client, cfg: &mut GlobalConfig) -> Mirror {
-    if let Some(m) = resolve_choice(&cfg.download) {
-        return m;
-    }
-    let m = pick_fastest(
-        client,
-        &[Mirror::official(), Mirror::bmclapi()],
-        PROBE_URL,
-        SPEEDTEST_TIMEOUT,
-    )
-    .await;
-    cfg.download.auto_pick = Some(m.id.clone());
-    m
+/// Download sources for one run; see [`Downloader::with_fallback`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedSource {
+    pub mirror: Mirror,
+    /// Tried after `mirror` and the original URL. Only set in auto mode; an
+    /// explicitly chosen source stays strict.
+    pub fallback: Option<Mirror>,
 }
 
-/// A version id must be usable as a single directory name.
-fn is_safe_id(id: &str) -> bool {
-    let mut c = Path::new(id).components();
-    matches!(c.next(), Some(Component::Normal(n)) if n == id) && c.next().is_none()
+impl ResolvedSource {
+    pub fn downloader(self, client: reqwest::Client) -> Downloader {
+        Downloader::new(client, self.mirror).with_fallback(self.fallback)
+    }
+}
+
+/// Source from the config. With Auto and no stored pick, speed-tests the
+/// built-in mirrors and stores the winner in `cfg.download.auto_pick`; if
+/// every probe fails, uses official for this run and stores nothing, so the
+/// next run tests again. In Auto mode the other built-in mirror is the fallback.
+pub async fn resolve_mirror(client: &reqwest::Client, cfg: &mut GlobalConfig) -> ResolvedSource {
+    let builtin = [Mirror::official(), Mirror::bmclapi()];
+    resolve_mirror_with(client, cfg, &builtin, PROBE_URL, SPEEDTEST_TIMEOUT).await
+}
+
+async fn resolve_mirror_with(
+    client: &reqwest::Client,
+    cfg: &mut GlobalConfig,
+    candidates: &[Mirror],
+    probe_url: &str,
+    timeout: Duration,
+) -> ResolvedSource {
+    let mirror = match resolve_choice(&cfg.download) {
+        Some(m) => m,
+        None => match pick_fastest(client, candidates, probe_url, timeout).await {
+            Some(m) => {
+                cfg.download.auto_pick = Some(m.id.clone());
+                m
+            }
+            None => Mirror::official(),
+        },
+    };
+    let fallback = match cfg.download.source {
+        SourceChoice::Auto => other_builtin(&mirror.id),
+        SourceChoice::Official | SourceChoice::Bmclapi => None,
+    };
+    ResolvedSource { mirror, fallback }
+}
+
+fn other_builtin(id: &str) -> Option<Mirror> {
+    match id {
+        "official" => Some(Mirror::bmclapi()),
+        "bmclapi" => Some(Mirror::official()),
+        _ => None,
+    }
+}
+
+/// `name` from downloaded metadata, if it is a single safe path component.
+fn checked_name(name: &str) -> Result<&str, PrepareError> {
+    if is_safe_name(name) {
+        Ok(name)
+    } else {
+        Err(PrepareError::UnsafeMetadata(name.to_string()))
+    }
 }
 
 fn read_cached(path: &Path) -> Option<VersionJson> {
@@ -140,7 +185,7 @@ impl Launcher {
     /// Version JSON cached at `versions/<id>/<id>.json`. The cache is reused
     /// when its sha1 matches the manifest, or when the manifest is unreachable.
     pub async fn ensure_version(&self, id: &str) -> Result<VersionJson, PrepareError> {
-        if !is_safe_id(id) {
+        if !is_safe_name(id) {
             return Err(PrepareError::UnknownVersion(id.to_string()));
         }
         let path = self.data.versions().join(id).join(format!("{id}.json"));
@@ -211,7 +256,11 @@ impl Launcher {
         let js = effective_java(&global.java, &inst.config);
         validate_extra_jvm_args(&js.extra_jvm_args)?;
         let extra_jvm_args = split_args(&js.extra_jvm_args);
-        let version = self.ensure_version(&inst.config.mc_version).await?;
+        // The client jar is keyed on the requested id, the same id
+        // `ensure_version` caches the JSON under (may differ from `version.id`).
+        let jar_id = inst.config.mc_version.as_str();
+        let version = self.ensure_version(jar_id).await?;
+        checked_name(&version.id)?;
 
         // 2. Java.
         let java = self.select_java(js.java_path.as_deref(), &version).await?;
@@ -251,10 +300,10 @@ impl Launcher {
 
         // 5. Downloads. The asset index must be on disk before its objects are known.
         let assets_dir = data.assets();
-        let index_path = assets_dir
-            .join("indexes")
-            .join(format!("{}.json", version.asset_index.id));
         let ai = &version.asset_index;
+        let index_file = format!("{}.json", checked_name(&ai.id)?);
+        let index_path = safe_join(&assets_dir.join("indexes"), &index_file)
+            .ok_or_else(|| PrepareError::UnsafeMetadata(ai.id.clone()))?;
         self.downloader
             .run(
                 vec![DownloadJob {
@@ -271,10 +320,7 @@ impl Launcher {
         let env = RuleEnv::current();
         let libs = resolve_libraries(&version.libraries, &env, &data.libraries());
         let client = &version.downloads.client;
-        let client_jar = data
-            .versions()
-            .join(&version.id)
-            .join(format!("{}.jar", version.id));
+        let client_jar = data.versions().join(jar_id).join(format!("{jar_id}.jar"));
         let mut jobs = vec![DownloadJob {
             url: client.url.clone(),
             dest: client_jar.clone(),
@@ -285,7 +331,7 @@ impl Launcher {
         jobs.extend(asset_jobs(&index, &assets_dir));
         let logging = version.logging.as_ref().and_then(|l| l.client.as_ref());
         let logging_config = match logging {
-            Some(l) if is_safe_id(&l.file.id) => {
+            Some(l) if is_safe_name(&l.file.id) => {
                 let dest = assets_dir.join("log_configs").join(&l.file.id);
                 jobs.push(DownloadJob {
                     url: l.file.url.clone(),
@@ -343,13 +389,25 @@ mod tests {
 
     #[test]
     fn safe_ids() {
-        assert!(is_safe_id("1.8.9"));
-        assert!(is_safe_id("26.3"));
-        assert!(!is_safe_id(""));
-        assert!(!is_safe_id("../x"));
-        assert!(!is_safe_id("a/b"));
-        assert!(!is_safe_id("."));
-        assert!(!is_safe_id("/abs"));
+        assert!(checked_name("1.8.9").is_ok());
+        assert!(checked_name("26.3").is_ok());
+        for bad in ["", "../x", "a/b", ".", "..", "/abs"] {
+            assert!(
+                matches!(checked_name(bad), Err(PrepareError::UnsafeMetadata(n)) if n == bad),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_metadata_message_is_localized() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let e = PrepareError::UnsafeMetadata("../evil".into());
+        set_language(Language::En);
+        assert!(e.to_string().contains("../evil") && e.to_string().is_ascii());
+        set_language(Language::ZhCn);
+        assert!(e.to_string().contains("../evil") && e.to_string().contains("不安全"));
     }
 
     #[test]
@@ -362,6 +420,11 @@ mod tests {
             java_major: 8,
         };
         assert!(w.to_string().contains("Java 21"));
+        assert!(w.to_string().contains("分代 ZGC"), "{w}");
+        set_language(Language::En);
+        assert!(w.to_string().contains("Generational ZGC"), "{w}");
+        assert!(!w.to_string().contains("GenerationalZgc"), "{w}");
+        set_language(Language::ZhCn);
         let w = PrepareWarning::LowMemory {
             requested_mib: 4096,
             available_mib: 1000,
@@ -376,8 +439,60 @@ mod tests {
     async fn resolve_mirror_respects_explicit_choice() {
         let mut cfg = GlobalConfig::default();
         cfg.download.source = crate::config::SourceChoice::Bmclapi;
-        let m = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
-        assert_eq!(m.id, "bmclapi");
+        let src = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
+        assert_eq!(src.mirror.id, "bmclapi");
+        assert_eq!(src.fallback, None);
         assert_eq!(cfg.download.auto_pick, None);
+
+        // Explicit official: strict, no fallback mirror and no third candidate.
+        cfg.download.source = crate::config::SourceChoice::Official;
+        let src = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
+        assert_eq!(src.mirror.id, "official");
+        assert_eq!(src.fallback, None);
+        let d = src.downloader(reqwest::Client::new());
+        assert!(d.fallback_mirror().is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_with_stored_pick_falls_back_to_the_other_mirror() {
+        let mut cfg = GlobalConfig::default();
+        cfg.download.auto_pick = Some("official".into());
+        let src = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
+        assert_eq!(src.mirror.id, "official");
+        assert_eq!(
+            src.fallback.as_ref().map(|m| m.id.as_str()),
+            Some("bmclapi")
+        );
+        cfg.download.auto_pick = Some("bmclapi".into());
+        let src = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
+        assert_eq!(src.mirror.id, "bmclapi");
+        assert_eq!(
+            src.fallback.as_ref().map(|m| m.id.as_str()),
+            Some("official")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_failed_speedtest_uses_official_without_persisting() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let probe = "https://probe.invalid/probe";
+        let cands = ["official", "bmclapi"].map(|id| Mirror {
+            id: id.into(),
+            rules: vec![("https://probe.invalid".into(), server.uri())],
+        });
+        let mut cfg = GlobalConfig::default();
+        let before = cfg.clone();
+        let c = reqwest::Client::new();
+        let src = resolve_mirror_with(&c, &mut cfg, &cands, probe, Duration::from_secs(2)).await;
+        assert_eq!(src.mirror, Mirror::official());
+        assert_eq!(src.fallback, Some(Mirror::bmclapi()));
+        // Callers persist only when the config changed, so nothing is written.
+        assert_eq!(cfg, before, "an all-fail speed test must not be stored");
     }
 }

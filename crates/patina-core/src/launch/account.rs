@@ -63,8 +63,14 @@ mod tests {
 
     #[test]
     fn offline_uuid_matches_java() {
-        assert_eq!(offline_uuid("Notch").to_string(), "b50ad385-829d-3141-a216-7e7d7539ba7f");
-        assert_eq!(offline_uuid("Dev").to_string(), "380df991-f603-344c-a090-369bad2a924a");
+        assert_eq!(
+            offline_uuid("Notch").to_string(),
+            "b50ad385-829d-3141-a216-7e7d7539ba7f"
+        );
+        assert_eq!(
+            offline_uuid("Dev").to_string(),
+            "380df991-f603-344c-a090-369bad2a924a"
+        );
     }
 
     #[test]

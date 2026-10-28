@@ -34,6 +34,17 @@ const AIKAR_ARGS: [&str; 18] = [
 ];
 
 impl GcPreset {
+    /// Localized name for display.
+    pub fn display_name(self) -> String {
+        let key = match self {
+            GcPreset::None => "gc_preset.none",
+            GcPreset::G1Aikar => "gc_preset.g1_aikar",
+            GcPreset::GenerationalZgc => "gc_preset.generational_zgc",
+            GcPreset::Custom => "gc_preset.custom",
+        };
+        rust_i18n::t!(key).into_owned()
+    }
+
     pub fn min_java_major(self) -> u32 {
         match self {
             GcPreset::None | GcPreset::Custom => 0,
@@ -158,6 +169,41 @@ pub fn clamp_for_arch(max_mib: u32, is_64bit: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_preset_display_names_follow_locale() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let all = [
+            GcPreset::None,
+            GcPreset::G1Aikar,
+            GcPreset::GenerationalZgc,
+            GcPreset::Custom,
+        ];
+        set_language(Language::ZhCn);
+        let zh: Vec<String> = all.iter().map(|p| p.display_name()).collect();
+        assert_eq!(
+            zh,
+            [
+                "默认（不加 GC 参数）",
+                "G1 调优（Aikar's Flags）",
+                "分代 ZGC",
+                "自定义"
+            ]
+        );
+        set_language(Language::En);
+        let en: Vec<String> = all.iter().map(|p| p.display_name()).collect();
+        assert_eq!(
+            en,
+            [
+                "Default (no GC flags)",
+                "Tuned G1 (Aikar's flags)",
+                "Generational ZGC",
+                "Custom"
+            ]
+        );
+        set_language(Language::ZhCn);
+    }
 
     #[test]
     fn default_memory() {

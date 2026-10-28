@@ -11,6 +11,9 @@ pub enum VersionKind {
     Snapshot,
     OldBeta,
     OldAlpha,
+    /// Any `type` this launcher does not know yet.
+    #[serde(other)]
+    Unknown,
 }
 
 impl VersionKind {
@@ -20,6 +23,7 @@ impl VersionKind {
             VersionKind::Snapshot => "snapshot",
             VersionKind::OldBeta => "old_beta",
             VersionKind::OldAlpha => "old_alpha",
+            VersionKind::Unknown => "unknown",
         }
     }
 }
@@ -66,5 +70,16 @@ mod tests {
         assert_eq!(m.find("b1.0").unwrap().kind, VersionKind::OldBeta);
         assert_eq!(m.find("1.0").unwrap().kind.as_str(), "release");
         assert!(m.find("nope").is_none());
+    }
+
+    #[test]
+    fn unknown_version_type_does_not_break_parsing() {
+        let json = r#"{"latest":{"release":"1.0","snapshot":"s"},"versions":[
+          {"id":"x1","type":"experiment","url":"u","releaseTime":"r","sha1":"h"},
+          {"id":"1.0","type":"release","url":"u","releaseTime":"r","sha1":"h"}]}"#;
+        let m: VersionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.find("x1").unwrap().kind, VersionKind::Unknown);
+        assert_eq!(m.find("x1").unwrap().kind.as_str(), "unknown");
+        assert_eq!(m.find("1.0").unwrap().kind, VersionKind::Release);
     }
 }

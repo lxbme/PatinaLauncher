@@ -284,11 +284,22 @@ mod tests {
             Some(Path::new("/d/log.xml")),
             &AssetLayout::Modern,
         );
-        assert_eq!(&c.args[0..4], &["-Xms512m", "-Xmx4096m", "-XX:+UseG1GC", "-Dfoo=1"]);
+        assert_eq!(
+            &c.args[0..4],
+            &["-Xms512m", "-Xmx4096m", "-XX:+UseG1GC", "-Dfoo=1"]
+        );
         assert_eq!(c.args[4], "-Dlog4j.configurationFile=/d/log.xml");
         assert_eq!(c.args[5], "-Dlog4j2.formatMsgNoLookups=true");
-        assert!(!c.args.iter().any(|a| a == "-XstartOnFirstThread" || a == "-Xss1M" || a == "--demo"));
-        let mc = c.args.iter().position(|a| a == "net.minecraft.client.main.Main").unwrap();
+        assert!(
+            !c.args
+                .iter()
+                .any(|a| a == "-XstartOnFirstThread" || a == "-Xss1M" || a == "--demo")
+        );
+        let mc = c
+            .args
+            .iter()
+            .position(|a| a == "net.minecraft.client.main.Main")
+            .unwrap();
         let cp = c.args.iter().position(|a| a == "-cp").unwrap();
         assert!(cp < mc);
         let u = c.args.iter().position(|a| a == "--username").unwrap();
@@ -297,13 +308,20 @@ mod tests {
         assert_eq!(c.cwd, PathBuf::from("/g"));
         assert_eq!(c.program, PathBuf::from("/j/bin/java"));
         assert!(c.args.contains(&"-Djava.library.path=/n".to_string()));
-        assert!(c.args.contains(&"-Dminecraft.launcher.brand=patina".to_string()));
+        assert!(
+            c.args
+                .contains(&"-Dminecraft.launcher.brand=patina".to_string())
+        );
     }
 
     #[test]
     fn no_logging_arg_without_config() {
         let c = build(MODERN, "/d", &["/x.jar"], None, &AssetLayout::Modern);
-        assert!(!c.args.iter().any(|a| a.starts_with("-Dlog4j.configurationFile")));
+        assert!(
+            !c.args
+                .iter()
+                .any(|a| a.starts_with("-Dlog4j.configurationFile"))
+        );
         assert_eq!(c.args[4], "-Dlog4j2.formatMsgNoLookups=true");
     }
 
@@ -327,9 +345,16 @@ mod tests {
             &AssetLayout::Virtual(PathBuf::from("/d/assets/virtual/legacy")),
         );
         assert!(c.args.contains(&"-Djava.library.path=/n".to_string()));
-        assert_eq!(after(&c, "-cp"), "/d/libraries/a.jar:/d/versions/1.8.9/1.8.9.jar");
+        assert_eq!(
+            after(&c, "-cp"),
+            "/d/libraries/a.jar:/d/versions/1.8.9/1.8.9.jar"
+        );
         assert_eq!(after(&c, "--userProperties"), "{}");
-        let mc = c.args.iter().position(|a| a == "net.minecraft.client.main.Main").unwrap();
+        let mc = c
+            .args
+            .iter()
+            .position(|a| a == "net.minecraft.client.main.Main")
+            .unwrap();
         assert!(c.args.iter().position(|a| a == "--username").unwrap() > mc);
         assert_eq!(after(&c, "--accessToken"), "secret-token");
         assert_eq!(after(&c, "--assetsDir"), "/d/assets");
