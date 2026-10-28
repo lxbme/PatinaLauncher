@@ -99,3 +99,14 @@ pub fn os_version() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
+
+/// Platform key used by Mojang's java-runtime index, if one exists for this machine.
+pub fn mojang_runtime_key() -> Option<&'static str> {
+    if cfg!(target_arch = "x86_64") {
+        Some("linux")
+    } else if cfg!(target_arch = "x86") {
+        Some("linux-i386")
+    } else {
+        None
+    }
+}

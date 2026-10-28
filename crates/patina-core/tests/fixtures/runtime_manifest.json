@@ -1,0 +1,57 @@
+{
+  "files": {
+    "bin": {
+      "type": "directory"
+    },
+    "bin/java": {
+      "downloads": {
+        "lzma": {
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 1,
+          "url": "https://x/l"
+        },
+        "raw": {
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 1,
+          "url": "https://piston-data.mojang.com/v1/objects/java"
+        }
+      },
+      "type": "file",
+      "executable": true
+    },
+    "lib/libjli.so": {
+      "downloads": {
+        "lzma": {
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 1,
+          "url": "https://x/l"
+        },
+        "raw": {
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 1,
+          "url": "https://piston-data.mojang.com/v1/objects/jli"
+        }
+      },
+      "type": "file"
+    },
+    "lib/alias.so": {
+      "target": "libjli.so",
+      "type": "link"
+    },
+    "release": {
+      "downloads": {
+        "lzma": {
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 1,
+          "url": "https://x/l"
+        },
+        "raw": {
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 1,
+          "url": "https://piston-data.mojang.com/v1/objects/release"
+        }
+      },
+      "type": "file"
+    }
+  }
+}
