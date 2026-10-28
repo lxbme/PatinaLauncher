@@ -1,6 +1,7 @@
 pub mod config;
 pub mod download;
 pub mod instance;
+pub mod java;
 pub mod jvm;
 pub mod meta;
 pub mod paths;

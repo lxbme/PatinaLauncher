@@ -51,9 +51,32 @@ pub fn rule_arch() -> &'static str {
     }
 }
 
-/// Filled in by Task 8.
+/// Existing, canonicalized `java` executables from the usual JVM locations,
+/// `$JAVA_HOME` and `$PATH`. May contain duplicates only if canonicalization
+/// differs; callers dedup anyway.
 pub fn java_candidates() -> Vec<PathBuf> {
-    vec![]
+    let mut raw: Vec<PathBuf> = Vec::new();
+    for root in ["/usr/lib/jvm", "/usr/lib64/jvm", "/opt"] {
+        if let Ok(rd) = std::fs::read_dir(root) {
+            raw.extend(rd.flatten().map(|e| e.path().join("bin").join("java")));
+        }
+    }
+    if let Some(home) = std::env::var_os("JAVA_HOME").filter(|h| !h.is_empty()) {
+        raw.push(PathBuf::from(home).join("bin").join("java"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        raw.extend(std::env::split_paths(&path).map(|d| d.join("java")));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in raw {
+        if let Ok(c) = p.canonicalize()
+            && c.is_file()
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn set_executable(path: &Path) -> io::Result<()> {
