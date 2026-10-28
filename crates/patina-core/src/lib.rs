@@ -7,3 +7,4 @@ pub mod meta;
 pub mod paths;
 pub mod platform;
 pub mod resolve;
+pub mod launch;
