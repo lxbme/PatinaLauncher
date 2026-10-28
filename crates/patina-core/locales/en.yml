@@ -1,0 +1,31 @@
+errors:
+  config:
+    io: "Failed to read or write the config file: %{error}"
+    parse: "Invalid config file format: %{error}"
+    serialize: "Failed to serialize the config: %{error}"
+  instance:
+    io: "File operation failed: %{error}"
+    parse: "Invalid instance config format: %{error}"
+    serialize: "Failed to serialize the instance config: %{error}"
+    not_found: "Instance not found: %{id}"
+    invalid_id: "Invalid instance ID: %{id}"
+  jvm:
+    memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
+    version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"
+  download:
+    failed: "Download failed %{url}: %{reason}"
+  runtime:
+    unavailable: "Component %{component} is unavailable: this platform has no official Java runtime; please set the Java path manually in the settings"
+    invalid_component: "Invalid runtime component name: %{component}"
+  prepare:
+    unknown_version: "Unknown game version: %{version}"
+    java_too_old: "Java is too old: this version needs Java %{required}, but the selected Java is %{found}"
+    java_not_found: "No usable Java found: %{path}"
+    invalid_jvm_args: "Invalid extra JVM arguments: %{error}"
+    runtime: "Failed to install the Java runtime: %{error}"
+    download: "Failed to download game files: %{error}"
+    io: "File operation failed: %{error}"
+    json: "Failed to parse version data: %{error}"
+warnings:
+  low_memory: "Not enough free memory: %{requested} MiB requested, %{available} MiB available; the game may stutter or crash"
+  gc_preset_ignored: "GC preset %{preset} needs Java %{required} or newer, but the current Java is %{found}; the preset was ignored"

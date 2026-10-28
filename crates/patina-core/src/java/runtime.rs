@@ -142,11 +142,9 @@ pub fn plan_install(m: &RuntimeManifest, dest: &Path) -> InstallPlan {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
-    #[error(
-        "组件 {component} 不可用：当前平台没有可用的官方 Java 运行时，请在设置中手动指定 Java 路径"
-    )]
+    #[error("{}", rust_i18n::t!("errors.runtime.unavailable", component = .component))]
     Unavailable { component: String },
-    #[error("非法的运行时组件名：{0:?}")]
+    #[error("{}", rust_i18n::t!("errors.runtime.invalid_component", component = format!("{:?}", .0)))]
     InvalidComponent(String),
     #[error(transparent)]
     Download(#[from] DownloadError),
@@ -244,7 +242,11 @@ impl ManagedRuntimes {
         if !is_safe_component(component) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("非法的运行时组件名：{component:?}"),
+                rust_i18n::t!(
+                    "errors.runtime.invalid_component",
+                    component = format!("{component:?}")
+                )
+                .to_string(),
             ));
         }
         match std::fs::remove_dir_all(self.home(component)) {

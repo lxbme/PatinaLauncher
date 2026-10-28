@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("读取或写入配置文件失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.config.io", error = .0))]
     Io(#[from] std::io::Error),
-    #[error("配置文件格式错误：{0}")]
+    #[error("{}", rust_i18n::t!("errors.config.parse", error = .0))]
     Parse(#[from] toml::de::Error),
-    #[error("序列化配置失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.config.serialize", error = .0))]
     Serialize(#[from] toml::ser::Error),
 }
 

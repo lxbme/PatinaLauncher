@@ -1,0 +1,31 @@
+errors:
+  config:
+    io: "读取或写入配置文件失败：%{error}"
+    parse: "配置文件格式错误：%{error}"
+    serialize: "序列化配置失败：%{error}"
+  instance:
+    io: "文件操作失败：%{error}"
+    parse: "实例配置格式错误：%{error}"
+    serialize: "序列化实例配置失败：%{error}"
+    not_found: "找不到实例：%{id}"
+    invalid_id: "无效的实例 ID：%{id}"
+  jvm:
+    memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
+    version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
+  download:
+    failed: "下载失败 %{url}：%{reason}"
+  runtime:
+    unavailable: "组件 %{component} 不可用：当前平台没有可用的官方 Java 运行时，请在设置中手动指定 Java 路径"
+    invalid_component: "非法的运行时组件名：%{component}"
+  prepare:
+    unknown_version: "未知的游戏版本：%{version}"
+    java_too_old: "Java 版本过低：此版本需要 Java %{required}，所选 Java 为 %{found}"
+    java_not_found: "找不到可用的 Java：%{path}"
+    invalid_jvm_args: "额外 JVM 参数无效：%{error}"
+    runtime: "安装 Java 运行时失败：%{error}"
+    download: "下载游戏文件失败：%{error}"
+    io: "文件操作失败：%{error}"
+    json: "解析版本数据失败：%{error}"
+warnings:
+  low_memory: "可用内存不足：请求 %{requested} MiB，当前可用 %{available} MiB，游戏可能卡顿或崩溃"
+  gc_preset_ignored: "GC 预设 %{preset} 需要 Java %{required} 及以上，当前 Java %{found}，已忽略该预设"

@@ -25,7 +25,7 @@ pub struct Progress {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
-    #[error("下载失败 {url}: {reason}")]
+    #[error("{}", rust_i18n::t!("errors.download.failed", url = .url, reason = .reason))]
     Failed { url: String, reason: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),

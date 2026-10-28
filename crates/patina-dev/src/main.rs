@@ -143,6 +143,8 @@ impl Ctx {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Developer tool: core errors printed here must be English.
+    patina_core::i18n::set_language(patina_core::i18n::Language::En);
     let cli = Cli::parse();
     let mut ctx = Ctx::load(cli.data_dir)?;
     match cli.cmd {

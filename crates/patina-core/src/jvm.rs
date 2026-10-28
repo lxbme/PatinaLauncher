@@ -68,9 +68,9 @@ pub fn default_max_mem_mib(total_mib: u64) -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JvmArgsError {
-    #[error("额外 JVM 参数中不能包含内存参数“{0}”，请使用内存设置来调整内存大小")]
+    #[error("{}", rust_i18n::t!("errors.jvm.memory_flag", flag = .0))]
     MemoryFlag(String),
-    #[error("额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择")]
+    #[error("{}", rust_i18n::t!("errors.jvm.version_flag"))]
     VersionFlag,
 }
 

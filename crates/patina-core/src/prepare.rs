@@ -47,36 +47,38 @@ impl std::fmt::Display for PrepareWarning {
             PrepareWarning::LowMemory {
                 requested_mib,
                 available_mib,
-            } => write!(
-                f,
-                "可用内存不足：请求 {requested_mib} MiB，当前可用 {available_mib} MiB，游戏可能卡顿或崩溃"
-            ),
-            PrepareWarning::GcPresetIgnored { preset, java_major } => write!(
-                f,
-                "GC 预设 {preset:?} 需要 Java {} 及以上，当前 Java {java_major}，已忽略该预设",
-                preset.min_java_major()
-            ),
+            } => f.write_str(&rust_i18n::t!(
+                "warnings.low_memory",
+                requested = requested_mib,
+                available = available_mib
+            )),
+            PrepareWarning::GcPresetIgnored { preset, java_major } => f.write_str(&rust_i18n::t!(
+                "warnings.gc_preset_ignored",
+                preset = format!("{preset:?}"),
+                required = preset.min_java_major(),
+                found = java_major
+            )),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareError {
-    #[error("未知的游戏版本：{0}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.unknown_version", version = .0))]
     UnknownVersion(String),
-    #[error("Java 版本过低：此版本需要 Java {required}，所选 Java 为 {found}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.java_too_old", required = .required, found = .found))]
     JavaTooOld { required: u32, found: u32 },
-    #[error("找不到可用的 Java：{}", .0.display())]
+    #[error("{}", rust_i18n::t!("errors.prepare.java_not_found", path = .0.display()))]
     JavaNotFound(PathBuf),
-    #[error("额外 JVM 参数无效：{0}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.invalid_jvm_args", error = .0))]
     InvalidJvmArgs(#[from] JvmArgsError),
-    #[error("安装 Java 运行时失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.runtime", error = .0))]
     Runtime(#[from] RuntimeError),
-    #[error("下载游戏文件失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.download", error = .0))]
     Download(#[from] DownloadError),
-    #[error("文件操作失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.io", error = .0))]
     Io(#[from] io::Error),
-    #[error("解析版本数据失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.prepare.json", error = .0))]
     Json(#[from] serde_json::Error),
 }
 
@@ -243,7 +245,6 @@ impl Launcher {
                 preset: js.gc_preset,
                 java_major: java.major,
             };
-            eprintln!("警告：{w}");
             warnings.push(w);
             Vec::new()
         };
@@ -352,7 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn warnings_render_in_chinese() {
+    fn warnings_render_with_values() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        set_language(Language::ZhCn);
         let w = PrepareWarning::GcPresetIgnored {
             preset: GcPreset::GenerationalZgc,
             java_major: 8,
@@ -363,6 +367,9 @@ mod tests {
             available_mib: 1000,
         };
         assert!(w.to_string().contains("4096"));
+        set_language(Language::En);
+        assert!(w.to_string().contains("Not enough free memory"));
+        set_language(Language::ZhCn);
     }
 
     #[tokio::test]

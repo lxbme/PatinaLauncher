@@ -7,15 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceError {
-    #[error("文件操作失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.instance.io", error = .0))]
     Io(#[from] std::io::Error),
-    #[error("实例配置格式错误：{0}")]
+    #[error("{}", rust_i18n::t!("errors.instance.parse", error = .0))]
     Parse(#[from] toml::de::Error),
-    #[error("序列化实例配置失败：{0}")]
+    #[error("{}", rust_i18n::t!("errors.instance.serialize", error = .0))]
     Serialize(#[from] toml::ser::Error),
-    #[error("找不到实例：{0}")]
+    #[error("{}", rust_i18n::t!("errors.instance.not_found", id = .0))]
     NotFound(String),
-    #[error("无效的实例 ID：{0}")]
+    #[error("{}", rust_i18n::t!("errors.instance.invalid_id", id = .0))]
     InvalidId(String),
 }
 
