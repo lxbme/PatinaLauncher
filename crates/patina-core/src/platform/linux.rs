@@ -44,7 +44,11 @@ pub fn rule_os_name() -> &'static str {
 }
 
 pub fn rule_arch() -> &'static str {
-    if cfg!(target_arch = "x86") { "x86" } else { "x86_64" }
+    if cfg!(target_arch = "x86") {
+        "x86"
+    } else {
+        "x86_64"
+    }
 }
 
 /// Filled in by Task 8.

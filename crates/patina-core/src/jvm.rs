@@ -131,14 +131,20 @@ pub fn split_args(s: &str) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryCheck {
     Ok,
-    Low { requested_mib: u32, available_mib: u64 },
+    Low {
+        requested_mib: u32,
+        available_mib: u64,
+    },
 }
 
 /// Warns when the requested memory exceeds 70% of the available memory.
 pub fn check_available_memory(min_mib: u32, max_mib: u32, available_mib: u64) -> MemoryCheck {
     let requested = min_mib.max(max_mib);
     if (requested as f64) * 0.7 > available_mib as f64 {
-        MemoryCheck::Low { requested_mib: requested, available_mib }
+        MemoryCheck::Low {
+            requested_mib: requested,
+            available_mib,
+        }
     } else {
         MemoryCheck::Ok
     }
@@ -153,54 +159,111 @@ pub fn clamp_for_arch(max_mib: u32, is_64bit: bool) -> u32 {
 mod tests {
     use super::*;
 
-    #[test] fn default_memory() {
+    #[test]
+    fn default_memory() {
         assert_eq!(default_max_mem_mib(4096), 2730);
         assert_eq!(default_max_mem_mib(6143), 4095);
         assert_eq!(default_max_mem_mib(6144), 4096);
         assert_eq!(default_max_mem_mib(32768), 4096);
     }
-    #[test] fn rejects_memory_and_version_flags() {
-        assert!(matches!(validate_extra_jvm_args("-Xmx4G"), Err(JvmArgsError::MemoryFlag(_))));
-        assert!(matches!(validate_extra_jvm_args("-Dx=1 -Xms1G"), Err(JvmArgsError::MemoryFlag(_))));
-        assert!(matches!(validate_extra_jvm_args("-XX:MaxHeapSize=1g"), Err(JvmArgsError::MemoryFlag(_))));
-        assert!(matches!(validate_extra_jvm_args("-XX:InitialHeapSize=1g"), Err(JvmArgsError::MemoryFlag(_))));
-        assert!(matches!(validate_extra_jvm_args("-XX:PermSize=128m"), Err(JvmArgsError::MemoryFlag(_))));
-        assert!(matches!(validate_extra_jvm_args("-version:1.8"), Err(JvmArgsError::VersionFlag)));
+    #[test]
+    fn rejects_memory_and_version_flags() {
+        assert!(matches!(
+            validate_extra_jvm_args("-Xmx4G"),
+            Err(JvmArgsError::MemoryFlag(_))
+        ));
+        assert!(matches!(
+            validate_extra_jvm_args("-Dx=1 -Xms1G"),
+            Err(JvmArgsError::MemoryFlag(_))
+        ));
+        assert!(matches!(
+            validate_extra_jvm_args("-XX:MaxHeapSize=1g"),
+            Err(JvmArgsError::MemoryFlag(_))
+        ));
+        assert!(matches!(
+            validate_extra_jvm_args("-XX:InitialHeapSize=1g"),
+            Err(JvmArgsError::MemoryFlag(_))
+        ));
+        assert!(matches!(
+            validate_extra_jvm_args("-XX:PermSize=128m"),
+            Err(JvmArgsError::MemoryFlag(_))
+        ));
+        assert!(matches!(
+            validate_extra_jvm_args("-version:1.8"),
+            Err(JvmArgsError::VersionFlag)
+        ));
         assert!(validate_extra_jvm_args("-Dfoo=bar -XX:+UseG1GC").is_ok());
         assert!(validate_extra_jvm_args("").is_ok());
     }
-    #[test] fn presets() {
+    #[test]
+    fn presets() {
         assert_eq!(GcPreset::default(), GcPreset::None);
         assert!(GcPreset::None.args(25).is_empty());
         assert!(GcPreset::Custom.args(25).is_empty());
         assert!(!GcPreset::GenerationalZgc.is_compatible(17));
-        assert_eq!(GcPreset::GenerationalZgc.args(21), vec!["-XX:+UseZGC", "-XX:+ZGenerational"]);
+        assert_eq!(
+            GcPreset::GenerationalZgc.args(21),
+            vec!["-XX:+UseZGC", "-XX:+ZGenerational"]
+        );
         assert_eq!(GcPreset::GenerationalZgc.args(23), vec!["-XX:+UseZGC"]);
         let g1 = GcPreset::G1Aikar.args(8);
         assert_eq!(g1.len(), 18);
         assert_eq!(g1[0], "-XX:+UseG1GC");
         assert!(GcPreset::G1Aikar.is_compatible(8));
     }
-    #[test] fn memory_check() {
-        assert_eq!(check_available_memory(512, 4096, 2000), MemoryCheck::Low { requested_mib: 4096, available_mib: 2000 });
+    #[test]
+    fn memory_check() {
+        assert_eq!(
+            check_available_memory(512, 4096, 2000),
+            MemoryCheck::Low {
+                requested_mib: 4096,
+                available_mib: 2000
+            }
+        );
         assert_eq!(check_available_memory(512, 4096, 2868), MemoryCheck::Ok); // 4096*0.7 = 2867.2
-        assert_eq!(check_available_memory(6000, 4096, 4000), MemoryCheck::Low { requested_mib: 6000, available_mib: 4000 });
+        assert_eq!(
+            check_available_memory(6000, 4096, 4000),
+            MemoryCheck::Low {
+                requested_mib: 6000,
+                available_mib: 4000
+            }
+        );
     }
-    #[test] fn arch_clamp() { assert_eq!(clamp_for_arch(4096, false), 2048); assert_eq!(clamp_for_arch(4096, true), 4096); }
-    #[test] fn split() { assert_eq!(split_args(r#"-Da="x y" -Db  '-Dc=z w'"#), vec!["-Da=x y", "-Db", "-Dc=z w"]); }
-    #[test] fn split_edge_cases() {
+    #[test]
+    fn arch_clamp() {
+        assert_eq!(clamp_for_arch(4096, false), 2048);
+        assert_eq!(clamp_for_arch(4096, true), 4096);
+    }
+    #[test]
+    fn split() {
+        assert_eq!(
+            split_args(r#"-Da="x y" -Db  '-Dc=z w'"#),
+            vec!["-Da=x y", "-Db", "-Dc=z w"]
+        );
+    }
+    #[test]
+    fn split_edge_cases() {
         assert!(split_args("").is_empty());
         assert!(split_args("   ").is_empty());
         assert_eq!(split_args(r#"-Da="x y"#), vec!["-Da=x y"]);
         assert_eq!(split_args(r#""" a"#), vec!["", "a"]);
     }
-    #[test] fn gc_preset_serde_snake_case() {
+    #[test]
+    fn gc_preset_serde_snake_case() {
         #[derive(Deserialize, Serialize)]
-        struct W { g: GcPreset }
+        struct W {
+            g: GcPreset,
+        }
         let w: W = toml::from_str("g = \"none\"").unwrap();
         assert_eq!(w.g, GcPreset::None);
         let w: W = toml::from_str("g = \"generational_zgc\"").unwrap();
         assert_eq!(w.g, GcPreset::GenerationalZgc);
-        assert!(toml::to_string(&W { g: GcPreset::G1Aikar }).unwrap().contains("g1_aikar"));
+        assert!(
+            toml::to_string(&W {
+                g: GcPreset::G1Aikar
+            })
+            .unwrap()
+            .contains("g1_aikar")
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Instance storage: one directory per instance with `instance.toml`.
 
-use crate::config::{write_atomic, JavaSettings};
+use crate::config::{JavaSettings, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -112,7 +112,7 @@ impl InstanceStore {
         let text = match std::fs::read_to_string(dir.join(CONFIG_FILE)) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(InstanceError::NotFound(id.to_string()))
+                return Err(InstanceError::NotFound(id.to_string()));
             }
             Err(e) => return Err(e.into()),
         };
@@ -156,7 +156,11 @@ impl InstanceStore {
         let base = sanitize_dir_name(name);
         let mut n = 1u32;
         let (id, dir) = loop {
-            let id = if n == 1 { base.clone() } else { format!("{base} ({n})") };
+            let id = if n == 1 {
+                base.clone()
+            } else {
+                format!("{base} ({n})")
+            };
             let dir = self.root.join(&id);
             match std::fs::create_dir(&dir) {
                 Ok(()) => break (id, dir),
@@ -290,7 +294,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = InstanceStore::new(tmp.path());
         assert!(store.load("../x").is_err());
-        assert!(matches!(store.load("nope"), Err(InstanceError::NotFound(_))));
+        assert!(matches!(
+            store.load("nope"),
+            Err(InstanceError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -300,7 +307,10 @@ mod tests {
         let store = InstanceStore::new(tmp.path());
         let mut i = store.create("J", "1.20").unwrap();
         assert_eq!(effective_java(&g, &i.config), &g);
-        let o = JavaSettings { min_mem_mib: 1024, ..Default::default() };
+        let o = JavaSettings {
+            min_mem_mib: 1024,
+            ..Default::default()
+        };
         i.config.java_override = Some(o.clone());
         store.save(&i).unwrap();
         let re = store.load("J").unwrap();
