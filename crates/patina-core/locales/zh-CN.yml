@@ -43,6 +43,7 @@ errors:
       http: "服务器返回状态码 %{status}"
       hash_mismatch: "文件校验值不符（应为 %{expected}，实际为 %{actual}）"
       size_mismatch: "文件大小不符（应为 %{expected} 字节，实际为 %{actual} 字节）"
+      too_slow: "下载源速度过慢"
       network: "网络错误：%{error}"
       io: "无法写入文件：%{error}"
       no_attempt: "没有尝试任何下载源"

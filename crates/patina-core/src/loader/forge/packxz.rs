@@ -16,6 +16,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::download::{DownloadError, DownloadJob, Downloader, sha1_file};
+use crate::fsutil::unique_sibling;
 use crate::java::ManagedRuntimes;
 use crate::loader::list::LoaderError;
 use crate::platform;
@@ -226,17 +227,25 @@ impl<'a> Unpack200<'a> {
     }
 }
 
-/// `dest` with `suffix` appended to its file name.
-fn sibling(dest: &Path, suffix: &str) -> PathBuf {
-    let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    dest.with_file_name(name)
-}
-
 fn remove_if_exists(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    }
+}
+
+/// Temporary files removed (best effort) when dropped.
+struct TempFiles([PathBuf; 3]);
+
+impl TempFiles {
+    fn clear(&self) -> io::Result<()> {
+        self.0.iter().try_for_each(|t| remove_if_exists(t))
+    }
+}
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        let _ = self.clear();
     }
 }
 
@@ -276,12 +285,13 @@ pub(crate) async fn ensure_legacy_library(
         Err(DownloadError::Io(e)) => return Err(e.into()),
     }
 
-    // 2. `<url>.pack.xz`.
-    let temps = [".pack.xz", ".pack", ".unpacked"].map(|s| sibling(dest, s));
-    let clear = || temps.iter().try_for_each(|t| remove_if_exists(t));
-    clear()?;
-    let unpacked = from_pack_xz(tools, job, checksums, &temps).await;
-    clear()?;
+    // 2. `<url>.pack.xz`, through temporary files unique to this call (see
+    // `fsutil::TEMP_SUFFIXES`); they are removed when done, or when this
+    // future is dropped midway.
+    let temps = [".pack.xz.part", ".pack.part", ".unpacked.part"];
+    let temps = TempFiles(temps.map(|s| unique_sibling(dest, s)));
+    let unpacked = from_pack_xz(tools, job, checksums, &temps.0).await;
+    temps.clear()?;
     if unpacked {
         Ok(())
     } else {

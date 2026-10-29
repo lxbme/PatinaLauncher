@@ -9,7 +9,7 @@ use super::installer::InstallerProfile;
 use super::packxz::{Unpack200, ensure_legacy_library};
 use super::{checked_profile_id, download_libraries, fill_sha1_from_sidecars, write_profile};
 use crate::download::{DownloadJob, Downloader};
-use crate::fsutil::safe_join;
+use crate::fsutil::{replace_atomic_part, safe_join};
 use crate::loader::list::LoaderError;
 use crate::loader::{InstallPhase, InstalledProfile, LoaderKind, ProgressSink, report};
 use crate::meta::{RuleEnv, maven_path};
@@ -93,26 +93,17 @@ pub async fn install_legacy(
     Ok(InstalledProfile { profile_id })
 }
 
-/// Copies jar entry `name` to `dest` through a `.part` file.
+/// Copies jar entry `name` to `dest` through a unique `.part` file (see
+/// [`replace_atomic_part`]).
 fn extract_entry(jar: &Path, name: &str, dest: &Path) -> Result<(), LoaderError> {
     let invalid = |e: &dyn std::fmt::Display| LoaderError::InstallerInvalid(format!("{name}: {e}"));
     let mut zip = zip::ZipArchive::new(std::fs::File::open(jar)?).map_err(|e| invalid(&e))?;
     let mut entry = zip.by_name(name).map_err(|e| invalid(&e))?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut part = dest.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
-    let copied = std::fs::File::create(&part).and_then(|mut f| {
+    replace_atomic_part(dest, |part| {
+        let mut f = std::fs::File::create(part)?;
         std::io::copy(&mut entry, &mut f)?;
         f.sync_all()
-    });
-    if let Err(e) = copied {
-        let _ = std::fs::remove_file(&part);
-        return Err(e.into());
-    }
-    std::fs::rename(&part, dest)?;
+    })?;
     Ok(())
 }
 

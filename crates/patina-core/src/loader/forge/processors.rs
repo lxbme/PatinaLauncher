@@ -13,7 +13,7 @@ use zip::result::ZipError;
 
 use crate::download::mirror::canonical_url;
 use crate::download::{DownloadJob, Downloader, sha1_file};
-use crate::fsutil::{is_safe_rel, safe_join};
+use crate::fsutil::{is_safe_rel, replace_atomic_part, safe_join};
 use crate::loader::list::LoaderError;
 use crate::loader::{InstallPhase, ProgressSink, report};
 use crate::meta::{VersionJson, maven_path};
@@ -171,7 +171,8 @@ pub fn resolve_data(
     Ok(out)
 }
 
-/// Copies jar entries to their destinations (through `.part` files) and
+/// Copies jar entries to their destinations (through unique `.part` files,
+/// see [`replace_atomic_part`]) and
 /// returns the destinations written. A missing entry is an error when
 /// `required`, else skipped.
 pub(crate) fn extract_entries(
@@ -190,21 +191,11 @@ pub(crate) fn extract_entries(
             Err(ZipError::FileNotFound) if !required => continue,
             Err(e) => return Err(invalid(format!("{name}: {e}"))),
         };
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut part = dest.as_os_str().to_owned();
-        part.push(".part");
-        let part = PathBuf::from(part);
-        let copied = File::create(&part).and_then(|mut f| {
+        replace_atomic_part(dest, |part| {
+            let mut f = File::create(part)?;
             std::io::copy(&mut entry, &mut f)?;
             f.sync_all()
-        });
-        if let Err(e) = copied {
-            let _ = std::fs::remove_file(&part);
-            return Err(e.into());
-        }
-        std::fs::rename(&part, dest)?;
+        })?;
         written.push(dest.clone());
     }
     Ok(written)

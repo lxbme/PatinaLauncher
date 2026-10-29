@@ -27,14 +27,42 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     is_safe_rel(rel).then(|| root.join(rel))
 }
 
-/// A temp file name next to `path` that no other writer in this or another
-/// process uses: `<name>.<pid>.<counter>.tmp`.
-pub fn unique_tmp_path(path: &Path) -> PathBuf {
+/// Suffixes of every temporary file Patina writes next to its target. All
+/// are named `<name>.<pid>.<counter><rest>` by [`unique_sibling`], so a file
+/// whose `<pid>` is not a live Patina process is a leftover:
+///
+/// - `<name>.<pid>.<n>.tmp`: [`replace_atomic`] / [`write_atomic`].
+/// - `<name>.<pid>.<n>.part`: downloads (one per attempt) and jar entry
+///   extraction ([`replace_atomic_part`]).
+/// - `<name>.<pid>.<n>.pack.xz.part`, `<name>.<pid>.<n>.pack.part`,
+///   `<name>.<pid>.<n>.unpacked.part`: the legacy Forge `.pack.xz` fallback
+///   (the downloaded `.pack.xz.part` gets its own download part file too).
+///
+/// A sweep therefore covers `*.<pid>.<n>.tmp` and `*.part`.
+pub const TEMP_SUFFIXES: [&str; 2] = [TMP_SUFFIX, PART_SUFFIX];
+const TMP_SUFFIX: &str = ".tmp";
+const PART_SUFFIX: &str = ".part";
+
+/// A file name next to `path` that no other writer in this or another
+/// process uses: `<name>.<pid>.<counter><suffix>`.
+pub fn unique_sibling(path: &Path, suffix: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    name.push(format!(".{}.{n}{suffix}", std::process::id()));
     path.with_file_name(name)
+}
+
+/// A temp file name next to `path` that no other writer uses:
+/// `<name>.<pid>.<counter>.tmp` (see [`unique_sibling`]).
+pub fn unique_tmp_path(path: &Path) -> PathBuf {
+    unique_sibling(path, TMP_SUFFIX)
+}
+
+/// A part file name next to `path` that no other writer uses:
+/// `<name>.<pid>.<counter>.part` (see [`unique_sibling`]).
+pub fn unique_part_path(path: &Path) -> PathBuf {
+    unique_sibling(path, PART_SUFFIX)
 }
 
 /// Makes `path` by `fill`ing a unique temp file next to it (see
@@ -44,10 +72,26 @@ pub fn replace_atomic(
     path: &Path,
     fill: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    replace_via(path, unique_tmp_path(path), fill)
+}
+
+/// [`replace_atomic`] through a unique `.part` file (see
+/// [`unique_part_path`]), for extracted content.
+pub fn replace_atomic_part(
+    path: &Path,
+    fill: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    replace_via(path, unique_part_path(path), fill)
+}
+
+fn replace_via(
+    path: &Path,
+    tmp: PathBuf,
+    fill: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = unique_tmp_path(path);
     let r = fill(&tmp).and_then(|()| std::fs::rename(&tmp, path));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -164,6 +208,44 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn part_paths_are_unique_siblings() {
+        let p = Path::new("/d/x.jar");
+        let (a, b) = (unique_part_path(p), unique_part_path(p));
+        assert_ne!(a, b);
+        let pid = std::process::id();
+        for t in [&a, &b] {
+            assert_eq!(t.parent(), p.parent());
+            let name = t.file_name().unwrap().to_str().unwrap();
+            let mid = name
+                .strip_prefix(&format!("x.jar.{pid}."))
+                .and_then(|r| r.strip_suffix(".part"))
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(mid.parse::<u64>().is_ok(), "{name}");
+        }
+        let t = unique_sibling(p, ".pack.xz.part");
+        assert!(
+            TEMP_SUFFIXES
+                .iter()
+                .any(|s| t.to_str().unwrap().ends_with(s))
+        );
+    }
+
+    #[test]
+    fn failed_part_replace_leaves_no_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.jar");
+        let r = replace_atomic_part(&target, |tmp| {
+            std::fs::write(tmp, b"half")?;
+            Err(std::io::Error::other("copy failed"))
+        });
+        assert!(r.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        replace_atomic_part(&target, |tmp| std::fs::write(tmp, b"ok")).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"ok");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

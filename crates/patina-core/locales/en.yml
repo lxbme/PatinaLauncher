@@ -43,6 +43,7 @@ errors:
       http: "the server returned HTTP status %{status}"
       hash_mismatch: "file checksum mismatch (expected %{expected}, got %{actual})"
       size_mismatch: "file size mismatch (expected %{expected} bytes, got %{actual} bytes)"
+      too_slow: "the download source is too slow"
       network: "network error: %{error}"
       io: "could not write the file: %{error}"
       no_attempt: "no download source was tried"
