@@ -66,7 +66,7 @@ pub fn installer_url(kind: LoaderKind, coord: &str) -> String {
 /// A version string that is safe inside a maven coordinate, a URL path and a
 /// file name: one path component, no `?`, `#`, `%`, `:`, `@`, whitespace or
 /// control characters.
-fn is_safe_version(s: &str) -> bool {
+pub(crate) fn is_safe_version(s: &str) -> bool {
     is_safe_name(s)
         && !s.contains(['?', '#', '%', ':', '@'])
         && !s.chars().any(|c| c.is_whitespace() || c.is_control())

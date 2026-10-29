@@ -29,6 +29,11 @@ errors:
     processor_killed: "加载器安装的第 %{step} 步在完成前被终止"
     processor_output_mismatch: "加载器安装生成的文件不正确：%{path}"
     legacy_library_unavailable: "无法从任何下载源获取旧版加载器依赖库 %{name}"
+    conflict: "该实例已安装 %{existing} %{version}，更换为其他加载器会替换它，需要你确认"
+    incompatible: "%{kind} %{version} 不支持新的 Minecraft 版本，请更换为兼容的 %{kind} 版本或移除加载器"
+    incompatible_no_replacement: "%{kind} %{version} 不支持新的 Minecraft 版本，且新版本没有可用的 %{kind}，请移除加载器后继续"
+    instance: "读取或保存实例失败：%{error}"
+    prepare: "为加载器准备游戏文件失败：%{error}"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
@@ -70,3 +75,6 @@ loader:
   forge: "Forge"
   neoforge: "NeoForge"
   fabric: "Fabric"
+notices:
+  loader:
+    mods_may_be_incompatible: "已更换模组加载器，已安装的模组可能无法在新的加载器上运行"

@@ -209,7 +209,31 @@ impl Launcher {
         Ok(v)
     }
 
-    async fn select_java(
+    /// The vanilla client jar at `versions/<mc>/<mc>.jar` (keyed on the
+    /// requested id, like [`Launcher::ensure_version`]), downloaded and
+    /// verified unless a matching file is already there. Returns its
+    /// absolute path.
+    pub(crate) async fn ensure_client_jar(
+        &self,
+        mc: &str,
+        version: &VersionJson,
+    ) -> Result<PathBuf, PrepareError> {
+        let mc = checked_name(mc)?;
+        let dest = std::path::absolute(self.data.versions().join(mc).join(format!("{mc}.jar")))?;
+        let client = &version.downloads.client;
+        let job = DownloadJob {
+            url: client.url.clone(),
+            dest: dest.clone(),
+            sha1: Some(client.sha1.clone()),
+            size: Some(client.size),
+        };
+        self.downloader.run(vec![job], None).await?;
+        Ok(dest)
+    }
+
+    /// `java_path`, or (when `None`) the managed runtime `version` asks for,
+    /// installed on first use.
+    pub(crate) async fn select_java(
         &self,
         java_path: Option<&Path>,
         version: &VersionJson,
@@ -318,15 +342,7 @@ impl Launcher {
 
         let env = RuleEnv::current();
         let libs = resolve_libraries(&version.libraries, &env, &data.libraries());
-        let client = &version.downloads.client;
-        let client_jar = data.versions().join(jar_id).join(format!("{jar_id}.jar"));
-        let mut jobs = vec![DownloadJob {
-            url: client.url.clone(),
-            dest: client_jar.clone(),
-            sha1: Some(client.sha1.clone()),
-            size: Some(client.size),
-        }];
-        jobs.extend(libs.jobs.iter().cloned());
+        let mut jobs = libs.jobs.clone();
         jobs.extend(asset_jobs(&index, &assets_dir));
         let logging = version.logging.as_ref().and_then(|l| l.client.as_ref());
         let logging_config = match logging {
@@ -342,7 +358,10 @@ impl Launcher {
             }
             _ => None,
         };
-        self.downloader.run(jobs, progress).await?;
+        // The client jar downloads alongside the rest (outside `progress`).
+        let (client_jar, ()) = tokio::try_join!(self.ensure_client_jar(jar_id, &version), async {
+            Ok::<(), PrepareError>(self.downloader.run(jobs, progress).await?)
+        },)?;
 
         // 6. Natives, legacy asset layout, game directory.
         extract_natives(&libs.natives, &natives_dir)?;

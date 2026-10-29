@@ -9,6 +9,8 @@ use serde::Deserialize;
 
 use super::LoaderKind;
 use crate::download::{DownloadError, Downloader, FailReason};
+use crate::instance::InstanceError;
+use crate::prepare::PrepareError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
@@ -45,6 +47,40 @@ pub enum LoaderError {
     /// a plain jar nor as a `.pack.xz`; `name` is its maven coordinate.
     #[error("{}", rust_i18n::t!("errors.loader.legacy_library_unavailable", name = .name))]
     LegacyLibraryUnavailable { name: String },
+    /// The instance already has another kind of loader; replacing it needs
+    /// the user's confirmation.
+    #[error("{}", rust_i18n::t!("errors.loader.conflict", existing = .existing.display_name(), version = .existing_version))]
+    Conflict {
+        existing: LoaderKind,
+        existing_version: String,
+    },
+    /// The installed loader version does not support the requested
+    /// Minecraft version; `can_replace` tells whether some version of the
+    /// same loader does.
+    #[error("{}", incompatible_text(*.kind, .version, *.can_replace))]
+    Incompatible {
+        kind: LoaderKind,
+        version: String,
+        can_replace: bool,
+    },
+    #[error("{}", rust_i18n::t!("errors.loader.instance", error = .0))]
+    Instance(#[from] InstanceError),
+    #[error("{}", rust_i18n::t!("errors.loader.prepare", error = .0))]
+    Prepare(#[from] PrepareError),
+}
+
+fn incompatible_text(kind: LoaderKind, version: &str, can_replace: bool) -> String {
+    let kind = kind.display_name();
+    if can_replace {
+        rust_i18n::t!("errors.loader.incompatible", kind = kind, version = version)
+    } else {
+        rust_i18n::t!(
+            "errors.loader.incompatible_no_replacement",
+            kind = kind,
+            version = version
+        )
+    }
+    .to_string()
 }
 
 /// Steps are shown 1-based.
