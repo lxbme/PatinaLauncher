@@ -2,11 +2,11 @@
 
 pub use super::InstalledProfile;
 use super::list::LoaderError;
-use super::{InstallPhase, ProgressSink, report};
-use crate::download::{Downloader, Progress};
+use crate::download::Downloader;
 use crate::fsutil::{is_safe_name, safe_join, write_atomic};
 use crate::meta::{PartialVersionJson, RuleEnv};
 use crate::paths::DataDirs;
+use crate::progress::{Phase, ProgressSink, Unit, report, run_downloads};
 use crate::resolve::resolve_libraries;
 
 /// Fetches the Fabric profile for `mc` + `loader_version`, downloads its
@@ -18,7 +18,7 @@ pub async fn install_fabric(
     loader_version: &str,
     progress: &ProgressSink,
 ) -> Result<InstalledProfile, LoaderError> {
-    report(progress, InstallPhase::FetchMetadata, 0, 1);
+    report(progress, Phase::FetchMetadata, 0, 1, Unit::Items);
     let url =
         format!("https://meta.fabricmc.net/v2/versions/loader/{mc}/{loader_version}/profile/json");
     let bytes = dl.fetch_bytes(&url, None).await?;
@@ -26,26 +26,24 @@ pub async fn install_fabric(
     if !is_safe_name(&profile.id) {
         return Err(LoaderError::UnsafeMetadata(profile.id));
     }
-    report(progress, InstallPhase::FetchMetadata, 1, 1);
+    report(progress, Phase::FetchMetadata, 1, 1, Unit::Items);
 
     let resolved = resolve_libraries(&profile.libraries, &RuleEnv::current(), &data.libraries());
-    let total = resolved.jobs.len();
-    report(progress, InstallPhase::DownloadLibraries, 0, total);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
-    let run = dl.run(resolved.jobs, Some(tx));
-    let forward = async {
-        while let Some(p) = rx.recv().await {
-            report(progress, InstallPhase::DownloadLibraries, p.done, p.total);
-        }
-    };
-    let (res, ()) = tokio::join!(run, forward);
-    res?;
+    run_downloads(
+        dl,
+        resolved.jobs,
+        progress,
+        Phase::DownloadLibraries,
+        Unit::Items,
+        0,
+    )
+    .await?;
 
-    report(progress, InstallPhase::Finalize, 0, 1);
+    report(progress, Phase::Finalize, 0, 1, Unit::Items);
     let dir = safe_join(&data.versions(), &profile.id)
         .ok_or_else(|| LoaderError::UnsafeMetadata(profile.id.clone()))?;
     write_atomic(&dir.join(format!("{}.json", profile.id)), &bytes)?;
-    report(progress, InstallPhase::Finalize, 1, 1);
+    report(progress, Phase::Finalize, 1, 1, Unit::Items);
     Ok(InstalledProfile {
         profile_id: profile.id,
     })
@@ -55,7 +53,7 @@ pub async fn install_fabric(
 mod tests {
     use super::*;
     use crate::download::Mirror;
-    use crate::loader::InstallProgress;
+    use crate::loader::TaskProgress;
     use crate::loader::forge::test_support::{FABRIC_HOSTS, offline_client};
     use serde_json::{Value, json};
     use sha1::{Digest, Sha1};
@@ -138,11 +136,11 @@ mod tests {
         );
         let asm = data.libraries().join("org/ow2/asm/asm/9.7.1/asm-9.7.1.jar");
         assert!(asm.is_file());
-        let mut last: Option<InstallProgress> = None;
+        let mut last: Option<TaskProgress> = None;
         while let Ok(p) = rx.try_recv() {
             last = Some(p);
         }
-        assert_eq!(last.unwrap().phase, InstallPhase::Finalize);
+        assert_eq!(last.unwrap().phase, Phase::Finalize);
     }
 
     #[tokio::test]

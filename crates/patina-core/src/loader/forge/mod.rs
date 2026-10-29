@@ -16,12 +16,13 @@ pub use processors::{Processor, ProcessorEnv, expand_arg, resolve_data, run_proc
 
 use futures::StreamExt;
 
+use super::LoaderKind;
 use super::list::LoaderError;
-use super::{InstallPhase, LoaderKind, ProgressSink, report};
-use crate::download::{DownloadJob, Downloader, Progress};
+use crate::download::{DownloadJob, Downloader};
 use crate::fsutil::{is_safe_name, safe_join, write_atomic};
 use crate::meta::PartialVersionJson;
 use crate::paths::DataDirs;
+use crate::progress::{Phase, ProgressSink, Unit, run_downloads};
 
 const NEOFORGE_ID_PREFIX: &str = "neoforge-";
 
@@ -121,22 +122,23 @@ pub(crate) async fn fill_sha1_from_sidecars(
     }
 }
 
-/// Runs `jobs`, forwarding progress as [`InstallPhase::DownloadLibraries`].
+/// Runs `jobs`, forwarding progress as [`Phase::DownloadLibraries`].
+/// `extra_items` is later work counted in the total from the start.
 pub(crate) async fn download_libraries(
     dl: &Downloader,
     jobs: Vec<DownloadJob>,
     progress: &ProgressSink,
+    extra_items: u64,
 ) -> Result<(), LoaderError> {
-    report(progress, InstallPhase::DownloadLibraries, 0, jobs.len());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
-    let run = dl.run(jobs, Some(tx));
-    let forward = async {
-        while let Some(p) = rx.recv().await {
-            report(progress, InstallPhase::DownloadLibraries, p.done, p.total);
-        }
-    };
-    let (res, ()) = tokio::join!(run, forward);
-    Ok(res?)
+    Ok(run_downloads(
+        dl,
+        jobs,
+        progress,
+        Phase::DownloadLibraries,
+        Unit::Items,
+        extra_items,
+    )
+    .await?)
 }
 
 #[cfg(test)]

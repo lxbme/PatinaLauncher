@@ -6,15 +6,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use patina_core::config::{GlobalConfig, SourceChoice};
-use patina_core::download::{Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT, fastest, measure_all};
+use patina_core::download::{Mirror, PROBE_URL, SPEEDTEST_TIMEOUT, fastest, measure_all};
 use patina_core::instance::{InstanceStore, effective_java};
 use patina_core::java::{ManagedRuntimes, detect_all};
 use patina_core::launch::{GameProcess, LogLine, dev_offline_account};
+use patina_core::loader::LoaderKind;
 use patina_core::loader::list::{LoaderError, VersionPick, list_versions};
 use patina_core::loader::ops::{OpOutcome, install_loader, remove_loader, set_mc_version};
-use patina_core::loader::{InstallPhase, InstallProgress, LoaderKind};
 use patina_core::paths::DataDirs;
 use patina_core::prepare::{Launcher, http_client, resolve_mirror};
+use patina_core::progress::{Phase, TaskProgress, Unit};
 use patina_dev::cli::{
     Cli, Cmd, InstanceCmd, JavaCmd, LoaderCmd, LoaderSpec, SourceCmd, parse_pick,
 };
@@ -330,13 +331,29 @@ fn print_notices(outcome: &OpOutcome) {
     }
 }
 
-fn phase_name(p: InstallPhase) -> &'static str {
+fn phase_name(p: Phase) -> &'static str {
     match p {
-        InstallPhase::FetchMetadata => "fetch-metadata",
-        InstallPhase::DownloadInstaller => "download-installer",
-        InstallPhase::DownloadLibraries => "download-libraries",
-        InstallPhase::RunProcessor => "run-processor",
-        InstallPhase::Finalize => "finalize",
+        Phase::FetchMetadata => "fetch-metadata",
+        Phase::DownloadRuntime => "download-runtime",
+        Phase::DownloadAssetIndex => "download-asset-index",
+        Phase::DownloadGameFiles => "download-game-files",
+        Phase::DownloadInstaller => "download-installer",
+        Phase::DownloadLibraries => "download-libraries",
+        Phase::RunProcessor => "run-processor",
+        Phase::Finalize => "finalize",
+        Phase::Launching => "launching",
+    }
+}
+
+/// `done/total`, in MB for byte progress.
+fn format_amount(p: &TaskProgress) -> String {
+    match p.unit {
+        Unit::Items => format!("{}/{}", p.done, p.total),
+        Unit::Bytes => format!(
+            "{:.1}/{:.1} MB",
+            p.done as f64 / 1_000_000.0,
+            p.total as f64 / 1_000_000.0
+        ),
     }
 }
 
@@ -345,23 +362,22 @@ fn phase_name(p: InstallPhase) -> &'static str {
 fn install_printer(
     start: Instant,
 ) -> (
-    mpsc::UnboundedSender<InstallProgress>,
+    mpsc::UnboundedSender<TaskProgress>,
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
     (tx, tokio::spawn(print_install_progress(rx, start)))
 }
 
-async fn print_install_progress(mut rx: mpsc::UnboundedReceiver<InstallProgress>, start: Instant) {
+async fn print_install_progress(mut rx: mpsc::UnboundedReceiver<TaskProgress>, start: Instant) {
     use std::io::Write;
-    let mut current: Option<InstallProgress> = None;
+    let mut current: Option<TaskProgress> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
-    let render = |p: &InstallProgress, newline: bool| {
+    let render = |p: &TaskProgress, newline: bool| {
         let line = format!(
-            "[{}] {}/{} ({:.1}s)",
+            "[{}] {} ({:.1}s)",
             phase_name(p.phase),
-            p.done,
-            p.total,
+            format_amount(p),
             start.elapsed().as_secs_f64()
         );
         if newline {
@@ -484,37 +500,6 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Prints download progress on one line, at most every 200 ms.
-async fn print_progress(mut rx: mpsc::UnboundedReceiver<Progress>, start: Instant) {
-    use std::io::Write;
-    let mut last_print: Option<Instant> = None;
-    let mut last = None;
-    let mut first = true;
-    while let Some(p) = rx.recv().await {
-        if first {
-            println!(
-                "Downloading game files (setup took {:.1}s)",
-                start.elapsed().as_secs_f64()
-            );
-            first = false;
-        }
-        last = Some(p);
-        if last_print.is_none_or(|t| t.elapsed() >= Duration::from_millis(200)) {
-            print!("\rDownloading {}/{} ", p.done, p.total);
-            let _ = std::io::stdout().flush();
-            last_print = Some(Instant::now());
-        }
-    }
-    if let Some(p) = last {
-        println!(
-            "\rDownloaded {}/{} (total {:.1}s)",
-            p.done,
-            p.total,
-            start.elapsed().as_secs_f64()
-        );
-    }
-}
-
 async fn print_logs(mut rx: mpsc::UnboundedReceiver<LogLine>) {
     while let Some(l) = rx.recv().await {
         println!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
@@ -545,8 +530,7 @@ async fn launch(ctx: &mut Ctx, id: &str, player: &str) -> Result<()> {
     }
 
     let start = Instant::now();
-    let (ptx, prx) = mpsc::unbounded_channel();
-    let printer = tokio::spawn(print_progress(prx, start));
+    let (ptx, printer) = install_printer(start);
     let account = dev_offline_account(player);
     let result = launcher
         .prepare(&inst, &ctx.config, &account, Some(ptx))

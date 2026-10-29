@@ -4,12 +4,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
-
 use crate::config::GlobalConfig;
 use crate::download::{
-    DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT,
-    pick_fastest, resolve_choice, sha1_file,
+    DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, SPEEDTEST_TIMEOUT, pick_fastest,
+    resolve_choice, sha1_file,
 };
 use crate::fsutil::{is_safe_name, safe_join};
 use crate::fsutil::{replace_atomic, write_atomic};
@@ -30,6 +28,7 @@ use crate::meta::{
 };
 use crate::paths::DataDirs;
 use crate::platform;
+use crate::progress::{Phase, ProgressSink, Unit, report, run_downloads};
 use crate::resolve::{
     AssetIndex, asset_jobs, asset_layout, extract_natives, materialize_legacy, resolve_libraries,
 };
@@ -298,6 +297,7 @@ impl Launcher {
         &self,
         java_path: Option<&Path>,
         version: &VersionJson,
+        progress: &ProgressSink,
     ) -> Result<JavaInstall, PrepareError> {
         let req = version.java_requirement();
         match java_path {
@@ -316,7 +316,9 @@ impl Launcher {
                 let bin = if runtimes.is_installed(&req.component) {
                     runtimes.java_bin(&req.component)
                 } else {
-                    runtimes.install(&self.downloader, &req.component).await?
+                    runtimes
+                        .install(&self.downloader, &req.component, progress)
+                        .await?
                 };
                 probe_blocking(bin).await
             }
@@ -328,7 +330,7 @@ impl Launcher {
         inst: &Instance,
         global: &GlobalConfig,
         account: &LaunchAccount,
-        progress: Option<UnboundedSender<Progress>>,
+        progress: ProgressSink,
     ) -> Result<Prepared, PrepareError> {
         // The game runs with cwd = game dir, so every path must be absolute.
         let data = DataDirs::new(std::path::absolute(self.data.root())?);
@@ -343,13 +345,17 @@ impl Launcher {
         // The client jar is keyed on the requested id, the same id
         // `ensure_version` caches the JSON under (may differ from `version.id`).
         let jar_id = inst.config.mc_version();
+        report(&progress, Phase::FetchMetadata, 0, 1, Unit::Items);
         let vanilla = self.ensure_version(jar_id).await?;
         checked_name(&vanilla.id)?;
         let version = self.merged_version(inst, vanilla).await?;
         checked_name(&version.id)?;
 
         // 2. Java.
-        let java = self.select_java(js.java_path.as_deref(), &version).await?;
+        report(&progress, Phase::FetchMetadata, 1, 1, Unit::Items);
+        let java = self
+            .select_java(js.java_path.as_deref(), &version, &progress)
+            .await?;
 
         // 3. Memory.
         let max = match (js.max_mem_mib, platform::total_memory_mib()) {
@@ -390,17 +396,20 @@ impl Launcher {
         let index_file = format!("{}.json", checked_name(&ai.id)?);
         let index_path = safe_join(&assets_dir.join("indexes"), &index_file)
             .ok_or_else(|| PrepareError::UnsafeMetadata(ai.id.clone()))?;
-        self.downloader
-            .run(
-                vec![DownloadJob {
-                    url: ai.url.clone(),
-                    dest: index_path.clone(),
-                    sha1: Some(ai.sha1.clone()),
-                    size: Some(ai.size),
-                }],
-                None,
-            )
-            .await?;
+        run_downloads(
+            &self.downloader,
+            vec![DownloadJob {
+                url: ai.url.clone(),
+                dest: index_path.clone(),
+                sha1: Some(ai.sha1.clone()),
+                size: Some(ai.size),
+            }],
+            &progress,
+            Phase::DownloadAssetIndex,
+            Unit::Items,
+            0,
+        )
+        .await?;
         let index: AssetIndex = serde_json::from_slice(&tokio::fs::read(&index_path).await?)?;
 
         let env = RuleEnv::current();
@@ -431,7 +440,15 @@ impl Launcher {
             }
             _ => None,
         };
-        self.downloader.run(jobs, progress).await?;
+        run_downloads(
+            &self.downloader,
+            jobs,
+            &progress,
+            Phase::DownloadGameFiles,
+            Unit::Items,
+            0,
+        )
+        .await?;
         let vanilla_jar = self.client_jar_job(jar_id, &version)?.dest;
         let client_jar = if inst.config.loader().is_some() {
             let (versions, id) = (data.versions(), version.id.clone());

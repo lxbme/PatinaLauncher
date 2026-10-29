@@ -11,9 +11,10 @@ use super::{checked_profile_id, download_libraries, fill_sha1_from_sidecars, wri
 use crate::download::{DownloadJob, Downloader};
 use crate::fsutil::{replace_atomic_part, safe_join};
 use crate::loader::list::LoaderError;
-use crate::loader::{InstallPhase, InstalledProfile, LoaderKind, ProgressSink, report};
+use crate::loader::{InstalledProfile, LoaderKind};
 use crate::meta::{RuleEnv, maven_path};
 use crate::paths::DataDirs;
+use crate::progress::{Phase, ProgressSink, Unit, report};
 use crate::resolve::resolve_libraries;
 
 /// Most `checksums` libraries fetched (and unpacked) at once.
@@ -72,8 +73,8 @@ pub async fn install_legacy(
         .partition(|j| checksummed.contains_key(&j.dest));
     fill_sha1_from_sidecars(dl, &mut jobs, |j| j.sha1.is_none() && j.dest != universal).await;
     let plain_total = jobs.len();
-    download_libraries(dl, jobs, progress).await?;
     let total = plain_total + legacy_jobs.len();
+    download_libraries(dl, jobs, progress, legacy_jobs.len() as u64).await?;
     let tools = Unpack200::new(dl, data.runtimes());
     let mut done = plain_total;
     let mut legacy = futures::stream::iter(&legacy_jobs)
@@ -84,12 +85,18 @@ pub async fn install_legacy(
         .buffer_unordered(LEGACY_CONCURRENCY);
     while legacy.try_next().await?.is_some() {
         done += 1;
-        report(progress, InstallPhase::DownloadLibraries, done, total);
+        report(
+            progress,
+            Phase::DownloadLibraries,
+            done as u64,
+            total as u64,
+            Unit::Items,
+        );
     }
 
-    report(progress, InstallPhase::Finalize, 0, 1);
+    report(progress, Phase::Finalize, 0, 1, Unit::Items);
     let profile_id = write_profile(data, LoaderKind::Forge, version)?;
-    report(progress, InstallPhase::Finalize, 1, 1);
+    report(progress, Phase::Finalize, 1, 1, Unit::Items);
     Ok(InstalledProfile { profile_id })
 }
 
@@ -116,7 +123,7 @@ mod tests {
         PACK_SHA1, PACK_SIG_SHA1, PACK_XZ, PACKED_ENTRIES, downloader, serve_jre_legacy, sha1_hex,
         write_zip,
     };
-    use crate::loader::{InstallPhase, InstallProgress};
+    use crate::loader::{Phase, TaskProgress};
     use crate::meta::PartialVersionJson;
     use serde_json::{Value, json};
     use wiremock::matchers::{method, path, path_regex};
@@ -236,11 +243,43 @@ mod tests {
         let written: PartialVersionJson = serde_json::from_slice(&written).unwrap();
         assert_eq!(written, expected_version);
 
-        let mut last: Option<InstallProgress> = None;
+        let mut last: Option<TaskProgress> = None;
         while let Ok(p) = rx.try_recv() {
             last = Some(p);
         }
-        assert_eq!(last.unwrap().phase, InstallPhase::Finalize);
+        assert_eq!(last.unwrap().phase, Phase::Finalize);
+    }
+
+    #[tokio::test]
+    async fn legacy_library_total_never_decreases() {
+        let server = MockServer::start().await;
+        serve(&server, LAUNCHWRAPPER, b"launchwrapper").await;
+        serve(
+            &server,
+            &format!("{LAUNCHWRAPPER}.sha1"),
+            format!("{}\n", sha1_hex(b"launchwrapper")).as_bytes(),
+        )
+        .await;
+        serve(&server, AKKA, b"akka").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataDirs::new(tmp.path().join("data"));
+        let jar = installer(tmp.path(), &profile_json());
+        let profile = read_installer(&jar).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        install_legacy(&downloader(&server, false), &data, &jar, profile, &Some(tx))
+            .await
+            .unwrap();
+        let mut libs = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            if p.phase == Phase::DownloadLibraries {
+                libs.push(p);
+            }
+        }
+        // One fixed total (plain + pack.xz libraries), rising done.
+        assert!(!libs.is_empty());
+        assert!(libs.iter().all(|p| p.total == libs[0].total), "{libs:?}");
+        assert!(libs.windows(2).all(|w| w[0].done <= w[1].done), "{libs:?}");
+        assert_eq!(libs.last().map(|p| (p.done, p.total)), Some((3, 3)));
     }
 
     #[tokio::test]

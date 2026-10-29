@@ -215,7 +215,7 @@ impl<'a> Unpack200<'a> {
             .get_or_init(|| async {
                 if !self.runtimes.is_installed(UNPACK200_RUNTIME) {
                     self.runtimes
-                        .install(self.dl, UNPACK200_RUNTIME)
+                        .install(self.dl, UNPACK200_RUNTIME, &None)
                         .await
                         .ok()?;
                 }
@@ -494,7 +494,10 @@ mod tests {
         let dl = Downloader::new(reqwest::Client::new(), Mirror::official())
             .with_fallback(Some(Mirror::bmclapi()));
         let runtimes = ManagedRuntimes::new(tmp.path().join("runtimes"));
-        runtimes.install(&dl, UNPACK200_RUNTIME).await.unwrap();
+        runtimes
+            .install(&dl, UNPACK200_RUNTIME, &None)
+            .await
+            .unwrap();
         let bin = platform::unpack200_in_home(&runtimes.home(UNPACK200_RUNTIME));
         let (xz, pack, jar) = (
             tmp.path().join("lib.jar.pack.xz"),

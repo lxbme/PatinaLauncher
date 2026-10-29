@@ -15,9 +15,9 @@ use crate::download::mirror::canonical_url;
 use crate::download::{DownloadJob, Downloader, sha1_file};
 use crate::fsutil::{is_safe_rel, replace_atomic_part, safe_join};
 use crate::loader::list::LoaderError;
-use crate::loader::{InstallPhase, ProgressSink, report};
 use crate::meta::{VersionJson, maven_path};
 use crate::platform::CLASSPATH_SEPARATOR;
+use crate::progress::{Phase, ProgressSink, Unit, report};
 
 /// The side Patina installs.
 pub const CLIENT: &str = "client";
@@ -322,14 +322,20 @@ pub async fn run_processors(
         }
     }
     let total = client.len();
-    report(progress, InstallPhase::RunProcessor, 0, total);
+    report(progress, Phase::RunProcessor, 0, total as u64, Unit::Items);
     for (done, (index, p)) in client.into_iter().enumerate() {
         if p.is_download_mojmaps() {
             download_mojmaps(p, env, dl, vanilla).await?;
         } else {
             run_one(java, index, done + 1, p, env).await?;
         }
-        report(progress, InstallPhase::RunProcessor, done + 1, total);
+        report(
+            progress,
+            Phase::RunProcessor,
+            (done + 1) as u64,
+            total as u64,
+            Unit::Items,
+        );
     }
     Ok(())
 }
@@ -793,7 +799,7 @@ mod tests {
         use crate::loader::forge::processors::test_java::{
             FakeJava, OUTPUT, downloader, processor_jar, vanilla,
         };
-        use crate::loader::{InstallPhase, InstallProgress};
+        use crate::loader::{Phase, TaskProgress};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -918,9 +924,9 @@ mod tests {
             assert_eq!(std::fs::read(st.lib("x:gen:1:client")).unwrap(), OUTPUT);
             assert!(!st.env.root.join("server.jar").exists());
 
-            let mut last: Option<InstallProgress> = None;
+            let mut last: Option<TaskProgress> = None;
             while let Ok(p) = rx.try_recv() {
-                assert_eq!(p.phase, InstallPhase::RunProcessor);
+                assert_eq!(p.phase, Phase::RunProcessor);
                 last = Some(p);
             }
             let last = last.unwrap();

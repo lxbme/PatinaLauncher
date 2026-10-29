@@ -237,6 +237,90 @@ async fn prepare_builds_command_against_fake_mojang() {
 }
 
 #[tokio::test]
+async fn prepare_reports_phases_in_order() {
+    use patina_core::progress::Phase;
+    let fake = fake_mojang(8).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    let inst = InstanceStore::new(l.data.instances())
+        .create("p", "26.3")
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    l.prepare(&inst, &s.global, &account(), Some(tx))
+        .await
+        .unwrap();
+    let mut phases = Vec::new();
+    while let Ok(p) = rx.try_recv() {
+        if phases.last() != Some(&p.phase) {
+            phases.push(p.phase);
+        }
+    }
+    assert_eq!(
+        phases,
+        [
+            Phase::FetchMetadata,
+            Phase::DownloadAssetIndex,
+            Phase::DownloadGameFiles
+        ]
+    );
+}
+
+#[tokio::test]
+async fn prepare_reports_runtime_phase_when_not_installed() {
+    use patina_core::java::RUNTIME_INDEX_URL;
+    use patina_core::progress::{Phase, Unit};
+    let fake = fake_mojang(8).await;
+    let mut s = setup();
+    s.global.java.java_path = None;
+    // A fake managed runtime whose `bin/java` is the usual fake Java.
+    let java = std::fs::read(&s.java).unwrap();
+    let mut entry = json!({"type": "file", "executable": true,
+        "downloads": {"raw": {"url": "https://piston-data.mojang.com/o/java"}}});
+    serve_ref(&fake.server, &mut entry["downloads"]["raw"], &java).await;
+    let manifest =
+        serde_json::to_vec(&json!({"files": {"bin": {"type": "directory"}, "bin/java": entry}}))
+            .unwrap();
+    serve(&fake.server, "/rt/manifest.json", manifest.clone()).await;
+    let index = json!({"linux": {"java-runtime-epsilon": [{
+        "manifest": {"url": "https://piston-meta.mojang.com/rt/manifest.json",
+            "sha1": sha1_hex(&manifest), "size": manifest.len()},
+        "version": {"name": "8u202"}}]}});
+    serve(
+        &fake.server,
+        &url_path(RUNTIME_INDEX_URL),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .await;
+
+    let l = launcher(&fake.server, &s.data);
+    let inst = InstanceStore::new(l.data.instances())
+        .create("r", "26.3")
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    l.prepare(&inst, &s.global, &account(), Some(tx))
+        .await
+        .unwrap();
+    let mut phases = Vec::new();
+    while let Ok(p) = rx.try_recv() {
+        if p.phase == Phase::DownloadRuntime {
+            assert_eq!(p.unit, Unit::Bytes);
+        }
+        if phases.last() != Some(&p.phase) {
+            phases.push(p.phase);
+        }
+    }
+    assert_eq!(
+        phases,
+        [
+            Phase::FetchMetadata,
+            Phase::DownloadRuntime,
+            Phase::DownloadAssetIndex,
+            Phase::DownloadGameFiles
+        ]
+    );
+}
+
+#[tokio::test]
 async fn ensure_version_caches_and_reuses_json() {
     let fake = fake_mojang(8).await;
     let s = setup();

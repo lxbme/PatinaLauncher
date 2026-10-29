@@ -80,3 +80,14 @@ loader:
 notices:
   loader:
     mods_may_be_incompatible: "The mod loader was changed; installed mods may not work with the new loader"
+progress:
+  phase:
+    fetch_metadata: "Fetching version info"
+    download_runtime: "Downloading Java runtime"
+    download_asset_index: "Downloading asset index"
+    download_game_files: "Downloading game files"
+    download_installer: "Downloading installer"
+    download_libraries: "Downloading libraries"
+    run_processor: "Running install steps"
+    finalize: "Finishing"
+    launching: "Launching game"

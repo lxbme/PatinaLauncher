@@ -15,9 +15,10 @@ use super::{checked_profile_id, download_libraries, fill_sha1_from_sidecars, wri
 use crate::download::Downloader;
 use crate::fsutil::{is_safe_name, safe_join, write_atomic};
 use crate::loader::list::LoaderError;
-use crate::loader::{InstallPhase, InstalledProfile, LoaderKind, ProgressSink, report};
+use crate::loader::{InstalledProfile, LoaderKind};
 use crate::meta::{Library, RuleEnv, VersionJson};
 use crate::paths::DataDirs;
+use crate::progress::{Phase, ProgressSink, Unit, report};
 use crate::resolve::resolve_libraries;
 
 /// File in `versions/<profile id>/` listing the processor-generated files
@@ -115,7 +116,7 @@ pub async fn install_modern(
     let mut provided: HashSet<PathBuf> = jobs.iter().map(|j| j.dest.clone()).collect();
     provided.extend(bundled);
     fill_sha1_from_sidecars(dl, &mut jobs, |j| j.sha1.is_none()).await;
-    download_libraries(dl, jobs, progress).await?;
+    download_libraries(dl, jobs, progress, 0).await?;
 
     // A previous install's list must not outlive a reinstall that fails from
     // here on: without it, launch reports that the loader needs reinstalling.
@@ -154,7 +155,7 @@ pub async fn install_modern(
     run_processors(java, &procs, &env, dl, vanilla, progress).await?;
 
     // 4. Generated-file list, then the profile JSON last.
-    report(progress, InstallPhase::Finalize, 0, 1);
+    report(progress, Phase::Finalize, 0, 1, Unit::Items);
     let generated: Vec<String> = referenced_library_files(&procs, &env)?
         .into_iter()
         .filter_map(|rel| {
@@ -165,7 +166,7 @@ pub async fn install_modern(
     write_atomic(&generated_file, &serde_json::to_vec_pretty(&generated)?)?;
     drop(scratch);
     let profile_id = write_profile(data, kind, version)?;
-    report(progress, InstallPhase::Finalize, 1, 1);
+    report(progress, Phase::Finalize, 1, 1, Unit::Items);
     Ok(InstalledProfile { profile_id })
 }
 
@@ -177,7 +178,7 @@ mod tests {
     };
     use crate::loader::forge::read_installer;
     use crate::loader::forge::test_support::{sha1_hex, write_zip};
-    use crate::loader::{InstallPhase, InstallProgress};
+    use crate::loader::{Phase, TaskProgress};
     use crate::meta::PartialVersionJson;
     use serde_json::{Value, json};
     use wiremock::matchers::{method, path};
@@ -409,14 +410,14 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join(GENERATED_FILE)).unwrap()).unwrap();
         assert_eq!(generated, vec![MOJMAPS.to_string(), PATCHED.to_string()]);
 
-        let mut last: Option<InstallProgress> = None;
+        let mut last: Option<TaskProgress> = None;
         let mut ran = false;
         while let Ok(p) = rx.try_recv() {
-            ran |= p.phase == InstallPhase::RunProcessor && p.done == 2 && p.total == 2;
+            ran |= p.phase == Phase::RunProcessor && p.done == 2 && p.total == 2;
             last = Some(p);
         }
         assert!(ran);
-        assert_eq!(last.unwrap().phase, InstallPhase::Finalize);
+        assert_eq!(last.unwrap().phase, Phase::Finalize);
     }
 
     #[tokio::test]

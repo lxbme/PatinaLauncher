@@ -80,3 +80,14 @@ loader:
 notices:
   loader:
     mods_may_be_incompatible: "已更换模组加载器，已安装的模组可能无法在新的加载器上运行"
+progress:
+  phase:
+    fetch_metadata: "正在获取版本信息"
+    download_runtime: "正在下载 Java 运行时"
+    download_asset_index: "正在下载资源索引"
+    download_game_files: "正在下载游戏文件"
+    download_installer: "正在下载安装器"
+    download_libraries: "正在下载依赖库"
+    run_processor: "正在运行安装步骤"
+    finalize: "正在完成"
+    launching: "正在启动游戏"

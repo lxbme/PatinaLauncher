@@ -10,6 +10,7 @@ use crate::download::{DownloadError, DownloadJob, Downloader};
 use crate::fsutil::{is_safe_name, is_safe_rel};
 use crate::meta::FileRef;
 use crate::platform;
+use crate::progress::{Phase, ProgressSink, Unit, run_downloads};
 
 pub const RUNTIME_INDEX_URL: &str = "https://piston-meta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
@@ -163,7 +164,12 @@ impl ManagedRuntimes {
         is_safe_name(component) && self.home(component).join(MARKER).is_file()
     }
 
-    pub async fn install(&self, dl: &Downloader, component: &str) -> Result<PathBuf, RuntimeError> {
+    pub async fn install(
+        &self,
+        dl: &Downloader,
+        component: &str,
+        progress: &ProgressSink,
+    ) -> Result<PathBuf, RuntimeError> {
         if !is_safe_name(component) {
             return Err(RuntimeError::InvalidComponent(component.to_string()));
         }
@@ -195,7 +201,15 @@ impl ManagedRuntimes {
         for d in &plan.dirs {
             tokio::fs::create_dir_all(d).await?;
         }
-        dl.run(plan.jobs, None).await?;
+        run_downloads(
+            dl,
+            plan.jobs,
+            progress,
+            Phase::DownloadRuntime,
+            Unit::Bytes,
+            0,
+        )
+        .await?;
         for e in &plan.executables {
             platform::set_executable(e)?;
         }
@@ -323,7 +337,7 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let rt = ManagedRuntimes::new(tmp.path().to_path_buf());
-        let r = rt.install(&downloader(&server), "../x").await;
+        let r = rt.install(&downloader(&server), "../x", &None).await;
         assert!(matches!(r, Err(RuntimeError::InvalidComponent(_))));
     }
 
@@ -354,9 +368,8 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn installs_from_fake_mojang() {
-        let server = MockServer::start().await;
+    /// Serves a one-component ("jre-legacy") fake runtime index and files.
+    async fn serve_fake_runtime(server: &MockServer) {
         let files: [(&str, &[u8]); 3] = [
             ("java", b"#!/bin/sh\n"),
             ("jli", b"jli-lib"),
@@ -389,17 +402,48 @@ mod tests {
         let idx_path = RUNTIME_INDEX_URL
             .strip_prefix("https://piston-meta.mojang.com")
             .unwrap();
-        serve(&server, idx_path, index).await;
-        serve(&server, "/m.json", manifest).await;
+        serve(server, idx_path, index).await;
+        serve(server, "/m.json", manifest).await;
         for (n, b) in files {
-            serve(&server, &format!("/o/{n}"), b.to_vec()).await;
+            serve(server, &format!("/o/{n}"), b.to_vec()).await;
         }
+    }
 
+    #[tokio::test]
+    async fn runtime_install_reports_bytes() {
+        let server = MockServer::start().await;
+        serve_fake_runtime(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = ManagedRuntimes::new(tmp.path().join("runtimes"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.install(&downloader(&server), "jre-legacy", &Some(tx))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            events.push(p);
+        }
+        assert!(!events.is_empty());
+        assert!(
+            events
+                .iter()
+                .all(|p| p.phase == Phase::DownloadRuntime && p.unit == Unit::Bytes),
+            "{events:?}"
+        );
+        let last = events.last().unwrap();
+        assert!(last.total > 0 && last.done == last.total, "{last:?}");
+        assert!(events.windows(2).all(|w| w[0].done <= w[1].done));
+    }
+
+    #[tokio::test]
+    async fn installs_from_fake_mojang() {
+        let server = MockServer::start().await;
+        serve_fake_runtime(&server).await;
         let tmp = tempfile::tempdir().unwrap();
         let rt = ManagedRuntimes::new(tmp.path().join("runtimes"));
         let dl = downloader(&server);
         assert!(!rt.is_installed("jre-legacy"));
-        let bin = rt.install(&dl, "jre-legacy").await.unwrap();
+        let bin = rt.install(&dl, "jre-legacy", &None).await.unwrap();
         assert_eq!(bin, rt.java_bin("jre-legacy"));
         use std::os::unix::fs::PermissionsExt;
         assert!(bin.is_file());
@@ -418,16 +462,20 @@ mod tests {
             vec![("jre-legacy".to_string(), "8u202".to_string())]
         );
         // reinstall over existing link works
-        rt.install(&dl, "jre-legacy").await.unwrap();
+        rt.install(&dl, "jre-legacy", &None).await.unwrap();
         // a failing reinstall (index lacks the component) clears the marker
         let dead = MockServer::start().await;
         let idx = RUNTIME_INDEX_URL
             .strip_prefix("https://piston-meta.mojang.com")
             .unwrap();
         serve(&dead, idx, br#"{"linux":{}}"#.to_vec()).await;
-        assert!(rt.install(&downloader(&dead), "jre-legacy").await.is_err());
+        assert!(
+            rt.install(&downloader(&dead), "jre-legacy", &None)
+                .await
+                .is_err()
+        );
         assert!(!rt.is_installed("jre-legacy"));
-        rt.install(&dl, "jre-legacy").await.unwrap();
+        rt.install(&dl, "jre-legacy", &None).await.unwrap();
         assert!(rt.is_installed("jre-legacy"));
         rt.remove("jre-legacy").unwrap();
         assert!(!rt.is_installed("jre-legacy"));
@@ -450,7 +498,7 @@ mod tests {
         let rt = ManagedRuntimes::new(tmp.path().to_path_buf());
         let dl = downloader(&server);
         for c in ["nope", "minecraft-java-exe"] {
-            let r = rt.install(&dl, c).await;
+            let r = rt.install(&dl, c, &None).await;
             assert!(matches!(r, Err(RuntimeError::Unavailable { .. })));
         }
     }

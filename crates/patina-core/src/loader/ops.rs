@@ -10,10 +10,11 @@ use super::forge::{
     InstallerProfile, fetch_installer, install_legacy, install_modern, read_installer,
 };
 use super::list::{LoaderError, LoaderVersion, VersionPick, list_versions};
-use super::{InstallPhase, InstalledProfile, LoaderKind, ProgressSink, report};
+use super::{InstalledProfile, LoaderKind};
 use crate::instance::{Component, ComponentUid, Instance, InstanceStore};
 use crate::meta::VersionJson;
 use crate::prepare::{Launcher, PrepareError};
+use crate::progress::{Phase, ProgressSink, Unit, report};
 
 /// Something the user should know after a successful operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +78,7 @@ pub async fn install_loader(
     }
     let mc = inst.config.mc_version();
     check_mc(mc)?;
-    report(&progress, InstallPhase::FetchMetadata, 0, 1);
+    report(&progress, Phase::FetchMetadata, 0, 1, Unit::Items);
     let list = list_versions(&launcher.downloader, kind, mc).await?;
     let version = pick.pick(&list).ok_or_else(|| match &pick {
         VersionPick::Exact(v) => LoaderError::VersionNotFound {
@@ -91,7 +92,7 @@ pub async fn install_loader(
         },
     })?;
     let vanilla = launcher.ensure_version(mc).await?;
-    report(&progress, InstallPhase::FetchMetadata, 1, 1);
+    report(&progress, Phase::FetchMetadata, 1, 1, Unit::Items);
     let component = install_version(launcher, version, &vanilla, &progress).await?;
 
     let mut config = inst.config.clone();
@@ -160,7 +161,7 @@ pub async fn set_mc_version(
         }
     };
 
-    report(&progress, InstallPhase::FetchMetadata, 0, 1);
+    report(&progress, Phase::FetchMetadata, 0, 1, Unit::Items);
     let list = match list_versions(&launcher.downloader, kind, mc).await {
         Ok(list) => list,
         Err(LoaderError::NoVersions { .. }) => Vec::new(),
@@ -189,7 +190,7 @@ pub async fn set_mc_version(
             }
         };
     let vanilla = launcher.ensure_version(mc).await?;
-    report(&progress, InstallPhase::FetchMetadata, 1, 1);
+    report(&progress, Phase::FetchMetadata, 1, 1, Unit::Items);
     let component = install_version(launcher, target, &vanilla, &progress).await?;
     config.set_loader(Some(component))?;
     Ok(OpOutcome {
@@ -264,8 +265,8 @@ async fn install_version(
 
 /// An already installed profile, reported as finalized.
 fn reused(progress: &ProgressSink, profile_id: String) -> InstalledProfile {
-    report(progress, InstallPhase::Finalize, 0, 1);
-    report(progress, InstallPhase::Finalize, 1, 1);
+    report(progress, Phase::Finalize, 0, 1, Unit::Items);
+    report(progress, Phase::Finalize, 1, 1, Unit::Items);
     InstalledProfile { profile_id }
 }
 
@@ -291,7 +292,7 @@ async fn install_forge(
         )),
         InstallerProfile::Modern { .. } => {
             // Processors run on the managed runtime for this version.
-            let java = launcher.select_java(None, vanilla).await?;
+            let java = launcher.select_java(None, vanilla, progress).await?;
             install_modern(dl, data, kind, &jar, profile, vanilla, &java.path, progress).await
         }
     }
@@ -316,7 +317,7 @@ mod tests {
     use crate::download::{Downloader, Mirror};
     use crate::i18n::{Language, locale_lock, set_language};
     use crate::java::{ManagedRuntimes, RUNTIME_INDEX_URL};
-    use crate::loader::InstallProgress;
+    use crate::loader::TaskProgress;
     use crate::loader::forge::processors::test_java::{FakeJava, processor_jar};
     use crate::loader::forge::test_support::{OFFICIAL_HOSTS, sha1_hex, write_zip};
     use crate::paths::DataDirs;
@@ -473,7 +474,7 @@ mod tests {
             )
             .await;
             let bin = ManagedRuntimes::new(self.launcher.data.runtimes())
-                .install(&self.launcher.downloader, &component)
+                .install(&self.launcher.downloader, &component, &None)
                 .await
                 .unwrap();
             // A freshly written executable can briefly fail with ETXTBSY while
@@ -1122,10 +1123,11 @@ mod tests {
         while let Ok(p) = rx.try_recv() {
             events.push(p);
         }
-        let meta = |done| InstallProgress {
-            phase: InstallPhase::FetchMetadata,
+        let meta = |done| TaskProgress {
+            phase: Phase::FetchMetadata,
             done,
             total: 1,
+            unit: Unit::Items,
         };
         assert_eq!(events[..2], [meta(0), meta(1)], "{events:?}");
 

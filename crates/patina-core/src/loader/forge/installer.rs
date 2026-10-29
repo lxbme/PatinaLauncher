@@ -12,10 +12,11 @@ use super::{fetch_sidecar, parse_sha1_sidecar};
 use crate::download::mirror::canonical_url;
 use crate::download::{DownloadJob, Downloader, sha1_file};
 use crate::fsutil::{is_safe_name, write_atomic};
+use crate::loader::LoaderKind;
 use crate::loader::list::{LoaderError, LoaderVersion};
-use crate::loader::{InstallPhase, LoaderKind, ProgressSink, report};
 use crate::meta::{PartialVersionJson, maven_path};
 use crate::paths::DataDirs;
+use crate::progress::{Phase, ProgressSink, Unit, report};
 
 /// What `install_profile.json` describes.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,7 +124,7 @@ pub async fn fetch_installer(
     progress: &ProgressSink,
 ) -> Result<PathBuf, LoaderError> {
     let (url, dest) = installer_target(data, kind, mc, v)?;
-    report(progress, InstallPhase::DownloadInstaller, 0, 1);
+    report(progress, Phase::DownloadInstaller, 0, 1, Unit::Items);
     let sha1 = fetch_sidecar(dl, &canonical_url(&format!("{url}.sha1"))).await;
     let job = DownloadJob {
         url,
@@ -141,7 +142,7 @@ pub async fn fetch_installer(
             _ => {}
         },
     }
-    report(progress, InstallPhase::DownloadInstaller, 1, 1);
+    report(progress, Phase::DownloadInstaller, 1, 1, Unit::Items);
     Ok(dest)
 }
 

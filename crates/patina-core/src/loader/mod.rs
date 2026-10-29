@@ -7,6 +7,8 @@ pub mod ops;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::progress::{Phase, ProgressSink, TaskProgress, Unit};
+
 pub use list::{
     LoaderError, LoaderVersion, VersionPick, list_versions, parse_fabric_list, parse_forge,
     parse_neoforge, parse_neoforge_legacy,
@@ -35,29 +37,4 @@ impl LoaderKind {
 pub struct InstalledProfile {
     /// Id of the loader version JSON (`Component.profile`).
     pub profile_id: String,
-}
-
-/// Receives install progress; `None` discards it.
-pub type ProgressSink = Option<tokio::sync::mpsc::UnboundedSender<InstallProgress>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallPhase {
-    FetchMetadata,
-    DownloadInstaller,
-    DownloadLibraries,
-    RunProcessor,
-    Finalize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InstallProgress {
-    pub phase: InstallPhase,
-    pub done: usize,
-    pub total: usize,
-}
-
-pub(crate) fn report(sink: &ProgressSink, phase: InstallPhase, done: usize, total: usize) {
-    if let Some(tx) = sink {
-        let _ = tx.send(InstallProgress { phase, done, total });
-    }
 }

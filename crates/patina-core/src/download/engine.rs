@@ -194,7 +194,7 @@ impl Drop for PartFile {
 
 /// The destination-lock key: `dest` made absolute and lexically normalized
 /// (`.` dropped, `..` pops), so spellings of one path share one lock.
-fn dest_key(dest: &Path) -> io::Result<PathBuf> {
+pub(crate) fn dest_key(dest: &Path) -> io::Result<PathBuf> {
     let mut out = PathBuf::new();
     for c in std::path::absolute(dest)?.components() {
         match c {
