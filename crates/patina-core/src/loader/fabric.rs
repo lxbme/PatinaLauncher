@@ -27,6 +27,8 @@ pub async fn install_fabric(
         return Err(LoaderError::UnsafeMetadata(profile.id));
     }
     report(progress, Phase::FetchMetadata, 1, 1, Unit::Items);
+    // Held until the profile json is written.
+    let _version_lock = data.lock_version_exclusive(&profile.id)?;
 
     let resolved = resolve_libraries(&profile.libraries, &RuleEnv::current(), &data.libraries());
     run_downloads(

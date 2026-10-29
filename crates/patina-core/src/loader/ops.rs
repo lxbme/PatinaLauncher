@@ -65,6 +65,7 @@ pub async fn install_loader(
     replace_existing: bool,
     progress: ProgressSink,
 ) -> Result<OpOutcome, LoaderError> {
+    let _lock = store.lock(id)?;
     let inst = store.load(id)?;
     let previous = inst.config.loader().map(|(k, c)| (k, c.version.clone()));
     if let Some((existing, existing_version)) = &previous
@@ -107,6 +108,7 @@ pub async fn install_loader(
 
 /// Removes the instance's loader (a no-op for a vanilla instance).
 pub fn remove_loader(store: &InstanceStore, id: &str) -> Result<OpOutcome, LoaderError> {
+    let _lock = store.lock(id)?;
     let inst = store.load(id)?;
     let mut config = inst.config;
     config.set_loader(None)?;
@@ -139,6 +141,7 @@ pub async fn set_mc_version(
     action: Option<LoaderAction>,
     progress: ProgressSink,
 ) -> Result<OpOutcome, LoaderError> {
+    let _lock = store.lock(id)?;
     let inst = store.load(id)?;
     check_mc(mc)?;
     if inst.config.mc_version() == mc {
@@ -240,7 +243,12 @@ async fn install_version(
             }
             // The id Fabric's metadata server gives its profiles.
             let id = format!("fabric-loader-{}-{mc}", v.maven_version);
-            if is_installed(data, &id, false).await {
+            // The shared lock is dropped before an install takes the exclusive one.
+            let present = {
+                let _shared = data.lock_version_shared(&id)?;
+                is_installed(data, &id, false).await
+            };
+            if present {
                 tracing::info!(profile = %id, "loader already installed; reusing");
                 reused(progress, id)
             } else {
@@ -248,7 +256,14 @@ async fn install_version(
             }
         }
         LoaderKind::Forge | LoaderKind::Neoforge => {
-            if let Some(found) = installed_forge(data, kind, mc, v).await {
+            let found = match installed_forge(data, kind, mc, v).await {
+                Some(f) => {
+                    let _shared = data.lock_version_shared(&f.profile_id)?;
+                    Some(f)
+                }
+                None => None,
+            };
+            if let Some(found) = found {
                 tracing::info!(profile = %found.profile_id, "loader already installed; reusing");
                 reused(progress, found.profile_id)
             } else {
@@ -877,6 +892,57 @@ mod tests {
             ))
         );
         assert_eq!(env.load(&id), out.instance);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ops_on_one_instance_are_busy() {
+        let env = Env::new().await;
+        let id = env.store.create("busy-op-unique", "1.20.1").unwrap().id;
+        let before = env.load(&id);
+        let guard = env.store.lock(&id).unwrap();
+        let r = env
+            .install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+            .await;
+        assert!(matches!(r, Err(LoaderError::Busy(_))), "{r:?}");
+        assert!(matches!(
+            remove_loader(&env.store, &id),
+            Err(LoaderError::Busy(_))
+        ));
+        let r = env.set_mc(&id, "1.21.1", None).await;
+        assert!(matches!(r, Err(LoaderError::Busy(_))), "{r:?}");
+        assert_eq!(env.load(&id), before);
+        drop(guard);
+        env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_of_version_in_use_is_busy() {
+        let env = Env::new().await;
+        for (name, kind, pick, pid) in [
+            (
+                "use-fabric",
+                LoaderKind::Fabric,
+                exact("0.16.10"),
+                fabric_id("0.16.10", "1.20.1"),
+            ),
+            (
+                "use-forge",
+                LoaderKind::Forge,
+                VersionPick::Recommended,
+                FORGE_MODERN_ID.to_string(),
+            ),
+        ] {
+            let id = env.store.create(name, "1.20.1").unwrap().id;
+            let before = env.load(&id);
+            let held = env.launcher.data.lock_version_shared(&pid).unwrap();
+            let r = env.install(&id, kind, pick, false).await;
+            assert!(matches!(r, Err(LoaderError::Busy(_))), "{r:?}");
+            assert!(!env.profile_json(&pid).exists());
+            assert_eq!(env.load(&id), before);
+            drop(held);
+        }
     }
 
     #[tokio::test]

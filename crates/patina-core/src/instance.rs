@@ -23,6 +23,8 @@ pub enum InstanceError {
     InvalidConfig(String),
     #[error("{}", rust_i18n::t!("errors.instance.invalid_icon", reason = .0))]
     InvalidIcon(String),
+    #[error(transparent)]
+    Busy(#[from] crate::locks::Busy),
 }
 
 impl From<std::io::Error> for InstanceError {
@@ -351,6 +353,11 @@ impl InstanceStore {
         Self { root: root.into() }
     }
 
+    /// Takes the in-process lock for instance `id` of this store.
+    pub fn lock(&self, id: &str) -> Result<crate::locks::InstanceGuard, crate::locks::Busy> {
+        crate::locks::Locks::global().instance(&self.root, id)
+    }
+
     fn check_id(id: &str) -> Result<(), InstanceError> {
         // No length cap here: ids may carry a dedup suffix past the cap.
         if id.is_empty() || id != clean_dir_name(id, usize::MAX) {
@@ -502,6 +509,7 @@ impl InstanceStore {
     /// instances root.
     pub fn delete_broken(&self, b: &BrokenInstance) -> Result<(), InstanceError> {
         let refuse = || InstanceError::InvalidId(b.id.clone());
+        let _lock = self.lock(&b.id)?;
         if !std::fs::symlink_metadata(&b.dir)?.is_dir() {
             return Err(refuse());
         }
@@ -519,6 +527,7 @@ impl InstanceStore {
 
     pub fn delete(&self, id: &str) -> Result<(), InstanceError> {
         Self::check_id(id)?;
+        let _lock = self.lock(id)?;
         let dir = self.root.join(id);
         if !dir.join(CONFIG_FILE).is_file() {
             return Err(InstanceError::NotFound(id.to_string()));
@@ -776,6 +785,27 @@ mod tests {
         assert_eq!(sanitize_dir_name("a:b*c?\"<>|\\"), "a_b_c______");
         assert_eq!(sanitize_dir_name("CON"), "_CON");
         assert_eq!(sanitize_dir_name("tab\there"), "tab_here");
+    }
+
+    #[test]
+    fn delete_refuses_while_instance_is_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let a = store.create("Busy", "1.8.9").unwrap();
+        let guard = store.lock(&a.id).unwrap();
+        assert!(matches!(store.delete(&a.id), Err(InstanceError::Busy(_))));
+        let broken = BrokenInstance {
+            id: a.id.clone(),
+            dir: a.dir.clone(),
+            error: InstanceError::NotFound(a.id.clone()),
+        };
+        assert!(matches!(
+            store.delete_broken(&broken),
+            Err(InstanceError::Busy(_))
+        ));
+        assert!(a.dir.is_dir());
+        drop(guard);
+        store.delete(&a.id).unwrap();
     }
 
     #[test]

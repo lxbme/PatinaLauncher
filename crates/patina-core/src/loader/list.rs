@@ -74,6 +74,9 @@ pub enum LoaderError {
     Instance(String),
     #[error("{}", rust_i18n::t!("errors.loader.prepare", error = .0))]
     Prepare(String),
+    /// Another operation holds the instance, or the version is in use.
+    #[error(transparent)]
+    Busy(#[from] crate::locks::Busy),
 }
 
 impl From<io::Error> for LoaderError {

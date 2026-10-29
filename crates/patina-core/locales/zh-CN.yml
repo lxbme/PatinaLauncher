@@ -64,6 +64,9 @@ errors:
     incompatible_no_replacement: "%{kind} %{version} 不支持新的 Minecraft 版本，且新版本没有可用的 %{kind}，请移除加载器后继续"
     instance: "读取或保存实例失败：%{error}"
     prepare: "为加载器准备游戏文件失败：%{error}"
+  locks:
+    instance_busy: "该实例（%{id}）正在执行其他操作，请等它完成后再试"
+    version_busy: "版本 %{id} 正在使用或安装中，请稍后再试"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"

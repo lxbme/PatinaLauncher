@@ -16,6 +16,7 @@ use crate::download::Downloader;
 use crate::fsutil::{is_safe_name, safe_join, write_atomic};
 use crate::loader::list::{InstallerProblem, LoaderError};
 use crate::loader::{InstalledProfile, LoaderKind};
+use crate::locks::processors_key;
 use crate::meta::{Library, RuleEnv, VersionJson};
 use crate::paths::DataDirs;
 use crate::progress::{Phase, ProgressSink, Unit, report};
@@ -67,6 +68,8 @@ pub async fn install_modern(
         return Err(invalid(InstallerProblem::NotModern));
     };
     let id = checked_profile_id(kind, &version.id)?;
+    // Held until the profile json is written.
+    let _version_lock = data.lock_version_exclusive(&id)?;
     let mc = vanilla.id.as_str();
     if !is_safe_name(mc) {
         return Err(LoaderError::UnsafeMetadata(mc.to_string()));
@@ -152,6 +155,9 @@ pub async fn install_modern(
     };
 
     // 3. Processors.
+    // MC_SRG / MC_EXTRA / MC_SLIM outputs are shared by every build of this
+    // Minecraft version. Lock order: profile first (above), then processors.
+    let _processors_lock = data.lock_version_exclusive(&processors_key(mc))?;
     run_processors(java, &procs, &env, dl, vanilla, progress).await?;
 
     // 4. Generated-file list, then the profile JSON last.

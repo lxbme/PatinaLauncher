@@ -37,6 +37,22 @@ impl DataDirs {
     pub fn assets(&self) -> PathBuf {
         self.root.join("assets")
     }
+    /// Shared use of version `id` of this data dir (see [`crate::locks`]).
+    pub fn lock_version_shared(
+        &self,
+        id: &str,
+    ) -> Result<crate::locks::VersionShared, crate::locks::Busy> {
+        crate::locks::Locks::global().version_shared(&self.versions(), id)
+    }
+
+    /// Exclusive access to version `id` of this data dir.
+    pub fn lock_version_exclusive(
+        &self,
+        id: &str,
+    ) -> Result<crate::locks::VersionExclusive, crate::locks::Busy> {
+        crate::locks::Locks::global().version_exclusive(&self.versions(), id)
+    }
+
     pub fn versions(&self) -> PathBuf {
         self.root.join("versions")
     }

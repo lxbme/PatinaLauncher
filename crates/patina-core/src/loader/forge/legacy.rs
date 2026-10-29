@@ -40,7 +40,9 @@ pub async fn install_legacy(
         return Err(LoaderError::InstallerInvalid(InstallerProblem::NotLegacy));
     };
     // Legacy installers are Forge-only (NeoForge never shipped one).
-    checked_profile_id(LoaderKind::Forge, &version.id)?;
+    let profile_id = checked_profile_id(LoaderKind::Forge, &version.id)?;
+    // Held until the profile json is written.
+    let _version_lock = data.lock_version_exclusive(&profile_id)?;
     let libraries = data.libraries();
     let universal = maven_path(&install_path)
         .and_then(|rel| safe_join(&libraries, &rel))
