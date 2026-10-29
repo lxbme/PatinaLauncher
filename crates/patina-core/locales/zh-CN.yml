@@ -72,6 +72,12 @@ errors:
     already_running: "实例 %{id} 已在运行"
     io: "文件操作失败（%{path}）：%{error}"
     record_not_saved: "启动器无法保存游戏运行记录（%{path}）：%{error}。启动器重启后将无法识别这个正在运行的游戏"
+  accounts:
+    not_found: "未找到账号：%{id}"
+    invalid_name: "玩家名“%{name}”无效：请使用 3 到 16 位字母、数字或下划线"
+    msa_unavailable: "微软账号登录暂不可用"
+    io: "文件操作失败（%{path}）：%{error}"
+    parse: "账号文件格式无效：%{error}"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"

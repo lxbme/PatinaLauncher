@@ -72,6 +72,12 @@ errors:
     already_running: "Instance %{id} is already running"
     io: "File operation failed (%{path}): %{error}"
     record_not_saved: "The launcher could not save the running-game record (%{path}): %{error}. If the launcher restarts, it will not recognise this game"
+  accounts:
+    not_found: "Account not found: %{id}"
+    invalid_name: "Invalid player name \"%{name}\": use 3 to 16 letters, digits or underscores"
+    msa_unavailable: "Microsoft sign-in is not available yet"
+    io: "File operation failed (%{path}): %{error}"
+    parse: "Invalid accounts file format: %{error}"
   jvm:
     memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"
