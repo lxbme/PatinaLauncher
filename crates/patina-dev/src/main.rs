@@ -9,7 +9,7 @@ use patina_core::config::{GlobalConfig, SourceChoice};
 use patina_core::download::{Mirror, PROBE_URL, SPEEDTEST_TIMEOUT, fastest, measure_all};
 use patina_core::instance::{InstanceStore, effective_java};
 use patina_core::java::{ManagedRuntimes, detect_all};
-use patina_core::launch::{GameProcess, LogLine, dev_offline_account};
+use patina_core::launch::{GameSession, dev_offline_account};
 use patina_core::loader::LoaderKind;
 use patina_core::loader::list::{LoaderError, VersionPick, list_versions};
 use patina_core::loader::ops::{OpOutcome, install_loader, remove_loader, set_mc_version};
@@ -504,12 +504,6 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-async fn print_logs(mut rx: mpsc::UnboundedReceiver<LogLine>) {
-    while let Some(l) = rx.recv().await {
-        println!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
-    }
-}
-
 async fn launch(ctx: &mut Ctx, id: &str, player: &str) -> Result<()> {
     let store = ctx.store();
     let mut inst = store.load(id)?;
@@ -536,48 +530,46 @@ async fn launch(ctx: &mut Ctx, id: &str, player: &str) -> Result<()> {
     let start = Instant::now();
     let (ptx, printer) = install_printer(start);
     let account = dev_offline_account(player);
-    let result = launcher
-        .prepare(&inst, &ctx.config, &account, Some(ptx))
-        .await;
+    let result = GameSession::start(&launcher, &inst, &ctx.config, &account, Some(ptx)).await;
     let _ = printer.await;
-    let prepared = result?;
+    let mut game = result?;
     println!(
-        "Prepared in {:.1}s; {} download(s) fell back to another source",
+        "Started in {:.1}s; {} download(s) fell back to another source",
         start.elapsed().as_secs_f64(),
         launcher.downloader.fallback_count()
     );
-    for w in &prepared.warnings {
+    for w in game.warnings() {
         println!("Warning: {w}");
     }
-    let cmd = &prepared.command;
-    println!(
-        "Launching {} ({} args), working dir {}",
-        cmd.program.display(),
-        cmd.args.len(),
-        cmd.cwd.display()
-    );
-
-    let (ltx, lrx) = mpsc::unbounded_channel();
-    let mut game = GameProcess::spawn(cmd, ltx)
-        .await
-        .context("failed to start the game process")?;
-    println!("Game process PID: {}", game.id().unwrap_or(0));
+    println!("Game process PID: {}", game.pid());
     inst.config.last_played = Some(now_secs());
     if let Err(e) = store.save(&inst) {
         eprintln!("Warning: failed to save last_played: {e}");
     }
-    let logs = tokio::spawn(print_logs(lrx));
 
-    let status = tokio::select! {
-        s = game.wait() => s?,
+    let mut logs = game.logs();
+    let printer = tokio::spawn(async move {
+        while let Some(l) = logs.recv().await {
+            println!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
+        }
+    });
+    let killer = game.killer();
+    let wait = game.wait();
+    tokio::pin!(wait);
+    let exit = tokio::select! {
+        e = &mut wait => e,
+        // Ctrl-C stops the game (not just this tool); the session is still
+        // waited on afterwards so the exit is reported and the record cleared.
         _ = tokio::signal::ctrl_c() => {
             println!("Ctrl-C received, stopping the game process...");
-            game.kill().await?;
-            game.wait().await?
+            if let Err(e) = killer.kill().await {
+                eprintln!("Failed to stop the game: {e}");
+            }
+            wait.await
         }
     };
-    let _ = tokio::time::timeout(Duration::from_secs(3), logs).await;
-    println!("Game exited: {status}");
+    let _ = tokio::time::timeout(Duration::from_secs(3), printer).await;
+    println!("Game exited: {exit:?}");
     Ok(())
 }
 

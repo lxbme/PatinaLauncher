@@ -8,7 +8,7 @@ pub use args::{
     LAUNCHER_NAME, LAUNCHER_VERSION, LaunchCommand, LaunchSpec, build_command, substitute,
 };
 pub mod log;
-pub mod process;
 pub mod running;
+pub mod session;
 pub use log::{Log4jXmlParser, LogLevel, LogLine, Stream};
-pub use process::GameProcess;
+pub use session::{GameSession, KillHandle, SessionError, SessionExit, SessionWarning};

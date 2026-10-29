@@ -67,6 +67,10 @@ errors:
   locks:
     instance_busy: "Another operation is already running on instance %{id}; try again when it finishes"
     version_busy: "The version %{id} is in use or being installed; try again later"
+  session:
+    already_running: "Instance %{id} is already running"
+    io: "File operation failed (%{path}): %{error}"
+    record_not_saved: "The launcher could not save the running-game record (%{path}): %{error}. If the launcher restarts, it will not recognise this game"
   jvm:
     memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"

@@ -120,6 +120,20 @@ fn flush_plain(buf: &str, stream: Stream) -> Vec<LogLine> {
         .collect()
 }
 
+/// Cuts `text` to at most `max` bytes (on a char boundary) and ends it with
+/// `…` when something was cut.
+pub fn truncate_with_ellipsis(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push('…');
+}
+
 /// Incremental parser; one instance per output stream.
 #[derive(Default)]
 pub struct Log4jXmlParser {
@@ -250,6 +264,16 @@ mod tests {
             Stream::Stdout,
         );
         assert_eq!(out[0].level, LogLevel::Unknown);
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let mut s = "ab€cd".to_string();
+        truncate_with_ellipsis(&mut s, 4);
+        assert_eq!(s, "ab…");
+        let mut s = "abc".to_string();
+        truncate_with_ellipsis(&mut s, 3);
+        assert_eq!(s, "abc");
     }
 
     #[test]

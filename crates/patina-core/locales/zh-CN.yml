@@ -67,6 +67,10 @@ errors:
   locks:
     instance_busy: "该实例（%{id}）正在执行其他操作，请等它完成后再试"
     version_busy: "版本 %{id} 正在使用或安装中，请稍后再试"
+  session:
+    already_running: "实例 %{id} 已在运行"
+    io: "文件操作失败（%{path}）：%{error}"
+    record_not_saved: "启动器无法保存游戏运行记录（%{path}）：%{error}。启动器重启后将无法识别这个正在运行的游戏"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
