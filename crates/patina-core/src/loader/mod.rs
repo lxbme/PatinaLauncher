@@ -1,6 +1,13 @@
 //! Mod loader support (Forge, NeoForge, Fabric).
 
+pub mod list;
+
 use serde::{Deserialize, Serialize};
+
+pub use list::{
+    LoaderError, LoaderVersion, VersionPick, list_versions, parse_fabric_list, parse_forge,
+    parse_neoforge, parse_neoforge_legacy,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -1,0 +1,2 @@
+https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml
+Fetched 2026-10-29; trimmed to a few versions of 1.7.10 (incl. _pre4 prerelease and a branch suffix), 1.12.2, 1.20.1, 1.21.1 and 26.x.

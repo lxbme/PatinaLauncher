@@ -1,0 +1,2 @@
+https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/1.21.1
+Fetched 2026-10-29; trimmed to the first 8 entries.

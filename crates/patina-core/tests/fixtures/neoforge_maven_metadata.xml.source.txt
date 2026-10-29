@@ -1,0 +1,2 @@
+https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml
+Fetched 2026-10-29; trimmed to a few 21.0.x, 21.1.x, 26.1.x, 26.2.x and 26.3.x versions (incl. -beta and alpha).

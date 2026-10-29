@@ -17,6 +17,12 @@ errors:
       empty_version: "the Minecraft version must not be empty"
       duplicate_minecraft: "only one minecraft component is allowed"
       not_a_loader: "the component is not a mod loader"
+  loader:
+    no_versions: "No %{kind} versions are available for Minecraft %{mc}"
+    version_not_found: "%{kind} version %{version} does not exist"
+    parse: "Failed to parse the loader version data: %{error}"
+    io: "File operation failed: %{error}"
+    json: "Invalid loader version data: %{error}"
   jvm:
     memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"

@@ -17,6 +17,12 @@ errors:
       empty_version: "Minecraft 版本不能为空"
       duplicate_minecraft: "只能有一个 minecraft 组件"
       not_a_loader: "该组件不是模组加载器"
+  loader:
+    no_versions: "Minecraft %{mc} 没有可用的 %{kind} 版本"
+    version_not_found: "%{kind} 版本 %{version} 不存在"
+    parse: "解析加载器版本数据失败：%{error}"
+    io: "文件操作失败：%{error}"
+    json: "加载器版本数据无效：%{error}"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
