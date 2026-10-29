@@ -1,6 +1,7 @@
 //! Instance storage: one directory per instance with `instance.toml`.
 
 use crate::config::{JavaSettings, write_atomic};
+use crate::loader::LoaderKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,19 +18,164 @@ pub enum InstanceError {
     NotFound(String),
     #[error("{}", rust_i18n::t!("errors.instance.invalid_id", id = .0))]
     InvalidId(String),
+    #[error("{}", rust_i18n::t!("errors.instance.invalid_config", reason = .0))]
+    InvalidConfig(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentUid {
+    Minecraft,
+    Forge,
+    Neoforge,
+    Fabric,
+}
+
+impl ComponentUid {
+    fn loader_kind(self) -> Option<LoaderKind> {
+        match self {
+            ComponentUid::Minecraft => None,
+            ComponentUid::Forge => Some(LoaderKind::Forge),
+            ComponentUid::Neoforge => Some(LoaderKind::Neoforge),
+            ComponentUid::Fabric => Some(LoaderKind::Fabric),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Component {
+    pub uid: ComponentUid,
+    pub version: String,
+    /// Id of the loader version JSON (`versions/<profile>/<profile>.json`).
+    /// Always `None` for the minecraft component.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+impl Component {
+    fn minecraft(version: &str) -> Self {
+        Component {
+            uid: ComponentUid::Minecraft,
+            version: version.to_string(),
+            profile: None,
+        }
+    }
+}
+
+/// On-disk shape; `mc_version` is only read, for plan-1 files.
+#[derive(Deserialize, Default)]
 #[serde(default)]
+struct RawConfig {
+    name: String,
+    mc_version: String,
+    components: Vec<Component>,
+    java_override: Option<JavaSettings>,
+    created_at: u64,
+    last_played: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct InstanceConfig {
     pub name: String,
-    pub mc_version: String,
+    /// Invariant: first is minecraft, at most one loader.
+    pub components: Vec<Component>,
     /// `None` means use the global settings.
     pub java_override: Option<JavaSettings>,
     /// Unix seconds.
     pub created_at: u64,
     /// Unix seconds.
     pub last_played: Option<u64>,
+}
+
+impl InstanceConfig {
+    fn from_raw(raw: RawConfig) -> Result<Self, InstanceError> {
+        let mut components = raw.components;
+        if components.is_empty() {
+            components.push(Component::minecraft(&raw.mc_version));
+        }
+        let cfg = InstanceConfig {
+            name: raw.name,
+            components,
+            java_override: raw.java_override,
+            created_at: raw.created_at,
+            last_played: raw.last_played,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), InstanceError> {
+        let bad = |reason: String| Err(InstanceError::InvalidConfig(reason));
+        match self.components.first() {
+            Some(c) if c.uid == ComponentUid::Minecraft => {
+                if c.version.trim().is_empty() {
+                    return bad(
+                        rust_i18n::t!("errors.instance.config_reason.empty_version").to_string()
+                    );
+                }
+                if c.profile.is_some() {
+                    return bad(
+                        rust_i18n::t!("errors.instance.config_reason.minecraft_profile")
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {
+                return bad(rust_i18n::t!("errors.instance.config_reason.no_minecraft").to_string());
+            }
+        }
+        let rest = &self.components[1..];
+        if rest.iter().any(|c| c.uid == ComponentUid::Minecraft) {
+            return bad(
+                rust_i18n::t!("errors.instance.config_reason.duplicate_minecraft").to_string(),
+            );
+        }
+        if rest
+            .iter()
+            .filter(|c| c.uid.loader_kind().is_some())
+            .count()
+            > 1
+        {
+            return bad(
+                rust_i18n::t!("errors.instance.config_reason.multiple_loaders").to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn mc_version(&self) -> &str {
+        self.components
+            .first()
+            .map(|c| c.version.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn loader(&self) -> Option<(LoaderKind, &Component)> {
+        self.components
+            .iter()
+            .find_map(|c| c.uid.loader_kind().map(|k| (k, c)))
+    }
+
+    pub fn set_mc_version(&mut self, v: &str) {
+        match self.components.first_mut() {
+            Some(c) if c.uid == ComponentUid::Minecraft => c.version = v.to_string(),
+            _ => self.components.insert(0, Component::minecraft(v)),
+        }
+    }
+
+    /// Replaces the loader component. Rejects a non-loader uid.
+    pub fn set_loader(&mut self, comp: Option<Component>) -> Result<(), InstanceError> {
+        if let Some(c) = &comp
+            && c.uid.loader_kind().is_none()
+        {
+            return Err(InstanceError::InvalidConfig(
+                rust_i18n::t!("errors.instance.config_reason.not_a_loader").to_string(),
+            ));
+        }
+        self.components.retain(|e| e.uid.loader_kind().is_none());
+        self.components.extend(comp);
+        Ok(())
+    }
 }
 
 pub fn effective_java<'a>(global: &'a JavaSettings, inst: &'a InstanceConfig) -> &'a JavaSettings {
@@ -137,7 +283,7 @@ impl InstanceStore {
         Ok(Instance {
             id: id.to_string(),
             dir,
-            config: toml::from_str(&text)?,
+            config: InstanceConfig::from_raw(toml::from_str(&text)?)?,
         })
     }
 
@@ -191,7 +337,7 @@ impl InstanceStore {
             dir,
             config: InstanceConfig {
                 name: name.to_string(),
-                mc_version: mc_version.to_string(),
+                components: vec![Component::minecraft(mc_version)],
                 java_override: None,
                 created_at: now_secs(),
                 last_played: None,
@@ -209,6 +355,7 @@ impl InstanceStore {
 
     pub fn save(&self, inst: &Instance) -> Result<(), InstanceError> {
         Self::check_id(&inst.id)?;
+        inst.config.validate()?;
         let s = toml::to_string_pretty(&inst.config)?;
         write_atomic(&self.root.join(&inst.id).join(CONFIG_FILE), s.as_bytes())?;
         Ok(())
@@ -237,6 +384,147 @@ impl InstanceStore {
 mod tests {
     use super::*;
     use crate::config::JavaSettings;
+
+    fn write_raw(tmp: &std::path::Path, id: &str, body: &str) {
+        std::fs::create_dir_all(tmp.join(id)).unwrap();
+        std::fs::write(tmp.join(id).join("instance.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn legacy_instance_config_migrates() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            "old",
+            "name = \"Old\"\nmc_version = \"1.20.1\"\ncreated_at = 5\n",
+        );
+        let store = InstanceStore::new(tmp.path());
+        let inst = store.load("old").unwrap();
+        assert_eq!(inst.config.mc_version(), "1.20.1");
+        assert!(inst.config.loader().is_none());
+        store.save(&inst).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("old/instance.toml")).unwrap();
+        assert!(text.contains("[[components]]"), "{text}");
+        assert!(!text.contains("mc_version"), "{text}");
+        assert_eq!(store.load("old").unwrap(), inst);
+    }
+
+    #[test]
+    fn loader_component_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let mut inst = store.create("L", "1.21.1").unwrap();
+        inst.config.java_override = Some(JavaSettings::default());
+        let fabric = Component {
+            uid: ComponentUid::Fabric,
+            version: "0.16.10".into(),
+            profile: Some("fabric-loader-0.16.10-1.21.1".into()),
+        };
+        inst.config.set_loader(Some(fabric.clone())).unwrap();
+        store.save(&inst).unwrap();
+        let re = store.load("L").unwrap();
+        assert_eq!(re, inst);
+        assert_eq!(re.config.mc_version(), "1.21.1");
+        let (kind, c) = re.config.loader().unwrap();
+        assert_eq!(kind, LoaderKind::Fabric);
+        assert_eq!(c, &fabric);
+        let mut re = re;
+        re.config.set_loader(None).unwrap();
+        assert!(re.config.loader().is_none());
+        re.config.set_mc_version("1.21.4");
+        assert_eq!(re.config.mc_version(), "1.21.4");
+    }
+
+    #[test]
+    fn missing_or_empty_mc_version_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        write_raw(tmp.path(), "a", "name = \"A\"\n");
+        write_raw(tmp.path(), "b", "name = \"B\"\nmc_version = \"\"\n");
+        for id in ["a", "b"] {
+            assert!(matches!(
+                store.load(id),
+                Err(InstanceError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn components_win_over_legacy_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            "m",
+            "mc_version = \"1.8\"\n[[components]]\nuid = \"minecraft\"\nversion = \"1.21\"\n",
+        );
+        let inst = InstanceStore::new(tmp.path()).load("m").unwrap();
+        assert_eq!(inst.config.mc_version(), "1.21");
+    }
+
+    #[test]
+    fn set_loader_keeps_minecraft_first_and_rejects_non_loaders() {
+        let mut cfg = InstanceStore::new(tempfile::tempdir().unwrap().path())
+            .create("x", "1.20")
+            .unwrap()
+            .config;
+        let forge = Component {
+            uid: ComponentUid::Forge,
+            version: "47.1".into(),
+            profile: Some("p".into()),
+        };
+        cfg.set_loader(Some(forge)).unwrap();
+        cfg.set_mc_version("1.20.1");
+        assert_eq!(cfg.components[0].uid, ComponentUid::Minecraft);
+        assert_eq!(cfg.mc_version(), "1.20.1");
+        assert!(cfg.loader().is_some());
+        let mc = Component {
+            uid: ComponentUid::Minecraft,
+            version: "1".into(),
+            profile: None,
+        };
+        assert!(matches!(
+            cfg.set_loader(Some(mc)),
+            Err(InstanceError::InvalidConfig(_))
+        ));
+        assert!(cfg.loader().is_some());
+    }
+
+    #[test]
+    fn save_refuses_invalid_config_and_keeps_old_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let mut inst = store.create("S", "1.20").unwrap();
+        let path = inst.dir.join("instance.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        inst.config.components.clear();
+        assert!(matches!(
+            store.save(&inst),
+            Err(InstanceError::InvalidConfig(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn invalid_components_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let mc = "[[components]]\nuid = \"minecraft\"\nversion = \"1.20.1\"\n";
+        let loader = |u: &str| format!("[[components]]\nuid = \"{u}\"\nversion = \"1\"\n");
+        let cases = [
+            format!("{mc}{}{}", loader("fabric"), loader("forge")),
+            format!("{}{mc}", loader("fabric")),
+            format!("{mc}{mc}"),
+            format!("{mc}profile = \"x\"\n"),
+        ];
+        for (i, body) in cases.iter().enumerate() {
+            let id = format!("bad{i}");
+            write_raw(tmp.path(), &id, body);
+            assert!(
+                matches!(store.load(&id), Err(InstanceError::InvalidConfig(_))),
+                "case {i}"
+            );
+        }
+    }
 
     #[test]
     fn create_sanitizes_and_dedups() {

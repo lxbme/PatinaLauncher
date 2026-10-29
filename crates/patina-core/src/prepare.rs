@@ -256,7 +256,7 @@ impl Launcher {
         let extra_jvm_args = split_args(&js.extra_jvm_args);
         // The client jar is keyed on the requested id, the same id
         // `ensure_version` caches the JSON under (may differ from `version.id`).
-        let jar_id = inst.config.mc_version.as_str();
+        let jar_id = inst.config.mc_version();
         let version = self.ensure_version(jar_id).await?;
         checked_name(&version.id)?;
 

@@ -8,6 +8,7 @@ pub mod instance;
 pub mod java;
 pub mod jvm;
 pub mod launch;
+pub mod loader;
 pub mod meta;
 pub mod paths;
 pub mod platform;

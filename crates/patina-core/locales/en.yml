@@ -9,6 +9,14 @@ errors:
     serialize: "Failed to serialize the instance config: %{error}"
     not_found: "Instance not found: %{id}"
     invalid_id: "Invalid instance ID: %{id}"
+    invalid_config: "Invalid instance config: %{reason}"
+    config_reason:
+      no_minecraft: "the first component must be minecraft"
+      multiple_loaders: "at most one loader component is allowed"
+      minecraft_profile: "the minecraft component must not have a profile"
+      empty_version: "the Minecraft version must not be empty"
+      duplicate_minecraft: "only one minecraft component is allowed"
+      not_a_loader: "the component is not a mod loader"
   jvm:
     memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"
@@ -46,3 +54,7 @@ source:
   auto: "Auto (fastest)"
   official: "Prefer official"
   bmclapi: "Prefer BMCLAPI"
+loader:
+  forge: "Forge"
+  neoforge: "NeoForge"
+  fabric: "Fabric"

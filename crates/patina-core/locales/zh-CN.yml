@@ -9,6 +9,14 @@ errors:
     serialize: "序列化实例配置失败：%{error}"
     not_found: "找不到实例：%{id}"
     invalid_id: "无效的实例 ID：%{id}"
+    invalid_config: "实例配置无效：%{reason}"
+    config_reason:
+      no_minecraft: "第一个组件必须是 minecraft"
+      multiple_loaders: "最多只能有一个加载器组件"
+      minecraft_profile: "minecraft 组件不能带有 profile"
+      empty_version: "Minecraft 版本不能为空"
+      duplicate_minecraft: "只能有一个 minecraft 组件"
+      not_a_loader: "该组件不是模组加载器"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
@@ -46,3 +54,7 @@ source:
   auto: "自动（测速选择）"
   official: "优先使用官方源"
   bmclapi: "优先使用 BMCLAPI"
+loader:
+  forge: "Forge"
+  neoforge: "NeoForge"
+  fabric: "Fabric"

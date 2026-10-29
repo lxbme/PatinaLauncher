@@ -169,7 +169,10 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
                     .map_or("never".to_string(), |t| t.to_string());
                 println!(
                     "{:<20} {:<20} {:<10} last played: {}",
-                    i.id, i.config.name, i.config.mc_version, played
+                    i.id,
+                    i.config.name,
+                    i.config.mc_version(),
+                    played
                 );
             }
         }
@@ -329,13 +332,13 @@ async fn launch(ctx: &mut Ctx, id: &str, player: &str) -> Result<()> {
     println!(
         "Instance {:?}, version {}, source {}, data dir {}",
         inst.config.name,
-        inst.config.mc_version,
+        inst.config.mc_version(),
         launcher.downloader.mirror().id,
         ctx.data.root().display()
     );
     let js = effective_java(&ctx.config.java, &inst.config);
     if js.java_path.is_none() {
-        let v = launcher.ensure_version(&inst.config.mc_version).await?;
+        let v = launcher.ensure_version(inst.config.mc_version()).await?;
         let component = v.java_requirement().component;
         let runtimes = ManagedRuntimes::new(ctx.data.runtimes());
         if runtimes.is_installed(&component) {
