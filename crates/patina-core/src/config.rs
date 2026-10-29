@@ -23,6 +23,18 @@ pub enum SourceChoice {
     Bmclapi,
 }
 
+impl SourceChoice {
+    /// Localized label for the settings UI.
+    pub fn display_name(self) -> String {
+        match self {
+            SourceChoice::Auto => rust_i18n::t!("source.auto"),
+            SourceChoice::Official => rust_i18n::t!("source.official"),
+            SourceChoice::Bmclapi => rust_i18n::t!("source.bmclapi"),
+        }
+        .to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DownloadConfig {
@@ -120,6 +132,28 @@ mod tests {
             GlobalConfig::load(&p).unwrap().download.source,
             SourceChoice::Bmclapi
         );
+    }
+
+    #[test]
+    fn source_choice_display_names_are_localized() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        set_language(Language::ZhCn);
+        assert_eq!(SourceChoice::Auto.display_name(), "自动（测速选择）");
+        assert_eq!(SourceChoice::Official.display_name(), "优先使用官方源");
+        assert_eq!(SourceChoice::Bmclapi.display_name(), "优先使用 BMCLAPI");
+        for c in [
+            SourceChoice::Auto,
+            SourceChoice::Official,
+            SourceChoice::Bmclapi,
+        ] {
+            assert!(!c.display_name().contains("固定"));
+        }
+        set_language(Language::En);
+        assert_eq!(SourceChoice::Auto.display_name(), "Auto (fastest)");
+        assert_eq!(SourceChoice::Official.display_name(), "Prefer official");
+        assert_eq!(SourceChoice::Bmclapi.display_name(), "Prefer BMCLAPI");
+        set_language(Language::ZhCn);
     }
 
     #[test]

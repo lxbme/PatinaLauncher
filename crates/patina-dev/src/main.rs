@@ -77,7 +77,7 @@ enum JavaCmd {
 enum SourceCmd {
     /// Show the current download source
     Show,
-    /// Set the download source
+    /// Set the preferred download source (the other one is still the fallback)
     Set { source: SourceArg },
     /// Measure the built-in mirrors and store the fastest for auto mode
     Speedtest,

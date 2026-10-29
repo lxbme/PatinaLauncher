@@ -42,3 +42,7 @@ gc_preset:
 warnings:
   low_memory: "可用内存不足：请求 %{requested} MiB，当前可用 %{available} MiB，游戏可能卡顿或崩溃"
   gc_preset_ignored: "GC 预设 %{preset} 需要 Java %{required} 及以上，当前 Java %{found}，已忽略该预设"
+source:
+  auto: "自动（测速选择）"
+  official: "优先使用官方源"
+  bmclapi: "优先使用 BMCLAPI"

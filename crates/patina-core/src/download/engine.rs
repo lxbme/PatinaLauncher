@@ -486,7 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_fallback_mirror_official_failure_is_final() {
+    async fn downloader_without_fallback_is_strict() {
         let server = MockServer::start().await;
         serve(&server, "/orig/a", 500, b"").await;
         Mock::given(method("GET"))

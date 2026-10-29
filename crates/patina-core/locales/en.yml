@@ -42,3 +42,7 @@ gc_preset:
 warnings:
   low_memory: "Not enough free memory: %{requested} MiB requested, %{available} MiB available; the game may stutter or crash"
   gc_preset_ignored: "GC preset %{preset} needs Java %{required} or newer, but the current Java is %{found}; the preset was ignored"
+source:
+  auto: "Auto (fastest)"
+  official: "Prefer official"
+  bmclapi: "Prefer BMCLAPI"

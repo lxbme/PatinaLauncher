@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{GlobalConfig, SourceChoice, write_atomic};
+use crate::config::{GlobalConfig, write_atomic};
 use crate::download::{
     DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT,
     pick_fastest, resolve_choice, sha1_file,
@@ -110,8 +110,8 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSource {
     pub mirror: Mirror,
-    /// Tried after `mirror` and the original URL. Only set in auto mode; an
-    /// explicitly chosen source stays strict.
+    /// Tried after `mirror` and the original URL. Always the other built-in
+    /// mirror: every source setting is a preference, not a lock.
     pub fallback: Option<Mirror>,
 }
 
@@ -124,7 +124,8 @@ impl ResolvedSource {
 /// Source from the config. With Auto and no stored pick, speed-tests the
 /// built-in mirrors and stores the winner in `cfg.download.auto_pick`; if
 /// every probe fails, uses official for this run and stores nothing, so the
-/// next run tests again. In Auto mode the other built-in mirror is the fallback.
+/// next run tests again. Whatever the setting, the other built-in mirror is the
+/// fallback.
 pub async fn resolve_mirror(client: &reqwest::Client, cfg: &mut GlobalConfig) -> ResolvedSource {
     let builtin = [Mirror::official(), Mirror::bmclapi()];
     resolve_mirror_with(client, cfg, &builtin, PROBE_URL, SPEEDTEST_TIMEOUT).await
@@ -147,10 +148,7 @@ async fn resolve_mirror_with(
             None => Mirror::official(),
         },
     };
-    let fallback = match cfg.download.source {
-        SourceChoice::Auto => other_builtin(&mirror.id),
-        SourceChoice::Official | SourceChoice::Bmclapi => None,
-    };
+    let fallback = other_builtin(&mirror.id);
     ResolvedSource { mirror, fallback }
 }
 
@@ -441,16 +439,22 @@ mod tests {
         cfg.download.source = crate::config::SourceChoice::Bmclapi;
         let src = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
         assert_eq!(src.mirror.id, "bmclapi");
-        assert_eq!(src.fallback, None);
+        assert_eq!(
+            src.fallback.as_ref().map(|m| m.id.as_str()),
+            Some("official")
+        );
         assert_eq!(cfg.download.auto_pick, None);
 
-        // Explicit official: strict, no fallback mirror and no third candidate.
+        // Explicit official is a preference: bmclapi is the fallback.
         cfg.download.source = crate::config::SourceChoice::Official;
         let src = resolve_mirror(&reqwest::Client::new(), &mut cfg).await;
         assert_eq!(src.mirror.id, "official");
-        assert_eq!(src.fallback, None);
+        assert_eq!(
+            src.fallback.as_ref().map(|m| m.id.as_str()),
+            Some("bmclapi")
+        );
         let d = src.downloader(reqwest::Client::new());
-        assert!(d.fallback_mirror().is_none());
+        assert!(d.fallback_mirror().is_some());
     }
 
     #[tokio::test]
