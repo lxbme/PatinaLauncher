@@ -9,7 +9,7 @@ use super::forge::installer::is_safe_version;
 use super::forge::{
     InstallerProfile, fetch_installer, install_legacy, install_modern, read_installer,
 };
-use super::list::{LoaderError, LoaderVersion, VersionPick, list_versions};
+use super::list::{InstallerProblem, LoaderError, LoaderVersion, VersionPick, list_versions};
 use super::{InstalledProfile, LoaderKind};
 use crate::instance::{Component, ComponentUid, Instance, InstanceStore};
 use crate::meta::VersionJson;
@@ -282,13 +282,13 @@ async fn install_forge(
     let read_from = jar.clone();
     let profile = tokio::task::spawn_blocking(move || read_installer(&read_from))
         .await
-        .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
+        .map_err(LoaderError::from)??;
     match profile {
         InstallerProfile::Legacy { .. } if kind == LoaderKind::Forge => {
             install_legacy(dl, data, &jar, profile, progress).await
         }
         InstallerProfile::Legacy { .. } => Err(LoaderError::InstallerInvalid(
-            "a NeoForge installer cannot use the legacy (versionInfo) format".into(),
+            InstallerProblem::NeoforgeLegacy,
         )),
         InstallerProfile::Modern { .. } => {
             // Processors run on the managed runtime for this version.

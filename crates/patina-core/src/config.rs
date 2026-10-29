@@ -7,11 +7,29 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("{}", rust_i18n::t!("errors.config.io", error = .0))]
-    Io(#[from] std::io::Error),
+    Io(String),
     #[error("{}", rust_i18n::t!("errors.config.parse", error = .0))]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("{}", rust_i18n::t!("errors.config.serialize", error = .0))]
-    Serialize(#[from] toml::ser::Error),
+    Serialize(String),
+}
+
+impl From<std::io::Error> for ConfigError {
+    fn from(e: std::io::Error) -> Self {
+        ConfigError::Io(e.to_string())
+    }
+}
+
+impl From<toml::de::Error> for ConfigError {
+    fn from(e: toml::de::Error) -> Self {
+        ConfigError::Parse(e.to_string())
+    }
+}
+
+impl From<toml::ser::Error> for ConfigError {
+    fn from(e: toml::ser::Error) -> Self {
+        ConfigError::Serialize(e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -105,6 +123,16 @@ impl GlobalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_errors_have_no_source() {
+        use std::error::Error;
+        let de = toml::from_str::<toml::Value>("x = [").unwrap_err();
+        let errs: Vec<ConfigError> = vec![std::io::Error::other("boom").into(), de.into()];
+        for e in errs {
+            assert!(e.source().is_none(), "{e:?}");
+        }
+    }
 
     #[test]
     fn global_config_roundtrip_and_missing_default() {

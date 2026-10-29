@@ -67,6 +67,31 @@ impl std::fmt::Display for PrepareWarning {
     }
 }
 
+/// Which downloaded or stored JSON document failed to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonSource {
+    Manifest,
+    VersionJson,
+    AssetIndex,
+    LoaderProfile,
+}
+
+impl JsonSource {
+    pub fn display_name(self) -> String {
+        match self {
+            JsonSource::Manifest => rust_i18n::t!("errors.prepare.json_source.manifest"),
+            JsonSource::VersionJson => rust_i18n::t!("errors.prepare.json_source.version_json"),
+            JsonSource::AssetIndex => rust_i18n::t!("errors.prepare.json_source.asset_index"),
+            JsonSource::LoaderProfile => {
+                rust_i18n::t!("errors.prepare.json_source.loader_profile")
+            }
+        }
+        .to_string()
+    }
+}
+
+/// Variants that show a lower-level error keep only its text (no `source()`),
+/// so a chain printer such as anyhow's `{:#}` shows each message once.
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareError {
     #[error("{}", rust_i18n::t!("errors.prepare.unknown_version", version = .0))]
@@ -76,21 +101,66 @@ pub enum PrepareError {
     #[error("{}", rust_i18n::t!("errors.prepare.java_not_found", path = .0.display()))]
     JavaNotFound(PathBuf),
     #[error("{}", rust_i18n::t!("errors.prepare.invalid_jvm_args", error = .0))]
-    InvalidJvmArgs(#[from] JvmArgsError),
+    InvalidJvmArgs(String),
     #[error("{}", rust_i18n::t!("errors.prepare.runtime", error = .0))]
-    Runtime(#[from] RuntimeError),
+    Runtime(String),
     #[error("{}", rust_i18n::t!("errors.prepare.download", error = .0))]
-    Download(#[from] DownloadError),
-    #[error("{}", rust_i18n::t!("errors.prepare.io", error = .0))]
-    Io(#[from] io::Error),
-    #[error("{}", rust_i18n::t!("errors.prepare.json", error = .0))]
-    Json(#[from] serde_json::Error),
+    Download(String),
+    /// A file operation failed; `path` is the file or directory involved.
+    #[error("{}", rust_i18n::t!("errors.prepare.io", path = .path.display(), error = .error))]
+    Io { path: PathBuf, error: String },
+    #[error("{}", rust_i18n::t!("errors.prepare.json", what = .what.display_name(), error = .error))]
+    Json { what: JsonSource, error: String },
+    /// A background task failed (panicked or was cancelled).
+    #[error("{}", rust_i18n::t!("errors.prepare.internal", error = .0))]
+    Internal(String),
     /// A file name from downloaded metadata would escape its directory.
     #[error("{}", rust_i18n::t!("errors.prepare.unsafe_metadata", name = .0))]
     UnsafeMetadata(String),
     /// The loader profile or a file its install generated is gone.
     #[error("{}", rust_i18n::t!("errors.prepare.loader_needs_reinstall", kind = .kind.display_name(), version = .version))]
     LoaderNeedsReinstall { kind: LoaderKind, version: String },
+}
+
+impl From<JvmArgsError> for PrepareError {
+    fn from(e: JvmArgsError) -> Self {
+        PrepareError::InvalidJvmArgs(e.to_string())
+    }
+}
+
+impl From<RuntimeError> for PrepareError {
+    fn from(e: RuntimeError) -> Self {
+        PrepareError::Runtime(e.to_string())
+    }
+}
+
+impl From<DownloadError> for PrepareError {
+    fn from(e: DownloadError) -> Self {
+        PrepareError::Download(e.to_string())
+    }
+}
+
+impl From<tokio::task::JoinError> for PrepareError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        PrepareError::Internal(e.to_string())
+    }
+}
+
+/// Error mapper attaching the path an IO operation was working on.
+fn io_at(path: &Path) -> impl FnOnce(io::Error) -> PrepareError {
+    let path = path.to_path_buf();
+    move |e| PrepareError::Io {
+        path,
+        error: e.to_string(),
+    }
+}
+
+/// Error mapper for a JSON document that failed to parse.
+fn json_as(what: JsonSource) -> impl FnOnce(serde_json::Error) -> PrepareError {
+    move |e| PrepareError::Json {
+        what,
+        error: e.to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -185,7 +255,7 @@ fn read_cached(path: &Path) -> Option<VersionJson> {
 impl Launcher {
     pub async fn manifest(&self) -> Result<VersionManifest, PrepareError> {
         let bytes = self.downloader.fetch_bytes(MANIFEST_URL, None).await?;
-        Ok(serde_json::from_slice(&bytes)?)
+        serde_json::from_slice(&bytes).map_err(json_as(JsonSource::Manifest))
     }
 
     /// Version JSON cached at `versions/<id>/<id>.json`. The cache is reused
@@ -211,8 +281,9 @@ impl Launcher {
             .downloader
             .fetch_bytes(&entry.url, Some(&entry.sha1))
             .await?;
-        let v: VersionJson = serde_json::from_slice(&bytes)?;
-        write_atomic(&path, &bytes)?;
+        let v: VersionJson =
+            serde_json::from_slice(&bytes).map_err(json_as(JsonSource::VersionJson))?;
+        write_atomic(&path, &bytes).map_err(io_at(&path))?;
         Ok(v)
     }
 
@@ -235,7 +306,8 @@ impl Launcher {
     /// (absolute destination).
     fn client_jar_job(&self, mc: &str, version: &VersionJson) -> Result<DownloadJob, PrepareError> {
         let mc = checked_name(mc)?;
-        let dest = std::path::absolute(self.data.versions().join(mc).join(format!("{mc}.jar")))?;
+        let rel = self.data.versions().join(mc).join(format!("{mc}.jar"));
+        let dest = std::path::absolute(&rel).map_err(io_at(&rel))?;
         let client = &version.downloads.client;
         Ok(DownloadJob {
             url: client.url.clone(),
@@ -333,9 +405,11 @@ impl Launcher {
         progress: ProgressSink,
     ) -> Result<Prepared, PrepareError> {
         // The game runs with cwd = game dir, so every path must be absolute.
-        let data = DataDirs::new(std::path::absolute(self.data.root())?);
-        let game_dir = std::path::absolute(inst.game_dir())?;
-        let natives_dir = std::path::absolute(inst.natives_dir())?;
+        let data =
+            DataDirs::new(std::path::absolute(self.data.root()).map_err(io_at(&self.data.root()))?);
+        let game_dir = std::path::absolute(inst.game_dir()).map_err(io_at(&inst.game_dir()))?;
+        let natives_dir =
+            std::path::absolute(inst.natives_dir()).map_err(io_at(&inst.natives_dir()))?;
         let mut warnings = Vec::new();
 
         // 1. Settings and version metadata.
@@ -410,7 +484,11 @@ impl Launcher {
             0,
         )
         .await?;
-        let index: AssetIndex = serde_json::from_slice(&tokio::fs::read(&index_path).await?)?;
+        let index_bytes = tokio::fs::read(&index_path)
+            .await
+            .map_err(io_at(&index_path))?;
+        let index: AssetIndex =
+            serde_json::from_slice(&index_bytes).map_err(json_as(JsonSource::AssetIndex))?;
 
         let env = RuleEnv::current();
         let libs = resolve_libraries(&version.libraries, &env, &data.libraries());
@@ -453,20 +531,21 @@ impl Launcher {
         let client_jar = if inst.config.loader().is_some() {
             let (versions, id) = (data.versions(), version.id.clone());
             let sha1 = version.downloads.client.sha1.clone();
+            let jar_dest = versions.join(&id).join(format!("{id}.jar"));
             tokio::task::spawn_blocking(move || {
                 loader_client_jar(&vanilla_jar, &versions, &id, &sha1)
             })
-            .await
-            .map_err(io::Error::other)??
+            .await?
+            .map_err(io_at(&jar_dest))?
         } else {
             vanilla_jar
         };
 
         // 6. Natives, legacy asset layout, game directory.
-        extract_natives(&libs.natives, &natives_dir)?;
+        extract_natives(&libs.natives, &natives_dir).map_err(io_at(&natives_dir))?;
         let layout = asset_layout(&index, &ai.id, &assets_dir, &game_dir);
-        materialize_legacy(&index, &assets_dir, &layout)?;
-        std::fs::create_dir_all(&game_dir)?;
+        materialize_legacy(&index, &assets_dir, &layout).map_err(io_at(&assets_dir))?;
+        std::fs::create_dir_all(&game_dir).map_err(io_at(&game_dir))?;
 
         // 7. Command line.
         let mut classpath = libs.classpath;
@@ -528,9 +607,7 @@ fn uses_library_directory(profile: &PartialVersionJson) -> bool {
 async fn probe_blocking(bin: PathBuf) -> Result<JavaInstall, PrepareError> {
     let p = bin.clone();
     tokio::task::spawn_blocking(move || probe(&p))
-        .await
-        .ok()
-        .flatten()
+        .await?
         .ok_or(PrepareError::JavaNotFound(bin))
 }
 
@@ -575,6 +652,54 @@ mod tests {
         let dir = versions.join("fabric-x");
         assert_eq!(std::fs::read(dir.join("fabric-x.jar")).unwrap(), body);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn io_error_names_the_path() {
+        let e = io_at(Path::new("/data/versions/x.json"))(io::Error::other("disk full"));
+        let text = e.to_string();
+        assert!(text.contains("/data/versions/x.json"), "{text}");
+        assert!(text.contains("disk full"), "{text}");
+    }
+
+    #[test]
+    fn wrapped_errors_have_no_source() {
+        use std::error::Error;
+        let json_err = serde_json::from_str::<u8>("x").unwrap_err();
+        let errs: Vec<PrepareError> = vec![
+            JvmArgsError::MemoryFlag("-Xmx1G".into()).into(),
+            RuntimeError::InvalidComponent("../x".into()).into(),
+            DownloadError::Io(io::Error::other("boom")).into(),
+            io_at(Path::new("/p"))(io::Error::other("boom")),
+            json_as(JsonSource::Manifest)(json_err),
+            PrepareError::Internal("x".into()),
+        ];
+        for e in errs {
+            assert!(e.source().is_none(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn json_source_is_localized() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let e = json_as(JsonSource::AssetIndex)(serde_json::from_str::<u8>("x").unwrap_err());
+        set_language(Language::ZhCn);
+        assert!(e.to_string().contains("资源索引"), "{e}");
+        set_language(Language::En);
+        assert!(e.to_string().contains("asset index"), "{e}");
+        set_language(Language::ZhCn);
+    }
+
+    #[tokio::test]
+    async fn join_error_is_internal() {
+        let join = tokio::task::spawn_blocking(|| -> u8 { panic!("boom") })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            PrepareError::from(join),
+            PrepareError::Internal(_)
+        ));
     }
 
     #[test]

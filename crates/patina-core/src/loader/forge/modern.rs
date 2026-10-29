@@ -14,7 +14,7 @@ use super::processors::{
 use super::{checked_profile_id, download_libraries, fill_sha1_from_sidecars, write_profile};
 use crate::download::Downloader;
 use crate::fsutil::{is_safe_name, safe_join, write_atomic};
-use crate::loader::list::LoaderError;
+use crate::loader::list::{InstallerProblem, LoaderError};
 use crate::loader::{InstalledProfile, LoaderKind};
 use crate::meta::{Library, RuleEnv, VersionJson};
 use crate::paths::DataDirs;
@@ -37,8 +37,8 @@ impl Drop for ScratchDir {
     }
 }
 
-fn invalid(msg: impl std::fmt::Display) -> LoaderError {
-    LoaderError::InstallerInvalid(msg.to_string())
+fn invalid(problem: InstallerProblem) -> LoaderError {
+    LoaderError::InstallerInvalid(problem)
 }
 
 /// Installs a modern Forge / NeoForge profile: downloads the installer and
@@ -64,7 +64,7 @@ pub async fn install_modern(
     progress: &ProgressSink,
 ) -> Result<InstalledProfile, LoaderError> {
     let InstallerProfile::Modern { profile, version } = profile else {
-        return Err(invalid("expected a modern (processors) install profile"));
+        return Err(invalid(InstallerProblem::NotModern));
     };
     let id = checked_profile_id(kind, &version.id)?;
     let mc = vanilla.id.as_str();
@@ -74,16 +74,16 @@ pub async fn install_modern(
     if let Some(wanted) = profile.get("minecraft").and_then(Value::as_str)
         && wanted != mc
     {
-        return Err(invalid(format!(
-            "the installer is for Minecraft {wanted}, not {mc}"
-        )));
+        return Err(invalid(InstallerProblem::WrongMinecraft {
+            expected: mc.to_string(),
+            found: wanted.to_string(),
+        }));
     }
     let minecraft_jar = data.versions().join(mc).join(format!("{mc}.jar"));
     if !minecraft_jar.is_file() {
-        return Err(LoaderError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Minecraft client jar missing: {}", minecraft_jar.display()),
-        )));
+        return Err(invalid(InstallerProblem::MinecraftJarMissing {
+            path: minecraft_jar.display().to_string(),
+        }));
     }
     let procs: Vec<Processor> = match profile.get("processors") {
         Some(v) => serde_json::from_value(v.clone())?,
@@ -112,7 +112,7 @@ pub async fn install_modern(
     let (jar_owned, wanted) = (jar.to_path_buf(), bundled);
     let bundled = tokio::task::spawn_blocking(move || extract_entries(&jar_owned, &wanted, false))
         .await
-        .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
+        .map_err(LoaderError::from)??;
     let mut provided: HashSet<PathBuf> = jobs.iter().map(|j| j.dest.clone()).collect();
     provided.extend(bundled);
     fill_sha1_from_sidecars(dl, &mut jobs, |j| j.sha1.is_none()).await;
@@ -141,7 +141,7 @@ pub async fn install_modern(
         resolve_data(&raw_data, CLIENT, &lib_dir, &jar_owned, &scratch_path)
     })
     .await
-    .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
+    .map_err(LoaderError::from)??;
     let env = ProcessorEnv {
         data: resolved,
         minecraft_jar,

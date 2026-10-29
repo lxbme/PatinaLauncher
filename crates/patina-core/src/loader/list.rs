@@ -23,13 +23,16 @@ pub enum LoaderError {
     #[error(transparent)]
     Download(#[from] DownloadError),
     #[error("{}", rust_i18n::t!("errors.loader.io", error = .0))]
-    Io(#[from] io::Error),
+    Io(String),
+    /// A background task failed (panicked or was cancelled).
+    #[error("{}", rust_i18n::t!("errors.loader.internal", error = .0))]
+    Internal(String),
     #[error("{}", rust_i18n::t!("errors.loader.json", error = .0))]
-    Json(#[from] serde_json::Error),
+    Json(String),
     #[error("{}", rust_i18n::t!("errors.loader.unsafe_metadata", name = .0))]
     UnsafeMetadata(String),
     #[error("{}", rust_i18n::t!("errors.loader.installer_invalid", reason = .0))]
-    InstallerInvalid(String),
+    InstallerInvalid(InstallerProblem),
     /// Processor `index` (0-based, into the profile's `processors`; kept for
     /// diagnostics) exited unsuccessfully. `step` is its 1-based position
     /// among the client-side processors, as `RunProcessor` progress counts
@@ -68,9 +71,172 @@ pub enum LoaderError {
         can_replace: bool,
     },
     #[error("{}", rust_i18n::t!("errors.loader.instance", error = .0))]
-    Instance(#[from] InstanceError),
+    Instance(String),
     #[error("{}", rust_i18n::t!("errors.loader.prepare", error = .0))]
-    Prepare(#[from] PrepareError),
+    Prepare(String),
+}
+
+impl From<io::Error> for LoaderError {
+    fn from(e: io::Error) -> Self {
+        LoaderError::Io(e.to_string())
+    }
+}
+
+impl From<tokio::task::JoinError> for LoaderError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        LoaderError::Internal(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for LoaderError {
+    fn from(e: serde_json::Error) -> Self {
+        LoaderError::Json(e.to_string())
+    }
+}
+
+impl From<InstanceError> for LoaderError {
+    fn from(e: InstanceError) -> Self {
+        LoaderError::Instance(e.to_string())
+    }
+}
+
+impl From<PrepareError> for LoaderError {
+    fn from(e: PrepareError) -> Self {
+        LoaderError::Prepare(e.to_string())
+    }
+}
+
+impl From<InstallerProblem> for LoaderError {
+    fn from(p: InstallerProblem) -> Self {
+        LoaderError::InstallerInvalid(p)
+    }
+}
+
+/// Why a loader installer cannot be used. `detail` fields carry the
+/// underlying (English) library error for `Debug` only; they are never shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallerProblem {
+    NotModern,
+    NotLegacy,
+    NeoforgeLegacy,
+    NoFabricInstaller,
+    /// The installer targets Minecraft `found`, but `expected` is installed.
+    WrongMinecraft {
+        expected: String,
+        found: String,
+    },
+    MissingEntry {
+        name: String,
+    },
+    UnreadableEntry {
+        name: String,
+        detail: String,
+    },
+    UnreadableArchive {
+        detail: String,
+    },
+    MissingInstallKey {
+        key: String,
+    },
+    DataNotObject,
+    DataNotString {
+        key: String,
+        side: String,
+    },
+    ArgBadEscape {
+        arg: String,
+    },
+    ArgUnclosed {
+        arg: String,
+    },
+    ArgUnknownKey {
+        arg: String,
+        key: String,
+    },
+    UnreadableJar {
+        path: String,
+        detail: String,
+    },
+    NoMainClass {
+        path: String,
+    },
+    MissingProcessorLibrary {
+        coord: String,
+    },
+    MojmapsNoOutput,
+    NoClientMappings {
+        version: String,
+    },
+    MinecraftJarMissing {
+        path: String,
+    },
+    NonUtf8Path {
+        path: String,
+    },
+}
+
+impl std::fmt::Display for InstallerProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use InstallerProblem::*;
+        let text = match self {
+            NotModern => rust_i18n::t!("errors.loader.installer.not_modern"),
+            NotLegacy => rust_i18n::t!("errors.loader.installer.not_legacy"),
+            NeoforgeLegacy => rust_i18n::t!("errors.loader.installer.neoforge_legacy"),
+            NoFabricInstaller => rust_i18n::t!("errors.loader.installer.no_fabric_installer"),
+            WrongMinecraft { expected, found } => rust_i18n::t!(
+                "errors.loader.installer.wrong_minecraft",
+                expected = expected,
+                found = found
+            ),
+            MissingEntry { name } => {
+                rust_i18n::t!("errors.loader.installer.missing_entry", name = name)
+            }
+            UnreadableEntry { name, .. } => {
+                rust_i18n::t!("errors.loader.installer.unreadable_entry", name = name)
+            }
+            UnreadableArchive { .. } => rust_i18n::t!("errors.loader.installer.unreadable_archive"),
+            MissingInstallKey { key } => {
+                rust_i18n::t!("errors.loader.installer.missing_install_key", key = key)
+            }
+            DataNotObject => rust_i18n::t!("errors.loader.installer.data_not_object"),
+            DataNotString { key, side } => rust_i18n::t!(
+                "errors.loader.installer.data_not_string",
+                key = key,
+                side = side
+            ),
+            ArgBadEscape { arg } => {
+                rust_i18n::t!("errors.loader.installer.arg_bad_escape", arg = arg)
+            }
+            ArgUnclosed { arg } => rust_i18n::t!("errors.loader.installer.arg_unclosed", arg = arg),
+            ArgUnknownKey { arg, key } => rust_i18n::t!(
+                "errors.loader.installer.arg_unknown_key",
+                arg = arg,
+                key = key
+            ),
+            UnreadableJar { path, .. } => {
+                rust_i18n::t!("errors.loader.installer.unreadable_jar", path = path)
+            }
+            NoMainClass { path } => {
+                rust_i18n::t!("errors.loader.installer.no_main_class", path = path)
+            }
+            MissingProcessorLibrary { coord } => rust_i18n::t!(
+                "errors.loader.installer.missing_processor_library",
+                coord = coord
+            ),
+            MojmapsNoOutput => rust_i18n::t!("errors.loader.installer.mojmaps_no_output"),
+            MinecraftJarMissing { path } => {
+                rust_i18n::t!("errors.loader.installer.minecraft_jar_missing", path = path)
+            }
+            NonUtf8Path { path } => {
+                rust_i18n::t!("errors.loader.installer.non_utf8_path", path = path)
+            }
+            NoClientMappings { version } => rust_i18n::t!(
+                "errors.loader.installer.no_client_mappings",
+                version = version
+            ),
+        };
+        f.write_str(&text)
+    }
 }
 
 fn incompatible_text(kind: LoaderKind, version: &str, can_replace: bool) -> String {
@@ -423,6 +589,140 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn every_problem() -> Vec<InstallerProblem> {
+        let s = |v: &str| v.to_string();
+        vec![
+            InstallerProblem::NotModern,
+            InstallerProblem::NotLegacy,
+            InstallerProblem::NeoforgeLegacy,
+            InstallerProblem::NoFabricInstaller,
+            InstallerProblem::WrongMinecraft {
+                expected: s("1.21.1"),
+                found: s("1.20.1"),
+            },
+            InstallerProblem::MissingEntry {
+                name: s("install_profile.json"),
+            },
+            InstallerProblem::UnreadableEntry {
+                name: s("version.json"),
+                detail: s("invalid Zip archive"),
+            },
+            InstallerProblem::UnreadableArchive {
+                detail: s("invalid Zip archive"),
+            },
+            InstallerProblem::MissingInstallKey { key: s("path") },
+            InstallerProblem::DataNotObject,
+            InstallerProblem::DataNotString {
+                key: s("MAPPINGS"),
+                side: s("client"),
+            },
+            InstallerProblem::ArgBadEscape { arg: s("{A") },
+            InstallerProblem::ArgUnclosed { arg: s("{A") },
+            InstallerProblem::ArgUnknownKey {
+                arg: s("{A}"),
+                key: s("A"),
+            },
+            InstallerProblem::UnreadableJar {
+                path: s("/lib/x.jar"),
+                detail: s("invalid Zip archive"),
+            },
+            InstallerProblem::NoMainClass {
+                path: s("/lib/x.jar"),
+            },
+            InstallerProblem::MissingProcessorLibrary {
+                coord: s("x:absent:1"),
+            },
+            InstallerProblem::MojmapsNoOutput,
+            InstallerProblem::NoClientMappings {
+                version: s("1.21.1"),
+            },
+            InstallerProblem::MinecraftJarMissing {
+                path: s("/data/versions/1.21.1/1.21.1.jar"),
+            },
+            InstallerProblem::NonUtf8Path {
+                path: s("/data/\u{FFFD}"),
+            },
+        ]
+    }
+
+    #[test]
+    fn installer_problems_localized() {
+        let _locale = locale_lock();
+        set_language(Language::ZhCn);
+        // Values that legitimately stay as written (coordinates, paths, versions, names).
+        let literals = [
+            "/data/versions/1.21.1/1.21.1.jar",
+            "/data/\u{FFFD}",
+            "1.21.1",
+            "1.20.1",
+            "install_profile.json",
+            "version.json",
+            "path",
+            "MAPPINGS",
+            "client",
+            "{A",
+            "{A}",
+            "A",
+            "/lib/x.jar",
+            "x:absent:1",
+            "Minecraft",
+            "NeoForge",
+            "Fabric",
+            "jar",
+            "Main-Class",
+            "UTF",
+            "versionInfo",
+            "processors",
+            "install",
+            "data",
+            "DOWNLOAD_MOJMAPS",
+            "processors",
+        ];
+        for p in every_problem() {
+            let mut text = p.to_string();
+            assert!(!text.is_empty());
+            for lit in literals {
+                text = text.replace(lit, " ");
+            }
+            let english = text
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|w| !w.is_empty());
+            assert!(!english, "{p:?} -> {}", p);
+            // The library detail never leaks into the message.
+            assert!(!p.to_string().contains("Zip"), "{p:?}");
+        }
+        set_language(Language::En);
+        let en = LoaderError::InstallerInvalid(InstallerProblem::MissingProcessorLibrary {
+            coord: "x:absent:1".into(),
+        });
+        assert!(en.to_string().contains("x:absent:1") && en.to_string().contains("missing"));
+        set_language(Language::ZhCn);
+    }
+
+    #[tokio::test]
+    async fn join_error_is_internal() {
+        let join = tokio::task::spawn_blocking(|| -> u8 { panic!("boom") })
+            .await
+            .unwrap_err();
+        assert!(matches!(LoaderError::from(join), LoaderError::Internal(_)));
+    }
+
+    #[test]
+    fn wrapped_loader_errors_have_no_source() {
+        use std::error::Error;
+        let errs: Vec<LoaderError> = vec![
+            io::Error::other("boom").into(),
+            serde_json::from_str::<u8>("x").unwrap_err().into(),
+            InstanceError::NotFound("x".into()).into(),
+            PrepareError::Internal("boom".into()).into(),
+            LoaderError::Internal("boom".into()),
+            InstallerProblem::NotModern.into(),
+        ];
+        for e in errs {
+            assert!(e.source().is_none(), "{e:?}");
+        }
+    }
 
     const FABRIC: &[u8] = include_bytes!("../../tests/fixtures/fabric_loader_list_1.21.1.json");
     const FORGE_XML: &str = include_str!("../../tests/fixtures/forge_maven_metadata.xml");

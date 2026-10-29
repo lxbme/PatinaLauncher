@@ -13,7 +13,7 @@ use crate::download::mirror::canonical_url;
 use crate::download::{DownloadJob, Downloader, sha1_file};
 use crate::fsutil::{is_safe_name, write_atomic};
 use crate::loader::LoaderKind;
-use crate::loader::list::{LoaderError, LoaderVersion};
+use crate::loader::list::{InstallerProblem, LoaderError, LoaderVersion};
 use crate::meta::{PartialVersionJson, maven_path};
 use crate::paths::DataDirs;
 use crate::progress::{Phase, ProgressSink, Unit, report};
@@ -82,7 +82,7 @@ fn installer_target(
     v: &LoaderVersion,
 ) -> Result<(String, PathBuf), LoaderError> {
     if kind == LoaderKind::Fabric {
-        return Err(invalid("Fabric has no installer jar"));
+        return Err(invalid(InstallerProblem::NoFabricInstaller));
     }
     for s in [mc, v.maven_version.as_str()] {
         if !is_safe_version(s) {
@@ -170,15 +170,24 @@ fn kind_dir(kind: LoaderKind) -> &'static str {
     }
 }
 
-fn invalid(msg: impl std::fmt::Display) -> LoaderError {
-    LoaderError::InstallerInvalid(msg.to_string())
+fn invalid(problem: InstallerProblem) -> LoaderError {
+    LoaderError::InstallerInvalid(problem)
 }
 
 fn read_entry(zip: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>, LoaderError> {
     let mut entry = match zip.by_name(name) {
         Ok(e) => e,
-        Err(ZipError::FileNotFound) => return Err(invalid(format!("missing {name}"))),
-        Err(e) => return Err(invalid(format!("{name}: {e}"))),
+        Err(ZipError::FileNotFound) => {
+            return Err(invalid(InstallerProblem::MissingEntry {
+                name: name.to_string(),
+            }));
+        }
+        Err(e) => {
+            return Err(invalid(InstallerProblem::UnreadableEntry {
+                name: name.to_string(),
+                detail: e.to_string(),
+            }));
+        }
     };
     let mut out = Vec::new();
     entry.read_to_end(&mut out)?;
@@ -189,7 +198,11 @@ fn read_entry(zip: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>, LoaderE
 /// means the legacy format; otherwise the version JSON is the jar entry named
 /// by the profile's `json` field (default `/version.json`).
 pub fn read_installer(jar: &Path) -> Result<InstallerProfile, LoaderError> {
-    let mut zip = ZipArchive::new(File::open(jar)?).map_err(invalid)?;
+    let mut zip = ZipArchive::new(File::open(jar)?).map_err(|e| {
+        invalid(InstallerProblem::UnreadableArchive {
+            detail: e.to_string(),
+        })
+    })?;
     let profile: Value = serde_json::from_slice(&read_entry(&mut zip, "install_profile.json")?)?;
     if let Some(info) = profile.get("versionInfo") {
         let install_str = |key: &str| {
@@ -198,7 +211,11 @@ pub fn read_installer(jar: &Path) -> Result<InstallerProfile, LoaderError> {
                 .and_then(|i| i.get(key))
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .ok_or_else(|| invalid(format!("install_profile.json lacks install.{key}")))
+                .ok_or_else(|| {
+                    invalid(InstallerProblem::MissingInstallKey {
+                        key: key.to_string(),
+                    })
+                })
         };
         return Ok(InstallerProfile::Legacy {
             install_path: install_str("path")?,

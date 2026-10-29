@@ -10,7 +10,7 @@ use super::packxz::{Unpack200, ensure_legacy_library};
 use super::{checked_profile_id, download_libraries, fill_sha1_from_sidecars, write_profile};
 use crate::download::{DownloadJob, Downloader};
 use crate::fsutil::{replace_atomic_part, safe_join};
-use crate::loader::list::LoaderError;
+use crate::loader::list::{InstallerProblem, LoaderError};
 use crate::loader::{InstalledProfile, LoaderKind};
 use crate::meta::{RuleEnv, maven_path};
 use crate::paths::DataDirs;
@@ -37,9 +37,7 @@ pub async fn install_legacy(
         version,
     } = profile
     else {
-        return Err(LoaderError::InstallerInvalid(
-            "expected a legacy (versionInfo) install profile".into(),
-        ));
+        return Err(LoaderError::InstallerInvalid(InstallerProblem::NotLegacy));
     };
     // Legacy installers are Forge-only (NeoForge never shipped one).
     checked_profile_id(LoaderKind::Forge, &version.id)?;
@@ -53,7 +51,7 @@ pub async fn install_legacy(
     let (jar_owned, dest) = (jar.to_path_buf(), universal.clone());
     tokio::task::spawn_blocking(move || extract_entry(&jar_owned, &file_path, &dest))
         .await
-        .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
+        .map_err(LoaderError::from)??;
 
     let resolved = resolve_libraries(&version.libraries, &RuleEnv::current(), &libraries);
     // `checksums` libraries (name, checksums) by destination: they are
@@ -103,7 +101,12 @@ pub async fn install_legacy(
 /// Copies jar entry `name` to `dest` through a unique `.part` file (see
 /// [`replace_atomic_part`]).
 fn extract_entry(jar: &Path, name: &str, dest: &Path) -> Result<(), LoaderError> {
-    let invalid = |e: &dyn std::fmt::Display| LoaderError::InstallerInvalid(format!("{name}: {e}"));
+    let invalid = |e: &dyn std::fmt::Display| {
+        LoaderError::InstallerInvalid(InstallerProblem::UnreadableEntry {
+            name: name.to_string(),
+            detail: e.to_string(),
+        })
+    };
     let mut zip = zip::ZipArchive::new(std::fs::File::open(jar)?).map_err(|e| invalid(&e))?;
     let mut entry = zip.by_name(name).map_err(|e| invalid(&e))?;
     replace_atomic_part(dest, |part| {

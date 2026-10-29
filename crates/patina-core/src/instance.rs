@@ -10,17 +10,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceError {
     #[error("{}", rust_i18n::t!("errors.instance.io", error = .0))]
-    Io(#[from] std::io::Error),
+    Io(String),
     #[error("{}", rust_i18n::t!("errors.instance.parse", error = .0))]
-    Parse(#[from] toml::de::Error),
+    Parse(String),
     #[error("{}", rust_i18n::t!("errors.instance.serialize", error = .0))]
-    Serialize(#[from] toml::ser::Error),
+    Serialize(String),
     #[error("{}", rust_i18n::t!("errors.instance.not_found", id = .0))]
     NotFound(String),
     #[error("{}", rust_i18n::t!("errors.instance.invalid_id", id = .0))]
     InvalidId(String),
     #[error("{}", rust_i18n::t!("errors.instance.invalid_config", reason = .0))]
     InvalidConfig(String),
+}
+
+impl From<std::io::Error> for InstanceError {
+    fn from(e: std::io::Error) -> Self {
+        InstanceError::Io(e.to_string())
+    }
+}
+
+impl From<toml::de::Error> for InstanceError {
+    fn from(e: toml::de::Error) -> Self {
+        InstanceError::Parse(e.to_string())
+    }
+}
+
+impl From<toml::ser::Error> for InstanceError {
+    fn from(e: toml::ser::Error) -> Self {
+        InstanceError::Serialize(e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +402,16 @@ impl InstanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_errors_have_no_source() {
+        use std::error::Error;
+        let de = toml::from_str::<toml::Value>("x = [").unwrap_err();
+        let errs: Vec<InstanceError> = vec![std::io::Error::other("boom").into(), de.into()];
+        for e in errs {
+            assert!(e.source().is_none(), "{e:?}");
+        }
+    }
     use crate::config::JavaSettings;
 
     fn write_raw(tmp: &std::path::Path, id: &str, body: &str) {

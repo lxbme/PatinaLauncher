@@ -14,7 +14,7 @@ use zip::result::ZipError;
 use crate::download::mirror::canonical_url;
 use crate::download::{DownloadJob, Downloader, sha1_file};
 use crate::fsutil::{is_safe_rel, replace_atomic_part, safe_join};
-use crate::loader::list::LoaderError;
+use crate::loader::list::{InstallerProblem, LoaderError};
 use crate::meta::{VersionJson, maven_path};
 use crate::platform::CLASSPATH_SEPARATOR;
 use crate::progress::{Phase, ProgressSink, Unit, report};
@@ -81,17 +81,16 @@ impl Processor {
     }
 }
 
-fn invalid(msg: impl std::fmt::Display) -> LoaderError {
-    LoaderError::InstallerInvalid(msg.to_string())
+fn invalid(problem: InstallerProblem) -> LoaderError {
+    LoaderError::InstallerInvalid(problem)
 }
 
 /// Processor arguments are strings, so paths must be valid UTF-8.
 fn path_str(p: &Path) -> Result<String, LoaderError> {
     p.to_str().map(str::to_string).ok_or_else(|| {
-        LoaderError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("path is not valid UTF-8: {}", p.display()),
-        ))
+        invalid(InstallerProblem::NonUtf8Path {
+            path: p.display().to_string(),
+        })
     })
 }
 
@@ -140,7 +139,7 @@ pub fn resolve_data(
         return if raw.is_null() {
             Ok(HashMap::new())
         } else {
-            Err(invalid("install_profile.json data is not an object"))
+            Err(invalid(InstallerProblem::DataNotObject))
         };
     };
     let mut out = HashMap::new();
@@ -149,9 +148,12 @@ pub fn resolve_data(
         let Some(value) = entry.get(side) else {
             continue;
         };
-        let value = value
-            .as_str()
-            .ok_or_else(|| invalid(format!("data.{key}.{side} is not a string")))?;
+        let value = value.as_str().ok_or_else(|| {
+            invalid(InstallerProblem::DataNotString {
+                key: key.clone(),
+                side: side.to_string(),
+            })
+        })?;
         let resolved = if let Some(coord) = bracketed(value) {
             path_str(&library_path(coord, libraries)?)?
         } else if let Some(lit) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
@@ -183,13 +185,22 @@ pub(crate) fn extract_entries(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    let mut zip = ZipArchive::new(File::open(jar)?).map_err(invalid)?;
+    let mut zip = ZipArchive::new(File::open(jar)?).map_err(|e| {
+        invalid(InstallerProblem::UnreadableArchive {
+            detail: e.to_string(),
+        })
+    })?;
     let mut written = Vec::new();
     for (name, dest) in entries {
         let mut entry = match zip.by_name(name) {
             Ok(e) => e,
             Err(ZipError::FileNotFound) if !required => continue,
-            Err(e) => return Err(invalid(format!("{name}: {e}"))),
+            Err(e) => {
+                return Err(invalid(InstallerProblem::UnreadableEntry {
+                    name: name.clone(),
+                    detail: e.to_string(),
+                }));
+            }
         };
         replace_atomic_part(dest, |part| {
             let mut f = File::create(part)?;
@@ -211,19 +222,27 @@ pub fn expand_arg(arg: &str, env: &ProcessorEnv) -> Result<String, LoaderError> 
     if let Some(coord) = bracketed(arg) {
         return path_str(&library_path(coord, &env.library_dir)?);
     }
-    let bad = |why: &str| invalid(format!("processor argument {arg:?}: {why}"));
+    let escape = || {
+        invalid(InstallerProblem::ArgBadEscape {
+            arg: arg.to_string(),
+        })
+    };
     let mut out = String::new();
     let mut chars = arg.chars();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => out.push(chars.next().ok_or_else(|| bad("bad escape"))?),
+            '\\' => out.push(chars.next().ok_or_else(escape)?),
             '{' | '\'' => {
                 let close = if c == '{' { '}' } else { '\'' };
                 let mut token = String::new();
                 loop {
                     match chars.next() {
-                        None => return Err(bad("unclosed token")),
-                        Some('\\') => token.push(chars.next().ok_or_else(|| bad("bad escape"))?),
+                        None => {
+                            return Err(invalid(InstallerProblem::ArgUnclosed {
+                                arg: arg.to_string(),
+                            }));
+                        }
+                        Some('\\') => token.push(chars.next().ok_or_else(escape)?),
                         Some(d) if d == close => break,
                         Some(d) => token.push(d),
                     }
@@ -231,9 +250,12 @@ pub fn expand_arg(arg: &str, env: &ProcessorEnv) -> Result<String, LoaderError> 
                 if c == '\'' {
                     out.push_str(&token);
                 } else {
-                    let value = env
-                        .lookup(&token)?
-                        .ok_or_else(|| bad(&format!("unknown key {token}")))?;
+                    let value = env.lookup(&token)?.ok_or_else(|| {
+                        invalid(InstallerProblem::ArgUnknownKey {
+                            arg: arg.to_string(),
+                            key: token.clone(),
+                        })
+                    })?;
                     out.push_str(&value);
                 }
             }
@@ -270,14 +292,22 @@ fn parse_main_class(manifest: &str) -> Option<String> {
 }
 
 fn main_class(jar: &Path) -> Result<String, LoaderError> {
-    let mut zip = ZipArchive::new(File::open(jar)?)
-        .map_err(|e| invalid(format!("{}: {e}", jar.display())))?;
+    let unreadable = |e: zip::result::ZipError| {
+        invalid(InstallerProblem::UnreadableJar {
+            path: jar.display().to_string(),
+            detail: e.to_string(),
+        })
+    };
+    let mut zip = ZipArchive::new(File::open(jar)?).map_err(unreadable)?;
     let mut text = String::new();
     zip.by_name("META-INF/MANIFEST.MF")
-        .map_err(|e| invalid(format!("{}: {e}", jar.display())))?
+        .map_err(unreadable)?
         .read_to_string(&mut text)?;
-    parse_main_class(&text)
-        .ok_or_else(|| invalid(format!("{}: no Main-Class in the manifest", jar.display())))
+    parse_main_class(&text).ok_or_else(|| {
+        invalid(InstallerProblem::NoMainClass {
+            path: jar.display().to_string(),
+        })
+    })
 }
 
 /// The first output whose file is missing or has another SHA-1.
@@ -317,7 +347,9 @@ pub async fn run_processors(
     for (_, p) in client.iter().filter(|(_, p)| !p.is_download_mojmaps()) {
         for coord in std::iter::once(&p.jar).chain(&p.classpath) {
             if !library_path(coord, &env.library_dir)?.is_file() {
-                return Err(invalid(format!("processor library {coord} is missing")));
+                return Err(invalid(InstallerProblem::MissingProcessorLibrary {
+                    coord: coord.clone(),
+                }));
             }
         }
     }
@@ -351,13 +383,12 @@ async fn download_mojmaps(
         .windows(2)
         .find(|w| w[0] == "--output")
         .map(|w| &w[1])
-        .ok_or_else(|| invalid("DOWNLOAD_MOJMAPS without --output"))?;
+        .ok_or_else(|| invalid(InstallerProblem::MojmapsNoOutput))?;
     let dest = confined_path(&expand_arg(output, env)?, env)?;
     let mappings = vanilla.downloads.client_mappings.as_ref().ok_or_else(|| {
-        invalid(format!(
-            "Minecraft {} has no client mappings to download",
-            vanilla.id
-        ))
+        invalid(InstallerProblem::NoClientMappings {
+            version: vanilla.id.clone(),
+        })
     })?;
     let job = DownloadJob {
         url: canonical_url(&mappings.url),
@@ -412,7 +443,7 @@ async fn run_one(
         .collect::<Result<Vec<_>, _>>()?;
     let main = tokio::task::spawn_blocking(move || main_class(&jar))
         .await
-        .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
+        .map_err(LoaderError::from)??;
 
     // Output is captured so it never reaches the user's terminal. A stderr
     // tail is kept for diagnostics, and both tails are logged at debug level.
@@ -1120,11 +1151,10 @@ mod tests {
                        {"jar": "x:second:1", "classpath": ["x:gone:1"], "args": []}]),
             ] {
                 match st.run(&procs(p)).await {
-                    Err(LoaderError::InstallerInvalid(why)) => {
-                        assert!(
-                            why.contains("x:absent:1") || why.contains("x:gone:1"),
-                            "{why}"
-                        )
+                    Err(LoaderError::InstallerInvalid(
+                        InstallerProblem::MissingProcessorLibrary { coord },
+                    )) => {
+                        assert!(coord == "x:absent:1" || coord == "x:gone:1", "{coord}")
                     }
                     other => panic!("expected InstallerInvalid, got {other:?}"),
                 }

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 pub use crate::progress::{Phase, ProgressSink, TaskProgress, Unit};
 
 pub use list::{
-    LoaderError, LoaderVersion, VersionPick, list_versions, parse_fabric_list, parse_forge,
-    parse_neoforge, parse_neoforge_legacy,
+    InstallerProblem, LoaderError, LoaderVersion, VersionPick, list_versions, parse_fabric_list,
+    parse_forge, parse_neoforge, parse_neoforge_legacy,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
