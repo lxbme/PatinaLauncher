@@ -284,9 +284,49 @@ pub fn kill_pid(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Signals that ask a process to stop: SIGHUP, SIGINT, SIGTERM.
+const STOP_SIGNALS: [i32; 3] = [1, 2, 15];
+
+/// Whether a game that ended with `status` was asked to stop rather than
+/// failing: it died of SIGHUP/SIGINT/SIGTERM, or exited with `128 + signal`
+/// for one of them (the JVM does that after running its shutdown hooks).
+/// True whoever sent the signal, this launcher or another process.
+pub fn is_stop_request(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.signal(), status.code()) {
+        (Some(sig), _) => STOP_SIGNALS.contains(&sig),
+        (None, Some(code)) => code > 128 && STOP_SIGNALS.contains(&(code - 128)),
+        (None, None) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_requests_are_recognised() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        let exited = |code: i32| ExitStatus::from_raw(code << 8);
+        let signalled = ExitStatus::from_raw;
+        for st in [
+            exited(143),
+            exited(130),
+            exited(129),
+            signalled(15),
+            signalled(2),
+        ] {
+            assert!(is_stop_request(&st), "{st:?}");
+        }
+        for st in [exited(0), exited(1), exited(255), exited(137), signalled(6)] {
+            assert!(!is_stop_request(&st), "{st:?}");
+        }
+        assert!(
+            !is_stop_request(&signalled(9)),
+            "SIGKILL may be the OOM killer"
+        );
+    }
 
     #[test]
     fn stat_parser_handles_odd_comm() {

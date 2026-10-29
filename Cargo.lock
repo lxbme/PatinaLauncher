@@ -1580,7 +1580,9 @@ dependencies = [
  "anyhow",
  "clap",
  "patina-core",
+ "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

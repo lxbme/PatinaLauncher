@@ -4,7 +4,8 @@ use clap::Parser;
 use patina_core::loader::ops::LoaderAction;
 use patina_core::loader::{LoaderKind, VersionPick};
 use patina_dev::cli::{
-    Cli, Cmd, InstanceCmd, KindArg, LoaderActionArg, LoaderCmd, LoaderSpec, SourceArg, SourceCmd,
+    AccountCmd, Cli, Cmd, IconCmd, InstanceCmd, KindArg, LoaderActionArg, LoaderCmd, LoaderSpec,
+    ModsCmd, SourceArg, SourceCmd, Toggle,
 };
 
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -223,10 +224,211 @@ fn launch_unchanged() {
         .unwrap()
         .cmd
     {
-        Cmd::Launch { id, offline } => {
-            assert_eq!((id.as_str(), offline.as_str()), ("fab-new", "Dev"))
+        Cmd::Launch { id, offline, .. } => {
+            assert_eq!((id.as_str(), offline.as_deref()), ("fab-new", Some("Dev")))
         }
         other => panic!("{other:?}"),
     }
-    assert!(parse(&["launch", "fab-new"]).is_err());
+    // Without --offline the current account is used.
+    assert!(parse(&["launch", "fab-new"]).is_ok());
+}
+
+fn cmd(args: &[&str]) -> Cmd {
+    parse(args).unwrap().cmd
+}
+
+#[test]
+fn status_kill_logs() {
+    assert!(matches!(cmd(&["status"]), Cmd::Status));
+    assert!(parse(&["status", "extra"]).is_err());
+    match cmd(&["kill", "forge-1201"]) {
+        Cmd::Kill { id } => assert_eq!(id, "forge-1201"),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse(&["kill"]).is_err());
+    match cmd(&["logs", "a"]) {
+        Cmd::Logs { id, follow } => assert_eq!((id.as_str(), follow), ("a", false)),
+        other => panic!("{other:?}"),
+    }
+    match cmd(&["logs", "a", "--follow"]) {
+        Cmd::Logs { follow, .. } => assert!(follow),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse(&["logs"]).is_err());
+    assert!(parse(&["logs", "a", "--tail"]).is_err());
+}
+
+#[test]
+fn search_and_sweep() {
+    match cmd(&["search", "sodium"]) {
+        Cmd::Search { query } => assert_eq!(query, "sodium"),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse(&["search"]).is_err());
+    assert!(matches!(cmd(&["sweep"]), Cmd::Sweep));
+    assert!(parse(&["sweep", "now"]).is_err());
+}
+
+#[test]
+fn instance_mods() {
+    let mods = |args: &[&str]| match instance(args) {
+        InstanceCmd::Mods { id, cmd } => (id, cmd),
+        other => panic!("{other:?}"),
+    };
+    let (id, c) = mods(&["instance", "mods", "fab", "list"]);
+    assert_eq!(id, "fab");
+    assert!(matches!(c, ModsCmd::List));
+    assert!(matches!(
+        mods(&["instance", "mods", "fab", "enable", "a.jar"]).1,
+        ModsCmd::Enable { file } if file == "a.jar"
+    ));
+    assert!(matches!(
+        mods(&["instance", "mods", "fab", "disable", "a.jar"]).1,
+        ModsCmd::Disable { file } if file == "a.jar"
+    ));
+    assert!(matches!(
+        mods(&["instance", "mods", "fab", "delete", "a.jar"]).1,
+        ModsCmd::Delete { file } if file == "a.jar"
+    ));
+    assert!(parse(&["instance", "mods", "fab"]).is_err());
+    assert!(parse(&["instance", "mods", "fab", "enable"]).is_err());
+    assert!(parse(&["instance", "mods", "fab", "remove", "a.jar"]).is_err());
+}
+
+#[test]
+fn instance_packs_shaders_saves() {
+    assert!(matches!(
+        instance(&["instance", "packs", "a"]),
+        InstanceCmd::Packs { id } if id == "a"
+    ));
+    assert!(matches!(
+        instance(&["instance", "shaders", "a"]),
+        InstanceCmd::Shaders { id } if id == "a"
+    ));
+    assert!(matches!(
+        instance(&["instance", "saves", "a"]),
+        InstanceCmd::Saves { id } if id == "a"
+    ));
+    for sub in ["packs", "shaders", "saves"] {
+        assert!(parse(&["instance", sub]).is_err(), "{sub}");
+    }
+}
+
+#[test]
+fn instance_icon() {
+    let icon = |args: &[&str]| match instance(args) {
+        InstanceCmd::Icon { id, cmd } => (id, cmd),
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(
+        icon(&["instance", "icon", "a", "builtin", "grass"]).1,
+        IconCmd::Builtin { name } if name == "grass"
+    ));
+    assert!(matches!(
+        icon(&["instance", "icon", "a", "custom", "/tmp/x.png"]).1,
+        IconCmd::Custom { path } if path.to_str() == Some("/tmp/x.png")
+    ));
+    assert!(matches!(
+        icon(&["instance", "icon", "a", "clear"]).1,
+        IconCmd::Clear
+    ));
+    assert!(parse(&["instance", "icon", "a"]).is_err());
+    assert!(parse(&["instance", "icon", "a", "builtin"]).is_err());
+    assert!(parse(&["instance", "icon", "a", "custom"]).is_err());
+    assert!(parse(&["instance", "icon", "a", "clear", "x"]).is_err());
+    assert!(parse(&["instance", "icon", "a", "round", "x"]).is_err());
+}
+
+#[test]
+fn instance_reinstall_loader_and_early_window() {
+    assert!(matches!(
+        instance(&["instance", "reinstall-loader", "a"]),
+        InstanceCmd::ReinstallLoader { id } if id == "a"
+    ));
+    assert!(parse(&["instance", "reinstall-loader"]).is_err());
+    match instance(&["instance", "early-window", "a", "on"]) {
+        InstanceCmd::EarlyWindow { id, state } => {
+            assert_eq!(id, "a");
+            assert_eq!(state, Toggle::On);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        instance(&["instance", "early-window", "a", "off"]),
+        InstanceCmd::EarlyWindow {
+            state: Toggle::Off,
+            ..
+        }
+    ));
+    assert!(parse(&["instance", "early-window", "a"]).is_err());
+    assert!(parse(&["instance", "early-window", "a", "maybe"]).is_err());
+    assert!(parse(&["instance", "early-window", "a", "ON"]).is_err());
+}
+
+#[test]
+fn account_commands() {
+    let account = |args: &[&str]| match cmd(args) {
+        Cmd::Account { cmd } => cmd,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(account(&["account", "list"]), AccountCmd::List));
+    assert!(matches!(
+        account(&["account", "add-offline", "Dev"]),
+        AccountCmd::AddOffline { name } if name == "Dev"
+    ));
+    assert!(matches!(
+        account(&["account", "use", "id1"]),
+        AccountCmd::Use { id } if id == "id1"
+    ));
+    assert!(matches!(
+        account(&["account", "remove", "id1"]),
+        AccountCmd::Remove { id } if id == "id1"
+    ));
+    for bad in [
+        &["account"][..],
+        &["account", "add-offline"],
+        &["account", "use"],
+        &["account", "remove"],
+        &["account", "login"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn launch_account_and_offline_conflict() {
+    match cmd(&["launch", "a"]) {
+        Cmd::Launch {
+            id,
+            account,
+            offline,
+        } => {
+            assert_eq!(id, "a");
+            assert_eq!((account, offline), (None, None));
+        }
+        other => panic!("{other:?}"),
+    }
+    match cmd(&["launch", "a", "--account", "acc1"]) {
+        Cmd::Launch {
+            account, offline, ..
+        } => assert_eq!((account.as_deref(), offline), (Some("acc1"), None)),
+        other => panic!("{other:?}"),
+    }
+    match cmd(&["launch", "a", "--offline", "Dev"]) {
+        Cmd::Launch {
+            account, offline, ..
+        } => assert_eq!((account, offline.as_deref()), (None, Some("Dev"))),
+        other => panic!("{other:?}"),
+    }
+    let err = parse(&["launch", "a", "--account", "x", "--offline", "Dev"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(parse(&["launch"]).is_err());
+    assert!(parse(&["launch", "a", "--account"]).is_err());
+}
+
+#[test]
+fn unknown_subcommands_are_rejected() {
+    for bad in [&["frobnicate"][..], &["instance", "frobnicate"]] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
 }

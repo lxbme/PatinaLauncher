@@ -398,7 +398,9 @@ impl GameSession {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         code = status.code();
-                        failed = !status.success();
+                        // A stop asked for by another process (or the user's
+                        // system monitor) is not a crash either.
+                        failed = !status.success() && !platform::is_stop_request(&status);
                         break;
                     }
                     Ok(None) => tokio::time::sleep(OWN_EXIT_POLL).await,
@@ -946,6 +948,58 @@ mod tests {
         assert_eq!(exit.code, None);
         assert!(exit.crashed);
         assert!(exit.saved_log.unwrap().exists());
+    }
+
+    /// Sends SIGTERM to `pid` from outside the session, as another launcher
+    /// process or a system monitor would.
+    fn external_term(pid: u32) {
+        let st = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    /// Regression: a stop requested from another process (here: SIGTERM, which
+    /// the JVM turns into exit code 143) was reported as a crash by the
+    /// launcher that owns the game, and its log was saved as a crash log.
+    #[tokio::test]
+    async fn external_stop_with_exit_143_is_not_a_crash() {
+        let e = env("i1");
+        let script = "trap 'exit 143' TERM; echo up; while :; do sleep 0.05; done";
+        let mut s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", script)).unwrap();
+        let _k = Killer(s.killer());
+        let mut rx = s.logs();
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.text, "up");
+        external_term(s.pid());
+        let exit = s.wait().await;
+        assert_eq!(exit.code, Some(143));
+        assert!(!exit.crashed, "a stop request is not a crash");
+        assert_eq!(exit.saved_log, None);
+        assert!(e.inst.dir.join(CURRENT_LOG).exists());
+    }
+
+    #[tokio::test]
+    async fn external_stop_by_sigterm_is_not_a_crash() {
+        let e = env("i1");
+        let script = "echo up; while :; do sleep 0.05; done";
+        let mut s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", script)).unwrap();
+        let _k = Killer(s.killer());
+        let mut rx = s.logs();
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.text, "up");
+        external_term(s.pid());
+        let exit = s.wait().await;
+        assert_eq!(exit.code, None);
+        assert!(!exit.crashed, "a stop request is not a crash");
+        assert_eq!(exit.saved_log, None);
     }
 
     #[tokio::test]

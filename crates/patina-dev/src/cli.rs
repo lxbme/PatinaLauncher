@@ -39,14 +39,77 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SourceCmd,
     },
-    /// Launch an instance
+    /// Launch an instance (as the current account unless told otherwise)
     Launch {
         /// Instance ID (directory name)
         id: String,
-        /// Offline player name (development only)
+        /// Launch as this stored account instead of the current one
+        #[arg(long, value_name = "ACCOUNT_ID", conflicts_with = "offline")]
+        account: Option<String>,
+        /// Offline player name, without storing an account (development only)
         #[arg(long, value_name = "PLAYER")]
-        offline: String,
+        offline: Option<String>,
     },
+    /// Show whether each instance's game is running
+    Status,
+    /// Stop a running game
+    Kill { id: String },
+    /// Print a running game's log, or the newest crash log path when it is not running
+    Logs {
+        id: String,
+        /// Keep printing new lines until the game exits (Ctrl-C only stops watching)
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Search instances and installed mods (the mod index is refreshed first)
+    Search { query: String },
+    /// Manage accounts
+    Account {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+    /// Remove stale temp files left by interrupted downloads and writes
+    Sweep,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AccountCmd {
+    /// List accounts; the current one is marked
+    List,
+    /// Add an offline account (development only)
+    AddOffline { name: String },
+    /// Make an account the current one
+    Use { id: String },
+    /// Remove an account
+    Remove { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModsCmd {
+    /// List mods with their name, version and format
+    List,
+    /// Enable a mod (`x.jar.disabled` becomes `x.jar`)
+    Enable { file: String },
+    /// Disable a mod (`x.jar` becomes `x.jar.disabled`)
+    Disable { file: String },
+    /// Delete a mod file
+    Delete { file: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IconCmd {
+    /// Use a built-in icon
+    Builtin { name: String },
+    /// Use an image file (png, jpeg or webp)
+    Custom { path: PathBuf },
+    /// Remove the icon
+    Clear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Toggle {
+    On,
+    Off,
 }
 
 #[derive(Subcommand, Debug)]
@@ -70,6 +133,28 @@ pub enum InstanceCmd {
         #[command(subcommand)]
         cmd: LoaderCmd,
     },
+    /// Manage an instance's mods
+    Mods {
+        id: String,
+        #[command(subcommand)]
+        cmd: ModsCmd,
+    },
+    /// List an instance's resource packs
+    Packs { id: String },
+    /// List an instance's shader packs
+    Shaders { id: String },
+    /// List an instance's worlds
+    Saves { id: String },
+    /// Set or clear an instance's icon
+    Icon {
+        id: String,
+        #[command(subcommand)]
+        cmd: IconCmd,
+    },
+    /// Reinstall the instance's current loader, repairing damaged files
+    ReinstallLoader { id: String },
+    /// Turn NeoForge's early loading window on or off
+    EarlyWindow { id: String, state: Toggle },
     /// Change an instance's Minecraft version
     SetVersion {
         id: String,
