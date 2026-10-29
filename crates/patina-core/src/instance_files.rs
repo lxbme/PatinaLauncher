@@ -117,4 +117,29 @@ mod tests {
             "this is = = broken ["
         );
     }
+
+    #[test]
+    fn deeply_nested_fml_toml_is_rejected_without_abort() {
+        let d = dir();
+        let path = fml_toml(d.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("x = {}", "[".repeat(100_000))).unwrap();
+        let e = early_window_disabled(d.path()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn brace_heavy_comment_in_fml_toml_is_fine() {
+        let d = dir();
+        let path = fml_toml(d.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("# {}\nearlyWindowControl = true\n", "{".repeat(70)),
+        )
+        .unwrap();
+        assert!(!early_window_disabled(d.path()).unwrap());
+        set_early_window_disabled(d.path(), true).unwrap();
+        assert!(early_window_disabled(d.path()).unwrap());
+    }
 }

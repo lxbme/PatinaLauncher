@@ -5,25 +5,19 @@
 //! through a hard cap, and no input may panic.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use zip::ZipArchive;
 
+use super::{ENTRY_MAX_BYTES, ICON_MAX_BYTES, Jar, MAX_ZIP_ENTRIES, PNG_SIGNATURE, read_capped};
 use crate::fsutil::is_safe_rel;
 
-/// Largest accepted icon, in bytes.
-pub const ICON_MAX_BYTES: usize = 1024 * 1024;
-/// Largest metadata entry (after decompression), in bytes.
-pub const ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
-/// A jar with more entries than this is rejected outright.
-pub const MAX_ZIP_ENTRIES: usize = 65536;
 /// At most this many icon paths are tried for a size-to-path icon map.
 const MAX_ICON_CANDIDATES: usize = 4;
 
 const DISABLED_SUFFIX: &str = ".disabled";
-const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModFormat {
@@ -229,8 +223,6 @@ pub fn delete_mod(path: &Path) -> io::Result<()> {
 
 // ---------------------------------------------------------------------------
 
-type Jar = ZipArchive<File>;
-
 fn jar_stem(jar: &Path) -> String {
     let name = jar.file_name().and_then(|n| n.to_str()).unwrap_or("");
     split_mod_name(name).map_or_else(
@@ -244,18 +236,6 @@ fn jar_stem(jar: &Path) -> String {
 
 fn has(ar: &mut Jar, name: &str) -> bool {
     ar.by_name(name).is_ok()
-}
-
-/// Reads one entry fully, refusing more than `limit` decompressed bytes
-/// whatever the zip header declares.
-fn read_capped(ar: &mut Jar, name: &str, limit: usize) -> Option<Vec<u8>> {
-    let f = ar.by_name(name).ok()?;
-    if f.is_dir() {
-        return None;
-    }
-    let mut buf = Vec::new();
-    f.take(limit as u64 + 1).read_to_end(&mut buf).ok()?;
-    (buf.len() <= limit).then_some(buf)
 }
 
 fn read_icon(ar: &mut Jar, path: &str) -> Option<Vec<u8>> {
@@ -914,5 +894,37 @@ mod tests {
             .map(|e| e.file_name)
             .collect();
         assert_eq!(names, ["link.jar"]);
+    }
+
+    #[test]
+    fn deeply_nested_mods_toml_does_not_abort() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("deep.jar");
+        let hostile = format!("modLoader = \"x\"\nv = {}", "[".repeat(100_000));
+        write_zip(&p, &[("META-INF/mods.toml", hostile.as_bytes())]);
+        let meta = read_mod_meta(&p, None);
+        assert!(meta.is_none_or(|m| m.version.is_none()));
+        let inline = format!("x = {}", "{a=".repeat(100_000));
+        write_zip(&p, &[("META-INF/neoforge.mods.toml", inline.as_bytes())]);
+        let _ = read_mod_meta(&p, None);
+    }
+
+    #[test]
+    fn brackets_in_valid_toml_strings_do_not_lose_metadata() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("m.jar");
+        let many = format!(
+            "modLoader = \"x\"\n[[mods]]\nmodId = \"a\"\nversion = \"1\"\ndescription = \"{}\"\n",
+            "[".repeat(70)
+        );
+        write_zip(&p, &[("META-INF/mods.toml", many.as_bytes())]);
+        let m = read_mod_meta(&p, None).unwrap();
+        assert_eq!(m.id.as_deref(), Some("a"));
+        assert_eq!(m.version.as_deref(), Some("1"));
+        let art = "[[mods]]\nmodId = \"b\"\nversion = \"2\"\ndescription = '''\n[[[[ {{{{ ]]]] art\n'''\n# {{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{\n";
+        write_zip(&p, &[("META-INF/mods.toml", art.as_bytes())]);
+        let m = read_mod_meta(&p, None).unwrap();
+        assert_eq!(m.id.as_deref(), Some("b"));
+        assert!(m.description.unwrap().contains("art"));
     }
 }
