@@ -103,6 +103,17 @@ pub fn java_bin_in_home(home: &Path) -> PathBuf {
     home.join("bin").join("java")
 }
 
+/// `unpack200` of a Java home (Java 8 runtimes ship it; it was removed in 14).
+pub fn unpack200_in_home(home: &Path) -> PathBuf {
+    home.join("bin").join("unpack200")
+}
+
+/// Whether spawning failed with `ETXTBSY`: an executable written moments ago
+/// can still be open for writing in a child another thread just forked.
+pub fn is_text_file_busy(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(26)
+}
+
 pub fn os_version() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())

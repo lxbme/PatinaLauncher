@@ -3,6 +3,7 @@
 pub mod installer;
 pub mod legacy;
 pub mod modern;
+pub mod packxz;
 pub mod processors;
 
 pub use installer::{
@@ -207,12 +208,28 @@ pub(crate) mod test_support {
 
     use crate::download::{Downloader, Mirror};
 
-    pub const OFFICIAL_HOSTS: [&str; 4] = [
+    pub const OFFICIAL_HOSTS: [&str; 6] = [
         "https://maven.minecraftforge.net",
         "https://files.minecraftforge.net",
         "https://maven.neoforged.net/releases",
         "https://libraries.minecraft.net",
+        "https://piston-meta.mojang.com",
+        "https://piston-data.mojang.com",
     ];
+
+    /// A real `.pack.xz` (made with jre-legacy's `pack200`, Forge's signed
+    /// layout, `xz -C crc64`) of a jar holding [`PACKED_ENTRIES`].
+    pub const PACK_XZ: &[u8] =
+        include_bytes!("../../../tests/fixtures/forge_legacy_lib.jar.pack.xz");
+    pub const PACKED_ENTRIES: [(&str, &[u8]); 2] = [
+        ("patina/hello.txt", b"hello from a packed library\n"),
+        ("patina/data.txt", b"pack200 fixture\n"),
+    ];
+    /// SHA-1 of the fixture's signature block (its `checksums.sha1`), the
+    /// value a library's `checksums` lists for the unpacked jar.
+    pub const PACK_SIG_SHA1: &str = "a56262c317a1770746bfba9ce4001a0ebd844e90";
+    /// SHA-1 of the fixture's pack200 data with the signature trailer cut.
+    pub const PACK_SHA1: &str = "3b4099f9edaac04db6f1fe1270a1bbe1268f11a0";
 
     /// A client that can never reach the real official hosts: they resolve
     /// to a closed local port, so the "original URL" candidate fails fast.
@@ -224,10 +241,68 @@ pub(crate) mod test_support {
             "files.minecraftforge.net",
             "maven.neoforged.net",
             "libraries.minecraft.net",
+            "piston-meta.mojang.com",
+            "piston-data.mojang.com",
         ] {
             b = b.resolve(host, dead);
         }
         b.build().unwrap()
+    }
+
+    /// Serves a managed `jre-legacy` (runtime index, manifest and a
+    /// `bin/unpack200` with body `unpack200`) through [`downloader`]'s
+    /// mirror; the index is expected `index_hits` times.
+    pub async fn serve_jre_legacy(server: &MockServer, unpack200: &[u8], index_hits: u64) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let bin_sha1 = sha1_hex(unpack200);
+        let manifest = serde_json::json!({"files": {
+            "bin": {"type": "directory"},
+            "bin/unpack200": {"type": "file", "executable": true, "downloads": {"raw": {
+                "url": format!("https://piston-data.mojang.com/v1/objects/{bin_sha1}/unpack200"),
+                "sha1": bin_sha1,
+                "size": unpack200.len(),
+            }}},
+        }})
+        .to_string();
+        let mut index = serde_json::Map::new();
+        index.insert(
+            crate::java::runtime::platform_key().unwrap().to_string(),
+            serde_json::json!({"jre-legacy": [{
+                "manifest": {
+                    "url": "https://piston-meta.mojang.com/v1/packages/fake/manifest.json",
+                    "sha1": sha1_hex(manifest.as_bytes()),
+                    "size": manifest.len(),
+                },
+                "version": {"name": "8u202"},
+            }]}),
+        );
+        let index = serde_json::Value::Object(index).to_string();
+        let index_path = crate::java::RUNTIME_INDEX_URL
+            .strip_prefix("https://piston-meta.mojang.com")
+            .unwrap();
+        let bodies: [(String, Vec<u8>); 3] = [
+            (index_path.to_string(), index.into_bytes()),
+            (
+                "/v1/packages/fake/manifest.json".into(),
+                manifest.into_bytes(),
+            ),
+            (
+                format!("/v1/objects/{bin_sha1}/unpack200"),
+                unpack200.to_vec(),
+            ),
+        ];
+        for (i, (p, body)) in bodies.into_iter().enumerate() {
+            let mock = Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body));
+            let mock = if i == 0 {
+                mock.expect(index_hits)
+            } else {
+                mock
+            };
+            mock.mount(server).await;
+        }
     }
 
     fn mirror(id: &str, base: String) -> Mirror {

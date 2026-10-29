@@ -28,6 +28,7 @@ errors:
     processor_failed: "加载器安装的第 %{step} 步失败（退出码 %{code}）"
     processor_killed: "加载器安装的第 %{step} 步在完成前被终止"
     processor_output_mismatch: "加载器安装生成的文件不正确：%{path}"
+    legacy_library_unavailable: "无法从任何下载源获取旧版加载器依赖库 %{name}"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"

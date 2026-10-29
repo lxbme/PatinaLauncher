@@ -1,17 +1,23 @@
 //! Installing legacy-format Forge (1.6.4 to 1.12.2: `install` + `versionInfo`).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use futures::{StreamExt, TryStreamExt};
+
 use super::installer::InstallerProfile;
+use super::packxz::{Unpack200, ensure_legacy_library};
 use super::{checked_profile_id, download_libraries, fill_sha1_from_sidecars, write_profile};
-use crate::download::Downloader;
+use crate::download::{DownloadJob, Downloader};
 use crate::fsutil::safe_join;
 use crate::loader::list::LoaderError;
 use crate::loader::{InstallPhase, InstalledProfile, LoaderKind, ProgressSink, report};
 use crate::meta::{RuleEnv, maven_path};
 use crate::paths::DataDirs;
 use crate::resolve::resolve_libraries;
+
+/// Most `checksums` libraries fetched (and unpacked) at once.
+const LEGACY_CONCURRENCY: usize = 4;
 
 /// Installs a legacy Forge profile: extracts the universal jar from the
 /// installer into `libraries/`, downloads the other client libraries and, as
@@ -49,19 +55,37 @@ pub async fn install_legacy(
         .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
 
     let resolved = resolve_libraries(&version.libraries, &RuleEnv::current(), &libraries);
-    let mut jobs = resolved.jobs;
-    // `checksums` libraries are verified separately (pack.xz handling).
-    let checksummed: HashSet<PathBuf> = version
+    // `checksums` libraries (name, checksums) by destination: they are
+    // verified against those and may come from a `.pack.xz` instead.
+    let checksummed: HashMap<PathBuf, (String, Vec<String>)> = version
         .libraries
         .iter()
         .filter(|l| !l.checksums.is_empty())
-        .filter_map(|l| maven_path(&l.name).and_then(|rel| safe_join(&libraries, &rel)))
+        .filter_map(|l| {
+            let dest = maven_path(&l.name).and_then(|rel| safe_join(&libraries, &rel))?;
+            Some((dest, (l.name.clone(), l.checksums.clone())))
+        })
         .collect();
-    fill_sha1_from_sidecars(dl, &mut jobs, |j| {
-        j.sha1.is_none() && j.dest != universal && !checksummed.contains(&j.dest)
-    })
-    .await;
+    let (legacy_jobs, mut jobs): (Vec<DownloadJob>, Vec<DownloadJob>) = resolved
+        .jobs
+        .into_iter()
+        .partition(|j| checksummed.contains_key(&j.dest));
+    fill_sha1_from_sidecars(dl, &mut jobs, |j| j.sha1.is_none() && j.dest != universal).await;
+    let plain_total = jobs.len();
     download_libraries(dl, jobs, progress).await?;
+    let total = plain_total + legacy_jobs.len();
+    let tools = Unpack200::new(dl, data.runtimes());
+    let mut done = plain_total;
+    let mut legacy = futures::stream::iter(&legacy_jobs)
+        .map(|job| {
+            let (name, checksums) = &checksummed[&job.dest];
+            ensure_legacy_library(&tools, job, name, checksums)
+        })
+        .buffer_unordered(LEGACY_CONCURRENCY);
+    while legacy.try_next().await?.is_some() {
+        done += 1;
+        report(progress, InstallPhase::DownloadLibraries, done, total);
+    }
 
     report(progress, InstallPhase::Finalize, 0, 1);
     let profile_id = write_profile(data, LoaderKind::Forge, version)?;
@@ -95,8 +119,12 @@ fn extract_entry(jar: &Path, name: &str, dest: &Path) -> Result<(), LoaderError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader::forge::packxz::{SIGNATURE_ENTRY, library_valid};
     use crate::loader::forge::read_installer;
-    use crate::loader::forge::test_support::{downloader, sha1_hex, write_zip};
+    use crate::loader::forge::test_support::{
+        PACK_SHA1, PACK_SIG_SHA1, PACK_XZ, PACKED_ENTRIES, downloader, serve_jre_legacy, sha1_hex,
+        write_zip,
+    };
     use crate::loader::{InstallPhase, InstallProgress};
     use crate::meta::PartialVersionJson;
     use serde_json::{Value, json};
@@ -110,11 +138,21 @@ mod tests {
         "net/minecraftforge/forge/1.7.10-10.13.4.1614-1.7.10/forge-1.7.10-10.13.4.1614-1.7.10.jar";
     const LAUNCHWRAPPER: &str = "/net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar";
     const AKKA: &str = "/com/typesafe/akka/akka-actor_2.11/2.3.3/akka-actor_2.11-2.3.3.jar";
+    const AKKA_NAME: &str = "com.typesafe.akka:akka-actor_2.11:2.3.3";
+    const OTHER_SHA1: &str = "ed62e9fc709ca0f2ff1a3220daa8b70a2870078e";
 
     /// The fixture plus the universal jar's own library entry, as real
-    /// 1.7.10 profiles have it (legacy files.minecraftforge.net url).
+    /// 1.7.10 profiles have it (legacy files.minecraftforge.net url). The
+    /// served akka body `b"akka"` matches its second `checksums` entry.
     fn profile_json() -> Value {
+        profile_with_akka_checksums(&[OTHER_SHA1, &sha1_hex(b"akka")])
+    }
+
+    fn profile_with_akka_checksums(checksums: &[&str]) -> Value {
         let mut v: Value = serde_json::from_str(PROFILE).unwrap();
+        let libs = v["versionInfo"]["libraries"].as_array_mut().unwrap();
+        let akka = libs.iter_mut().find(|l| l["name"] == AKKA_NAME).unwrap();
+        akka["checksums"] = json!(checksums);
         v["versionInfo"]["libraries"]
             .as_array_mut()
             .unwrap()
@@ -303,5 +341,175 @@ mod tests {
         assert!(matches!(r, Err(LoaderError::InstallerInvalid(_))), "{r:?}");
 
         assert!(!data.versions().exists());
+    }
+
+    /// The fake `unpack200`: exits 3 unless its input is the fixture's
+    /// pack200 data with the trailer cut; otherwise copies `jar` to its
+    /// output.
+    fn fake_unpack200(jar: &Path) -> Vec<u8> {
+        format!(
+            "#!/bin/sh\n[ \"$(sha1sum < \"$1\" | cut -c1-40)\" = {PACK_SHA1} ] || exit 3\ncp '{}' \"$2\"\n",
+            jar.display()
+        )
+        .into_bytes()
+    }
+
+    async fn not_found(server: &MockServer, p: &str, hits: u64) {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(hits)
+            .mount(server)
+            .await;
+    }
+
+    async fn serve_launchwrapper(server: &MockServer) {
+        serve(server, LAUNCHWRAPPER, b"launchwrapper").await;
+        serve(
+            server,
+            &format!("{LAUNCHWRAPPER}.sha1"),
+            sha1_hex(b"launchwrapper").as_bytes(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plain_jar_preferred_when_checksum_matches() {
+        let server = MockServer::start().await;
+        serve_launchwrapper(&server).await;
+        Mock::given(method("GET"))
+            .and(path(AKKA))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"akka".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        never(&server, r"\.pack\.xz$").await;
+        never(&server, "^/v1/").await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataDirs::new(tmp.path().join("data"));
+        let jar = installer(tmp.path(), &profile_json());
+        let dl = downloader(&server, false);
+        for _ in 0..2 {
+            // the second run keeps the verified jar: still one request
+            let profile = read_installer(&jar).unwrap();
+            let out = install_legacy(&dl, &data, &jar, profile, &None)
+                .await
+                .unwrap();
+            assert_eq!(out.profile_id, ID);
+        }
+        assert_eq!(
+            std::fs::read(data.libraries().join(&AKKA[1..])).unwrap(),
+            b"akka"
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_pack_xz() {
+        let server = MockServer::start().await;
+        serve_launchwrapper(&server).await;
+        // the plain jar downloads from the mirror but fails its checksums
+        // (a body that downloaded is not retried on the other sources)
+        serve(&server, AKKA, b"stale akka").await;
+        not_found(&server, &format!("/fb{AKKA}"), 0).await;
+        serve(&server, &format!("{AKKA}.pack.xz"), PACK_XZ).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let unpacked = tmp.path().join("unpacked.jar");
+        write_zip(&unpacked, &PACKED_ENTRIES);
+        serve_jre_legacy(&server, &fake_unpack200(&unpacked), 1).await;
+
+        let data = DataDirs::new(tmp.path().join("data"));
+        let profile_json = profile_with_akka_checksums(&[OTHER_SHA1, PACK_SIG_SHA1]);
+        let jar = installer(tmp.path(), &profile_json);
+        let profile = read_installer(&jar).unwrap();
+        let out = install_legacy(&downloader(&server, true), &data, &jar, profile, &None)
+            .await
+            .unwrap();
+        assert_eq!(out.profile_id, ID);
+
+        let akka = data.libraries().join(&AKKA[1..]);
+        assert!(library_valid(&akka, &[PACK_SIG_SHA1.to_string()]).unwrap());
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&akka).unwrap()).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [SIGNATURE_ENTRY, "patina/data.txt", "patina/hello.txt"]
+        );
+        let mut sig = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(SIGNATURE_ENTRY).unwrap(), &mut sig)
+            .unwrap();
+        assert!(sig.contains(" patina/hello.txt\n"), "{sig}");
+        let left: Vec<_> = std::fs::read_dir(akka.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [akka.file_name().unwrap()], "temporary files left");
+        assert!(
+            crate::java::ManagedRuntimes::new(data.runtimes())
+                .is_installed(super::super::packxz::UNPACK200_RUNTIME)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_library_missing_everywhere_is_unavailable() {
+        let server = MockServer::start().await;
+        serve_launchwrapper(&server).await;
+        for p in [AKKA.to_string(), format!("{AKKA}.pack.xz")] {
+            not_found(&server, &p, 1).await;
+            not_found(&server, &format!("/fb{p}"), 1).await;
+        }
+        // no pack.xz to unpack: jre-legacy is not installed
+        serve_jre_legacy(&server, b"unused", 0).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataDirs::new(tmp.path().join("data"));
+        let jar = installer(tmp.path(), &profile_json());
+        let profile = read_installer(&jar).unwrap();
+        let r = install_legacy(&downloader(&server, true), &data, &jar, profile, &None).await;
+        match r {
+            Err(LoaderError::LegacyLibraryUnavailable { name }) => assert_eq!(name, AKKA_NAME),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!data.versions().join(ID).exists());
+        assert!(!data.libraries().join(&AKKA[1..]).exists());
+
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let e = LoaderError::LegacyLibraryUnavailable {
+            name: AKKA_NAME.into(),
+        };
+        for lang in [Language::En, Language::ZhCn] {
+            set_language(lang);
+            let msg = e.to_string();
+            assert!(msg.contains(AKKA_NAME) && !msg.contains("errors."), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_unpack_result_is_unavailable() {
+        let server = MockServer::start().await;
+        serve_launchwrapper(&server).await;
+        not_found(&server, AKKA, 1).await;
+        serve(&server, &format!("{AKKA}.pack.xz"), PACK_XZ).await;
+        let tmp = tempfile::tempdir().unwrap();
+        // the "unpacked" jar's entries do not match the signature
+        let unpacked = tmp.path().join("unpacked.jar");
+        write_zip(&unpacked, &[("patina/hello.txt", b"tampered")]);
+        serve_jre_legacy(&server, &fake_unpack200(&unpacked), 1).await;
+
+        let data = DataDirs::new(tmp.path().join("data"));
+        let profile_json = profile_with_akka_checksums(&[PACK_SIG_SHA1]);
+        let jar = installer(tmp.path(), &profile_json);
+        let profile = read_installer(&jar).unwrap();
+        let r = install_legacy(&downloader(&server, false), &data, &jar, profile, &None).await;
+        assert!(
+            matches!(r, Err(LoaderError::LegacyLibraryUnavailable { .. })),
+            "{r:?}"
+        );
+        let akka = data.libraries().join(&AKKA[1..]);
+        let left = std::fs::read_dir(akka.parent().unwrap()).unwrap().count();
+        assert_eq!(left, 0, "temporary files left");
     }
 }

@@ -1391,6 +1391,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "lzma-rust2",
  "md-5",
  "quick-xml",
  "regex",

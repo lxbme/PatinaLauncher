@@ -41,6 +41,10 @@ pub enum LoaderError {
     /// A processor output does not have the SHA-1 the installer declares.
     #[error("{}", rust_i18n::t!("errors.loader.processor_output_mismatch", path = .path))]
     ProcessorOutputMismatch { path: String },
+    /// A legacy Forge library with `checksums` could be obtained neither as
+    /// a plain jar nor as a `.pack.xz`; `name` is its maven coordinate.
+    #[error("{}", rust_i18n::t!("errors.loader.legacy_library_unavailable", name = .name))]
+    LegacyLibraryUnavailable { name: String },
 }
 
 /// Steps are shown 1-based.
