@@ -66,6 +66,14 @@ async fn main() -> Result<()> {
     // Developer tool: core errors printed here must be English.
     patina_core::i18n::set_language(patina_core::i18n::Language::En);
     let cli = Cli::parse();
+    let default_level = if cli.verbose { "debug" } else { "warn" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let mut ctx = Ctx::load(cli.data_dir)?;
     match cli.cmd {
         Cmd::Instance { cmd } => instance(&mut ctx, cmd).await,

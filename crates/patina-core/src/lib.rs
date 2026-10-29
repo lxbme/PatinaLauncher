@@ -14,3 +14,5 @@ pub mod paths;
 pub mod platform;
 pub mod prepare;
 pub mod resolve;
+#[cfg(test)]
+mod test_log;

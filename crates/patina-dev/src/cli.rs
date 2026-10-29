@@ -15,6 +15,9 @@ pub struct Cli {
     /// Data directory (overrides PATINA_DATA_DIR and the default location)
     #[arg(long, global = true, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
+    /// Log at debug level (RUST_LOG overrides)
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
     #[command(subcommand)]
     pub cmd: Cmd,
 }

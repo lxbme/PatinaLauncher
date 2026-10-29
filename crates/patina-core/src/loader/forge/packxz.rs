@@ -307,22 +307,32 @@ async fn from_pack_xz(
         size: None,
     };
     // Only a downloaded pack.xz is worth installing jre-legacy for.
-    if tools.dl.run(vec![download], None).await.is_err() {
+    if let Err(e) = tools.dl.run(vec![download], None).await {
+        tracing::debug!(url = %job.url, error = ?e, "pack.xz download failed");
         return false;
     }
     let Some(unpack200) = tools.bin().await else {
+        tracing::debug!(url = %job.url, "no unpack200 available for pack.xz fallback");
         return false;
     };
     let pack_out = pack.clone();
-    let Ok(Ok(signature)) = tokio::task::spawn_blocking(move || prepare_pack(&xz, &pack_out)).await
-    else {
-        return false;
+    let signature = match tokio::task::spawn_blocking(move || prepare_pack(&xz, &pack_out)).await {
+        Ok(Ok(signature)) => signature,
+        Ok(Err(e)) => {
+            tracing::debug!(url = %job.url, error = ?e, "pack.xz could not be prepared");
+            return false;
+        }
+        Err(e) => {
+            tracing::debug!(url = %job.url, error = ?e, "pack.xz preparation task failed");
+            return false;
+        }
     };
-    if run_unpack200(&unpack200, &pack, &jar).await.is_err() {
+    if let Err(e) = run_unpack200(&unpack200, &pack, &jar).await {
+        tracing::debug!(url = %job.url, error = ?e, "unpack200 failed");
         return false;
     }
     let (dest, checksums) = (job.dest.clone(), checksums.to_vec());
-    tokio::task::spawn_blocking(move || -> io::Result<bool> {
+    let finished = tokio::task::spawn_blocking(move || -> io::Result<bool> {
         add_signature(&jar, &signature)?;
         if !library_valid(&jar, &checksums)? {
             return Ok(false);
@@ -330,8 +340,22 @@ async fn from_pack_xz(
         std::fs::rename(&jar, &dest)?;
         Ok(true)
     })
-    .await
-    .is_ok_and(|r| r.unwrap_or(false))
+    .await;
+    match finished {
+        Ok(Ok(true)) => true,
+        Ok(Ok(false)) => {
+            tracing::debug!(url = %job.url, "unpacked jar failed checksum verification");
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(url = %job.url, error = ?e, "finishing unpacked jar failed");
+            false
+        }
+        Err(e) => {
+            tracing::debug!(url = %job.url, error = ?e, "finishing task failed");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

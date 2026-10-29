@@ -80,11 +80,20 @@ pub(crate) fn parse_sha1_sidecar(body: &[u8]) -> Option<String> {
 
 /// Fetches `url` (a `.sha1` sidecar, already canonical) from the current
 /// sources. `None` when it is unavailable or malformed: the caller then
-/// downloads without a checksum. There is no developer log sink in
-/// patina-core yet, so the miss is not logged.
+/// downloads without a checksum. The miss is logged at debug level.
 pub(crate) async fn fetch_sidecar(dl: &Downloader, url: &str) -> Option<String> {
-    let body = dl.fetch_bytes(url, None).await.ok()?;
-    parse_sha1_sidecar(&body)
+    let body = match dl.fetch_bytes(url, None).await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::debug!(url, error = ?e, "sha1 sidecar unavailable");
+            return None;
+        }
+    };
+    let parsed = parse_sha1_sidecar(&body);
+    if parsed.is_none() {
+        tracing::debug!(url, "sha1 sidecar malformed");
+    }
+    parsed
 }
 
 /// Fills `sha1` from `<url>.sha1` for each job `want` selects (at most

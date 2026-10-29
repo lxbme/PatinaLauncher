@@ -417,9 +417,8 @@ async fn run_one(
         .await
         .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
 
-    // Output is captured so it never reaches the user's terminal. Only a
-    // stderr tail is kept, for diagnostics: patina-core has no developer log
-    // sink yet (plan 2 Task 8 ruling; `tracing` comes with plan 4).
+    // Output is captured so it never reaches the user's terminal. A stderr
+    // tail is kept for diagnostics, and both tails are logged at debug level.
     let out = tokio::process::Command::new(java)
         .arg("-cp")
         .arg(classpath.join(CLASSPATH_SEPARATOR))
@@ -431,12 +430,19 @@ async fn run_one(
         .kill_on_drop(true)
         .output()
         .await?;
+    tracing::debug!(
+        index,
+        step,
+        stdout_tail = %output_tail(&out.stdout),
+        stderr_tail = %output_tail(&out.stderr),
+        "processor output"
+    );
     if !out.status.success() {
         return Err(LoaderError::ProcessorFailed {
             index,
             step,
             exit_code: out.status.code(),
-            stderr_tail: stderr_tail(&out.stderr),
+            stderr_tail: output_tail(&out.stderr),
         });
     }
     if let Some(path) = first_unaccepted(&outputs).await {
@@ -462,9 +468,20 @@ async fn first_unaccepted(outputs: &[(PathBuf, String)]) -> Option<PathBuf> {
     let outputs = outputs.to_vec();
     tokio::task::spawn_blocking(move || {
         outputs.into_iter().find_map(|(path, sha1)| {
-            let ok = sha1_file(&path).is_ok_and(|a| a.eq_ignore_ascii_case(&sha1))
-                || is_intact_zip(&path);
-            (!ok).then_some(path)
+            let actual = sha1_file(&path);
+            if actual.as_ref().is_ok_and(|a| a.eq_ignore_ascii_case(&sha1)) {
+                return None;
+            }
+            if is_intact_zip(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    expected = %sha1,
+                    actual = %actual.as_deref().unwrap_or("unreadable"),
+                    "accepted intact zip with differing sha1"
+                );
+                return None;
+            }
+            Some(path)
         })
     })
     .await
@@ -489,13 +506,13 @@ fn is_intact_zip(path: &Path) -> bool {
     })
 }
 
-/// Most bytes of a failed processor's stderr kept for diagnostics.
-const STDERR_TAIL_BYTES: usize = 4096;
+/// Most bytes of a processor's stdout or stderr kept for diagnostics.
+const OUTPUT_TAIL_BYTES: usize = 4096;
 
-/// The last [`STDERR_TAIL_BYTES`] of `stderr`, lossily decoded.
-fn stderr_tail(stderr: &[u8]) -> String {
-    let start = stderr.len().saturating_sub(STDERR_TAIL_BYTES);
-    String::from_utf8_lossy(&stderr[start..]).into_owned()
+/// The last [`OUTPUT_TAIL_BYTES`] of `output`, lossily decoded.
+fn output_tail(output: &[u8]) -> String {
+    let start = output.len().saturating_sub(OUTPUT_TAIL_BYTES);
+    String::from_utf8_lossy(&output[start..]).into_owned()
 }
 
 /// `/`-separated paths, relative to the library dir, of the files the
@@ -647,6 +664,15 @@ exit 0
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_tail_keeps_only_the_end() {
+        assert_eq!(output_tail(b"short"), "short");
+        let long = [vec![b'a'; 10_000], b"END".to_vec()].concat();
+        let tail = output_tail(&long);
+        assert_eq!(tail.len(), OUTPUT_TAIL_BYTES);
+        assert!(tail.ends_with("END"));
+    }
     use crate::loader::forge::test_support::{sha1_hex, write_zip};
     use serde_json::json;
 

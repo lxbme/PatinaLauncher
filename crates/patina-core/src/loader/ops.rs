@@ -240,6 +240,7 @@ async fn install_version(
             // The id Fabric's metadata server gives its profiles.
             let id = format!("fabric-loader-{}-{mc}", v.maven_version);
             if is_installed(data, &id, false).await {
+                tracing::info!(profile = %id, "loader already installed; reusing");
                 reused(progress, id)
             } else {
                 install_fabric(dl, data, mc, &v.maven_version, progress).await?
@@ -247,6 +248,7 @@ async fn install_version(
         }
         LoaderKind::Forge | LoaderKind::Neoforge => {
             if let Some(found) = installed_forge(data, kind, mc, v).await {
+                tracing::info!(profile = %found.profile_id, "loader already installed; reusing");
                 reused(progress, found.profile_id)
             } else {
                 install_forge(launcher, v, vanilla, progress).await?

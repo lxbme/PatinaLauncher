@@ -248,6 +248,7 @@ impl Downloader {
                 match self.attempt(cand, sha1, size, part).await {
                     Ok(bytes) => {
                         if i > 0 {
+                            tracing::info!(original = %url, used = %cand, "download fell back");
                             self.fallbacks.fetch_add(1, Ordering::Relaxed);
                         }
                         return Ok(bytes);
@@ -586,6 +587,54 @@ mod tests {
         let j = job(&orig, dir.path());
         d.run(vec![j.clone()], None).await.unwrap();
         assert_eq!(std::fs::read(&j.dest).unwrap(), b"hello");
+    }
+
+    /// The single "download fell back" line mentioning `server`.
+    fn fallback_line(server: &MockServer) -> String {
+        let lines = crate::test_log::test_log_buffer().lines_containing(&server.uri());
+        let hits: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("download fell back"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{lines:?}");
+        hits[0].clone()
+    }
+
+    #[tokio::test]
+    async fn fallback_is_logged_with_distinct_original_and_used() {
+        let server = MockServer::start().await;
+        serve(&server, "/mirror/a", 404, b"").await;
+        serve(&server, "/orig/a", 404, b"").await;
+        serve(&server, "/fb/a", 200, b"hello").await;
+        let (d, orig) = setup(&server);
+        let d = d.with_fallback(Some(Mirror {
+            id: "fb".into(),
+            rules: vec![(orig.clone(), format!("{}/fb", server.uri()))],
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_log::test_log_buffer();
+        d.run(vec![job(&orig, dir.path())], None).await.unwrap();
+        let line = fallback_line(&server);
+        assert!(line.contains(&format!("original={orig}/a")), "{line}");
+        assert!(
+            line.contains(&format!("used={}/fb/a", server.uri())),
+            "{line}"
+        );
+        assert!(!line.contains("/mirror/a"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn mirror_fallback_logs_the_original_url() {
+        let server = MockServer::start().await;
+        serve(&server, "/mirror/a", 404, b"").await;
+        serve(&server, "/orig/a", 200, b"hello").await;
+        let (d, orig) = setup(&server);
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_log::test_log_buffer();
+        d.run(vec![job(&orig, dir.path())], None).await.unwrap();
+        let line = fallback_line(&server);
+        assert!(line.contains(&format!("original={orig}/a")), "{line}");
+        assert!(line.contains(&format!("used={orig}/a")), "{line}");
     }
 
     #[tokio::test]
