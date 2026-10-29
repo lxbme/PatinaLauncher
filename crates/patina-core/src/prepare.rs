@@ -565,6 +565,7 @@ impl Launcher {
             extra_jvm_args: &extra_jvm_args,
             logging_config: logging_config.as_deref(),
             env: &env,
+            instance_marker: Some(inst.id.clone()),
         });
         Ok(Prepared { command, warnings })
     }

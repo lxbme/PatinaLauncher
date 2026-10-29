@@ -14,6 +14,9 @@ use super::log::{Log4jXmlParser, LogLine, Stream};
 /// How long `wait` lets the readers drain after the child has exited.
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Deprecated: piped, kill-on-drop process used only by patina-dev. Replaced by
+/// detached processes (`platform::spawn_detached`) and `GameSession`; to be
+/// removed once patina-dev switches over.
 pub struct GameProcess {
     child: tokio::process::Child,
     readers: Vec<tokio::task::JoinHandle<()>>,

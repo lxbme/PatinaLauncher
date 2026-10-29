@@ -9,5 +9,6 @@ pub use args::{
 };
 pub mod log;
 pub mod process;
+pub mod running;
 pub use log::{Log4jXmlParser, LogLevel, LogLine, Stream};
 pub use process::GameProcess;

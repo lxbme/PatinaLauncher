@@ -1529,6 +1529,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rust-i18n",
+ "rustix",
  "serde",
  "serde-saphyr 2.0.0",
  "serde_json",

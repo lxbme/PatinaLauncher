@@ -8,6 +8,8 @@ use crate::paths::DataDirs;
 use crate::platform::CLASSPATH_SEPARATOR;
 use crate::resolve::AssetLayout;
 
+/// JVM system property carrying the instance id.
+pub const INSTANCE_MARKER_PROP: &str = "-Dpatina.instance";
 pub const LAUNCHER_NAME: &str = "patina";
 pub const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -27,6 +29,9 @@ pub struct LaunchSpec<'a> {
     pub extra_jvm_args: &'a [String],
     pub logging_config: Option<&'a Path>,
     pub env: &'a RuleEnv,
+    /// Instance id; adds `-Dpatina.instance=<id>` so a running game can be
+    /// recognised later by its command line.
+    pub instance_marker: Option<String>,
 }
 
 #[derive(Clone)]
@@ -188,6 +193,9 @@ pub fn build_command(spec: &LaunchSpec) -> LaunchCommand {
         ),
     }
 
+    if let Some(id) = &spec.instance_marker {
+        args.push(format!("{INSTANCE_MARKER_PROP}={id}"));
+    }
     args.push(v.main_class.clone());
 
     match (&v.arguments, &v.minecraft_arguments) {
@@ -267,6 +275,7 @@ mod tests {
             extra_jvm_args: &extra,
             logging_config: logging,
             env: &e,
+            instance_marker: Some("inst-1".into()),
         })
     }
 
@@ -312,6 +321,22 @@ mod tests {
             c.args
                 .contains(&"-Dminecraft.launcher.brand=patina".to_string())
         );
+    }
+
+    #[test]
+    fn marker_is_in_command_line() {
+        let c = build(MODERN, "/d", &["/x.jar"], None, &AssetLayout::Modern);
+        let m = c
+            .args
+            .iter()
+            .position(|a| a == "-Dpatina.instance=inst-1")
+            .unwrap();
+        let mc = c
+            .args
+            .iter()
+            .position(|a| a == "net.minecraft.client.main.Main")
+            .unwrap();
+        assert!(m < mc);
     }
 
     #[test]
