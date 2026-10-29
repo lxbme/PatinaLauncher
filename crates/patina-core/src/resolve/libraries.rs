@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::download::DownloadJob;
+use crate::download::{DownloadJob, mirror::canonical_url};
 use crate::fsutil::safe_join;
 use crate::meta::{FileRef, Library, RuleEnv, maven_path, rules_allow};
 
@@ -18,6 +18,9 @@ pub struct ResolvedLibraries {
     pub classpath: Vec<PathBuf>,
     pub natives: Vec<NativeJar>,
     pub jobs: Vec<DownloadJob>,
+    /// Classpath libraries produced by loader processors (empty artifact url):
+    /// never downloaded, but expected on disk.
+    pub generated: Vec<PathBuf>,
 }
 
 pub fn resolve_libraries(
@@ -27,7 +30,7 @@ pub fn resolve_libraries(
 ) -> ResolvedLibraries {
     let mut out = ResolvedLibraries::default();
     for lib in libs {
-        if !rules_allow(&lib.rules, env) {
+        if !lib.is_client_side() || !rules_allow(&lib.rules, env) {
             continue;
         }
         if let Some(natives) = &lib.natives {
@@ -38,7 +41,12 @@ pub fn resolve_libraries(
                 if let Some(artifact) = &downloads.artifact
                     && let Some(dest) = artifact_dest(artifact, &lib.name, libraries_dir)
                 {
-                    out.jobs.push(job_from(artifact, dest.clone()));
+                    if artifact.url.is_empty() {
+                        // Produced by a loader processor; never downloaded.
+                        out.generated.push(dest.clone());
+                    } else {
+                        out.jobs.push(job_from(artifact, dest.clone()));
+                    }
                     out.classpath.push(dest);
                 }
             }
@@ -49,12 +57,15 @@ pub fn resolve_libraries(
                 let Some(dest) = safe_join(libraries_dir, &rel) else {
                     continue;
                 };
-                let base = lib.url.as_deref().unwrap_or(LIBRARIES_URL);
+                let mut base = lib.url.as_deref().unwrap_or(LIBRARIES_URL).to_string();
+                if !base.ends_with('/') {
+                    base.push('/');
+                }
                 out.jobs.push(DownloadJob {
-                    url: format!("{base}{rel}"),
+                    url: canonical_url(&format!("{base}{rel}")),
                     dest: dest.clone(),
-                    sha1: None,
-                    size: None,
+                    sha1: lib.sha1.clone(),
+                    size: lib.size,
                 });
                 out.classpath.push(dest);
             }
@@ -72,7 +83,7 @@ fn artifact_dest(file: &FileRef, name: &str, libraries_dir: &Path) -> Option<Pat
 
 fn job_from(file: &FileRef, dest: PathBuf) -> DownloadJob {
     DownloadJob {
-        url: file.url.clone(),
+        url: canonical_url(&file.url),
         dest,
         sha1: Some(file.sha1.clone()),
         size: Some(file.size),
@@ -250,6 +261,73 @@ mod tests {
         assert_eq!(r.jobs[0].dest, root.join("ok/good/1/good-1.jar"));
         for p in r.classpath.iter().chain(r.jobs.iter().map(|j| &j.dest)) {
             assert!(p.starts_with(root), "{} escapes the root", p.display());
+        }
+    }
+
+    fn libs(json: &str) -> Vec<Library> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn library_level_sha1_is_used() {
+        let l = libs(
+            r#"[{"name":"net.fabricmc:intermediary:1.21.1","url":"https://maven.fabricmc.net/","sha1":"abc","size":42}]"#,
+        );
+        let r = resolve_libraries(&l, &linux(), Path::new("/L"));
+        assert_eq!(r.jobs.len(), 1);
+        assert_eq!(r.jobs[0].sha1.as_deref(), Some("abc"));
+        assert_eq!(r.jobs[0].size, Some(42));
+    }
+
+    #[test]
+    fn url_without_trailing_slash_is_normalized() {
+        let l = libs(
+            r#"[{"name":"net.fabricmc:intermediary:1.21.1","url":"https://maven.fabricmc.net"}]"#,
+        );
+        let r = resolve_libraries(&l, &linux(), Path::new("/L"));
+        assert_eq!(
+            r.jobs[0].url,
+            "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar"
+        );
+    }
+
+    #[test]
+    fn empty_url_artifact_is_generated_not_downloaded() {
+        let l = libs(
+            r#"[{"name":"net.minecraftforge:forge:1.20.1:client","downloads":{"artifact":{"url":"","sha1":"","size":0,"path":"net/minecraftforge/forge/1.20.1/forge-1.20.1-client.jar"}}}]"#,
+        );
+        let r = resolve_libraries(&l, &linux(), Path::new("/L"));
+        let p =
+            Path::new("/L/net/minecraftforge/forge/1.20.1/forge-1.20.1-client.jar").to_path_buf();
+        assert_eq!(r.classpath, vec![p.clone()]);
+        assert_eq!(r.generated, vec![p]);
+        assert!(r.jobs.is_empty());
+    }
+
+    #[test]
+    fn server_only_library_is_skipped() {
+        let l = libs(r#"[{"name":"a:b:1","clientreq":false},{"name":"a:c:1","clientreq":true}]"#);
+        let r = resolve_libraries(&l, &linux(), Path::new("/L"));
+        assert_eq!(r.classpath.len(), 1);
+        assert_eq!(r.jobs.len(), 1);
+        assert!(r.classpath[0].ends_with("c-1.jar"));
+    }
+
+    #[test]
+    fn old_forge_maven_url_is_canonicalized() {
+        let l = libs(
+            r#"[{"name":"a:b:1","url":"http://files.minecraftforge.net/maven/"},
+            {"name":"a:c:1","downloads":{"artifact":{"url":"http://files.minecraftforge.net/maven/a/c/1/c-1.jar","sha1":"00","size":1}}},
+            {"name":"a:n:1","natives":{"linux":"natives-linux"},"downloads":{"classifiers":{"natives-linux":{"url":"https://files.minecraftforge.net/maven/a/n/1/n-1-natives-linux.jar","sha1":"00","size":1,"path":"a/n/1/n-1-natives-linux.jar"}}}}]"#,
+        );
+        let r = resolve_libraries(&l, &linux(), Path::new("/L"));
+        assert_eq!(r.jobs.len(), 3);
+        for j in &r.jobs {
+            assert!(
+                j.url.starts_with("https://maven.minecraftforge.net/"),
+                "{}",
+                j.url
+            );
         }
     }
 }
