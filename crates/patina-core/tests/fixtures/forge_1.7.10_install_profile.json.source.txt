@@ -1,0 +1,2 @@
+install_profile.json from https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/1.7.10-10.13.4.1614-1.7.10/forge-1.7.10-10.13.4.1614-1.7.10-installer.jar
+versionInfo.libraries trimmed to 3: launchwrapper and akka-actor (real; akka has checksums+clientreq/serverreq); the third (clientreq:false) is hand-added since the real data has no clientreq:false entry.

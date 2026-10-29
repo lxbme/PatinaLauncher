@@ -1,0 +1,75 @@
+{
+  "id": "1.20.1-forge-47.4.28",
+  "inheritsFrom": "1.20.1",
+  "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+  "arguments": {
+    "game": [
+      "--launchTarget",
+      "forgeclient",
+      "--fml.forgeVersion",
+      "47.4.28",
+      "--fml.mcVersion",
+      "1.20.1",
+      "--fml.forgeGroup",
+      "net.minecraftforge",
+      "--fml.mcpVersion",
+      "20230612.114412"
+    ],
+    "jvm": [
+      "-Djava.net.preferIPv6Addresses=system",
+      "-DignoreList=bootstraplauncher,securejarhandler,asm-commons,asm-util,asm-analysis,asm-tree,asm,JarJarFileSystems,client-extra,fmlcore,javafmllanguage,lowcodelanguage,mclanguage,forge-,${version_name}.jar",
+      "-DmergeModules=jna-5.10.0.jar,jna-platform-5.10.0.jar",
+      "-DlibraryDirectory=${library_directory}",
+      "-p",
+      "${library_directory}/cpw/mods/bootstraplauncher/1.1.2/bootstraplauncher-1.1.2.jar${classpath_separator}${library_directory}/cpw/mods/securejarhandler/2.1.10/securejarhandler-2.1.10.jar${classpath_separator}${library_directory}/org/ow2/asm/asm-commons/9.9.1/asm-commons-9.9.1.jar${classpath_separator}${library_directory}/org/ow2/asm/asm-util/9.9.1/asm-util-9.9.1.jar${classpath_separator}${library_directory}/org/ow2/asm/asm-analysis/9.9.1/asm-analysis-9.9.1.jar${classpath_separator}${library_directory}/org/ow2/asm/asm-tree/9.9.1/asm-tree-9.9.1.jar${classpath_separator}${library_directory}/org/ow2/asm/asm/9.9.1/asm-9.9.1.jar${classpath_separator}${library_directory}/net/minecraftforge/JarJarFileSystems/0.3.19/JarJarFileSystems-0.3.19.jar",
+      "--add-modules",
+      "ALL-MODULE-PATH",
+      "--add-opens",
+      "java.base/java.util.jar=cpw.mods.securejarhandler",
+      "--add-opens",
+      "java.base/java.lang.invoke=cpw.mods.securejarhandler",
+      "--add-exports",
+      "java.base/sun.security.util=cpw.mods.securejarhandler",
+      "--add-exports",
+      "jdk.naming.dns/com.sun.jndi.dns=java.naming"
+    ]
+  },
+  "libraries": [
+    {
+      "name": "cpw.mods:securejarhandler:2.1.10",
+      "downloads": {
+        "artifact": {
+          "path": "cpw/mods/securejarhandler/2.1.10/securejarhandler-2.1.10.jar",
+          "url": "https://maven.minecraftforge.net/cpw/mods/securejarhandler/2.1.10/securejarhandler-2.1.10.jar",
+          "sha1": "51e6a22c6c716beb11e244bf5b8be480f51dd6b5",
+          "size": 88749
+        }
+      }
+    },
+    {
+      "name": "org.ow2.asm:asm:9.9.1",
+      "downloads": {
+        "artifact": {
+          "path": "org/ow2/asm/asm/9.9.1/asm-9.9.1.jar",
+          "url": "https://maven.minecraftforge.net/org/ow2/asm/asm/9.9.1/asm-9.9.1.jar",
+          "sha1": "2ceea6ab43bcae1979b2a6d85fc0ca429877e5ab",
+          "size": 126252
+        }
+      }
+    },
+    {
+      "name": "net.minecraftforge:forge:1.20.1-47.4.28:client",
+      "downloads": {
+        "artifact": {
+          "path": "net/minecraftforge/forge/1.20.1-47.4.28/forge-1.20.1-47.4.28-client.jar",
+          "url": "",
+          "sha1": "0000000000000000000000000000000000000000",
+          "size": 0
+        }
+      }
+    }
+  ],
+  "type": "release",
+  "time": "2026-10-13T16:25:27+00:00",
+  "releaseTime": "2026-10-13T16:25:27+00:00"
+}

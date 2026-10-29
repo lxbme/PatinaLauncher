@@ -64,6 +64,21 @@ pub struct Library {
     pub natives: Option<HashMap<String, String>>,
     #[serde(default)]
     pub extract: Option<Extract>,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub clientreq: Option<bool>,
+    #[serde(default)]
+    pub checksums: Vec<String>,
+}
+
+impl Library {
+    /// Legacy Forge marks server-only libraries with `clientreq: false`.
+    pub fn is_client_side(&self) -> bool {
+        self.clientreq != Some(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +95,8 @@ pub struct AssetIndexRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionDownloads {
     pub client: FileRef,
+    #[serde(default)]
+    pub client_mappings: Option<FileRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +156,34 @@ impl VersionJson {
             major_version: 8,
         })
     }
+}
+
+/// A loader profile (Fabric profile JSON, Forge version.json / versionInfo):
+/// everything but `id` is optional and gets merged over the vanilla version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialVersionJson {
+    pub id: String,
+    #[serde(default)]
+    pub inherits_from: Option<String>,
+    #[serde(default)]
+    pub main_class: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<Arguments>,
+    #[serde(default)]
+    pub minecraft_arguments: Option<String>,
+    #[serde(default)]
+    pub libraries: Vec<Library>,
+    #[serde(default)]
+    pub asset_index: Option<AssetIndexRef>,
+    #[serde(default)]
+    pub assets: Option<String>,
+    #[serde(default)]
+    pub java_version: Option<JavaVersionReq>,
+    #[serde(default)]
+    pub logging: Option<Logging>,
+    #[serde(default, rename = "type")]
+    pub kind: Option<VersionKind>,
 }
 
 #[cfg(test)]
@@ -215,5 +260,69 @@ mod tests {
                 && cls.contains_key("natives-windows-64")
         );
         assert!(l.libraries[1].downloads.is_none());
+    }
+
+    #[test]
+    fn parses_fabric_profile_as_partial() {
+        let p: PartialVersionJson = serde_json::from_str(include_str!(
+            "../../tests/fixtures/fabric_profile_1.21.1.json"
+        ))
+        .unwrap();
+        assert_eq!(p.inherits_from.as_deref(), Some("1.21.1"));
+        assert!(p.main_class.as_deref().unwrap().contains("fabricmc"));
+        assert!(
+            p.libraries
+                .iter()
+                .any(|l| l.sha1.is_some() && l.size.is_some())
+        );
+    }
+
+    #[test]
+    fn parses_modern_forge_version_json() {
+        let p: PartialVersionJson = serde_json::from_str(include_str!(
+            "../../tests/fixtures/forge_1.20.1_version.json"
+        ))
+        .unwrap();
+        assert_eq!(p.inherits_from.as_deref(), Some("1.20.1"));
+        assert!(p.arguments.is_some() && p.main_class.is_some());
+        assert!(p.libraries.iter().any(|l| {
+            l.downloads
+                .as_ref()
+                .and_then(|d| d.artifact.as_ref())
+                .is_some_and(|a| a.url.is_empty())
+        }));
+    }
+
+    #[test]
+    fn parses_legacy_forge_version_info() {
+        let ip: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/forge_1.7.10_install_profile.json"
+        ))
+        .unwrap();
+        let p: PartialVersionJson = serde_json::from_value(ip["versionInfo"].clone()).unwrap();
+        assert!(!p.minecraft_arguments.as_deref().unwrap().is_empty());
+        assert!(p.libraries.iter().any(|l| !l.checksums.is_empty()));
+        assert!(p.libraries.iter().any(|l| !l.is_client_side()));
+        assert!(
+            p.libraries
+                .iter()
+                .any(|l| l.clientreq == Some(true) && !l.checksums.is_empty())
+        );
+        assert!(
+            p.libraries
+                .iter()
+                .any(|l| l.clientreq.is_none() && l.is_client_side())
+        );
+    }
+
+    #[test]
+    fn version_json_reads_client_mappings() {
+        let mut v: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_modern.json")).unwrap();
+        v["downloads"]["client_mappings"] =
+            serde_json::json!({"url": "https://x/m.txt", "sha1": "ab", "size": 7});
+        let parsed: VersionJson = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.downloads.client_mappings.unwrap().size, 7);
+        assert!(modern().downloads.client_mappings.is_none());
     }
 }

@@ -1,0 +1,2 @@
+version.json from https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/1.20.1-47.4.28/forge-1.20.1-47.4.28-installer.jar
+Libraries trimmed to 2 real ones; the third (:client, url "") is a hand-added entry modeled on Forge's generated-library convention, because the real version.json has no empty-url library.

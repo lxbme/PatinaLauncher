@@ -1,0 +1,46 @@
+{
+  "install": {
+    "profileName": "Forge",
+    "target": "1.7.10-Forge10.13.4.1614-1.7.10",
+    "path": "net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10",
+    "version": "Forge 10.13.4.1614-1.7.10",
+    "filePath": "forge-1.7.10-10.13.4.1614-1.7.10-universal.jar",
+    "welcome": "Welcome to the simple Forge installer.",
+    "minecraft": "1.7.10",
+    "mirrorList": "https://files.minecraftforge.net/mirror-brand.list",
+    "logo": "/big_logo.png"
+  },
+  "versionInfo": {
+    "id": "1.7.10-Forge10.13.4.1614-1.7.10",
+    "time": "2015-12-10T00:05:37-0500",
+    "releaseTime": "1960-01-01T00:00:00-0700",
+    "type": "release",
+    "minecraftArguments": "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --userProperties ${user_properties} --userType ${user_type} --tweakClass cpw.mods.fml.common.launcher.FMLTweaker",
+    "mainClass": "net.minecraft.launchwrapper.Launch",
+    "minimumLauncherVersion": 14,
+    "assets": "1.7.10",
+    "inheritsFrom": "1.7.10",
+    "jar": "1.7.10",
+    "libraries": [
+      {
+        "name": "net.minecraft:launchwrapper:1.12",
+        "serverreq": true
+      },
+      {
+        "name": "com.typesafe.akka:akka-actor_2.11:2.3.3",
+        "url": "https://maven.minecraftforge.net/",
+        "checksums": [
+          "ed62e9fc709ca0f2ff1a3220daa8b70a2870078e",
+          "25a86ccfdb6f6dfe08971f4825d0a01be83a6f2e"
+        ],
+        "serverreq": true,
+        "clientreq": true
+      },
+      {
+        "name": "net.minecraft:fake-server-only:1.0",
+        "serverreq": true,
+        "clientreq": false
+      }
+    ]
+  }
+}

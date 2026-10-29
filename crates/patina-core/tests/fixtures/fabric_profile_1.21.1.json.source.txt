@@ -1,0 +1,2 @@
+https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/1.21.1/0.16.10/profile/json
+Libraries trimmed to the first 3.
