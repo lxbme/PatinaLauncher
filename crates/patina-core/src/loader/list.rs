@@ -24,6 +24,8 @@ pub enum LoaderError {
     Io(#[from] io::Error),
     #[error("{}", rust_i18n::t!("errors.loader.json", error = .0))]
     Json(#[from] serde_json::Error),
+    #[error("{}", rust_i18n::t!("errors.loader.unsafe_metadata", name = .0))]
+    UnsafeMetadata(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

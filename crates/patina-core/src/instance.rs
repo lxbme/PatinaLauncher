@@ -1,6 +1,7 @@
 //! Instance storage: one directory per instance with `instance.toml`.
 
-use crate::config::{JavaSettings, write_atomic};
+use crate::config::JavaSettings;
+use crate::fsutil::write_atomic;
 use crate::loader::LoaderKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

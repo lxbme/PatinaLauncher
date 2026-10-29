@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{GlobalConfig, write_atomic};
+use crate::config::GlobalConfig;
 use crate::download::{
     DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT,
     pick_fastest, resolve_choice, sha1_file,
 };
+use crate::fsutil::write_atomic;
 use crate::fsutil::{is_safe_name, safe_join};
 use crate::instance::{Instance, effective_java};
 use crate::java::{JavaInstall, ManagedRuntimes, RuntimeError, probe};

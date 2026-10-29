@@ -25,6 +25,18 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     is_safe_rel(rel).then(|| root.join(rel))
 }
 
+/// Writes to a temp file next to `path`, then renames.
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
