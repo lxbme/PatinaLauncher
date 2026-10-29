@@ -59,6 +59,7 @@ errors:
     io: "File operation failed: %{error}"
     json: "Failed to parse version data: %{error}"
     unsafe_metadata: "Version data contains an unsafe file name: %{name}"
+    loader_needs_reinstall: "The %{kind} installation for this instance (version %{version}) is incomplete or was deleted. Reinstall the loader and try again."
 gc_preset:
   none: "Default (no GC flags)"
   g1_aikar: "Tuned G1 (Aikar's flags)"

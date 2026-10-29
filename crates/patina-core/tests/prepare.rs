@@ -374,3 +374,172 @@ async fn client_jar_is_keyed_on_requested_id() {
     let cp = &args[args.iter().position(|a| a == "-cp").unwrap() + 1];
     assert!(cp.ends_with("versions/26.3/26.3.jar"), "{cp}");
 }
+
+// ---- loader instances ----
+
+use patina_core::instance::{Component, ComponentUid, Instance};
+use patina_core::loader::forge::GENERATED_FILE;
+
+const PROFILE_ID: &str = "fabric-loader-0.16.10-26.3";
+
+fn loader_instance(l: &Launcher, uid: ComponentUid, profile: Option<&str>) -> Instance {
+    let mut inst = InstanceStore::new(l.data.instances())
+        .create("加载器", "26.3")
+        .unwrap();
+    inst.config
+        .set_loader(Some(Component {
+            uid,
+            version: "0.16.10".into(),
+            profile: profile.map(String::from),
+        }))
+        .unwrap();
+    inst
+}
+
+fn write_profile(data: &Path, id: &str, profile: &Value) {
+    let dir = data.join("versions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(profile).unwrap(),
+    )
+    .unwrap();
+}
+
+fn art(name: &str, path: &str, url: &str, body: &[u8]) -> Value {
+    json!({ "name": name, "downloads": { "artifact": {
+        "path": path, "url": url, "sha1": sha1_hex(body), "size": body.len() } } })
+}
+
+fn classpath(args: &[String]) -> Vec<String> {
+    let cp = &args[args.iter().position(|a| a == "-cp").unwrap() + 1];
+    cp.split(':').map(String::from).collect()
+}
+
+#[tokio::test]
+async fn prepare_merges_fabric_profile() {
+    let fake = fake_mojang(8).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    let body = b"fabric loader";
+    serve(&fake.server, "/fabric/loader.jar", body.to_vec()).await;
+    let url = format!("{}/fabric/loader.jar", fake.server.uri());
+    // Same group:artifact as a vanilla library, different version.
+    let dup_body = b"brigadier override";
+    serve(&fake.server, "/fabric/brig.jar", dup_body.to_vec()).await;
+    let dup_url = format!("{}/fabric/brig.jar", fake.server.uri());
+    write_profile(
+        &s.data,
+        PROFILE_ID,
+        &json!({
+            "id": PROFILE_ID, "inheritsFrom": "26.3", "type": "release",
+            "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "arguments": { "game": [], "jvm": [] },
+            "libraries": [
+                art("net.fabricmc:fabric-loader:0.16.10", "net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar", &url, body),
+                art("com.mojang:brigadier:9.9.9", "com/mojang/brigadier/9.9.9/brigadier-9.9.9.jar", &dup_url, dup_body),
+            ]
+        }),
+    );
+    let inst = loader_instance(&l, ComponentUid::Fabric, Some(PROFILE_ID));
+    let prepared = l.prepare(&inst, &s.global, &account(), None).await.unwrap();
+    let args = &prepared.command.args;
+    assert!(args.contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_string()));
+    assert!(!args.contains(&"net.minecraft.client.main.Main".to_string()));
+    let cp = classpath(args);
+    assert!(cp.iter().any(|p| p.ends_with("fabric-loader-0.16.10.jar")));
+    let brig: Vec<_> = cp.iter().filter(|p| p.contains("brigadier")).collect();
+    assert_eq!(brig.len(), 1, "{cp:?}");
+    assert!(brig[0].ends_with("brigadier-9.9.9.jar"));
+    assert!(cp.last().unwrap().ends_with("versions/26.3/26.3.jar"));
+    let v = args.iter().position(|a| a == "--version").unwrap();
+    assert_eq!(args[v + 1], PROFILE_ID);
+    assert!(s.data.join("versions/26.3/26.3.jar").is_file());
+}
+
+#[tokio::test]
+async fn missing_generated_library_requires_reinstall() {
+    let fake = fake_mojang(8).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    write_profile(
+        &s.data,
+        "forge-x",
+        &json!({
+            "id": "forge-x", "inheritsFrom": "26.3", "mainClass": "m",
+            "libraries": [art("net.minecraft:client:1-x:srg", "net/minecraft/client/1-x/client-1-x-srg.jar", "", b"")]
+        }),
+    );
+    let inst = loader_instance(&l, ComponentUid::Forge, Some("forge-x"));
+    let err = l
+        .prepare(&inst, &s.global, &account(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PrepareError::LoaderNeedsReinstall { .. }),
+        "{err}"
+    );
+    // Present on disk: launches.
+    let f = s
+        .data
+        .join("libraries/net/minecraft/client/1-x/client-1-x-srg.jar");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"x").unwrap();
+    l.prepare(&inst, &s.global, &account(), None).await.unwrap();
+}
+
+#[tokio::test]
+async fn generated_file_list_is_checked_and_modern_needs_it() {
+    let fake = fake_mojang(8).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    write_profile(
+        &s.data,
+        "neoforge-x",
+        &json!({
+            "id": "neoforge-x", "inheritsFrom": "26.3", "mainClass": "m",
+            "arguments": { "game": [], "jvm": ["-DlibraryDirectory=${library_directory}"] },
+            "libraries": []
+        }),
+    );
+    let inst = loader_instance(&l, ComponentUid::Neoforge, Some("neoforge-x"));
+    // Modern profile without the generated list: incomplete install.
+    let e = l.prepare(&inst, &s.global, &account(), None).await;
+    assert!(matches!(e, Err(PrepareError::LoaderNeedsReinstall { .. })));
+    let dir = s.data.join("versions/neoforge-x");
+    std::fs::write(dir.join(GENERATED_FILE), r#"["a/b/1/b-1.jar"]"#).unwrap();
+    let e = l.prepare(&inst, &s.global, &account(), None).await;
+    assert!(matches!(e, Err(PrepareError::LoaderNeedsReinstall { .. })));
+    let f = s.data.join("libraries/a/b/1/b-1.jar");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"x").unwrap();
+    l.prepare(&inst, &s.global, &account(), None).await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_profile_requires_reinstall() {
+    let fake = fake_mojang(8).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    for profile in [Some(PROFILE_ID), None] {
+        let inst = loader_instance(&l, ComponentUid::Fabric, profile);
+        let err = l
+            .prepare(&inst, &s.global, &account(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PrepareError::LoaderNeedsReinstall { .. }),
+            "{err}"
+        );
+    }
+    // Unparseable profile too.
+    let dir = s.data.join("versions").join(PROFILE_ID);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{PROFILE_ID}.json")), "{ nope").unwrap();
+    let inst = loader_instance(&l, ComponentUid::Fabric, Some(PROFILE_ID));
+    let err = l
+        .prepare(&inst, &s.global, &account(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PrepareError::LoaderNeedsReinstall { .. }));
+}

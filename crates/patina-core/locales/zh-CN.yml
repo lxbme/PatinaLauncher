@@ -59,6 +59,7 @@ errors:
     io: "文件操作失败：%{error}"
     json: "解析版本数据失败：%{error}"
     unsafe_metadata: "版本数据中包含不安全的文件名：%{name}"
+    loader_needs_reinstall: "此实例的 %{kind}（版本 %{version}）安装不完整或已被删除，请重新安装加载器后再试。"
 gc_preset:
   none: "默认（不加 GC 参数）"
   g1_aikar: "G1 调优（Aikar's Flags）"

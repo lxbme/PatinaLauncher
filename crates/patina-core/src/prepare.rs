@@ -22,7 +22,12 @@ use crate::jvm::{
 use crate::launch::{
     LAUNCHER_NAME, LAUNCHER_VERSION, LaunchAccount, LaunchCommand, LaunchSpec, build_command,
 };
-use crate::meta::{MANIFEST_URL, RuleEnv, VersionJson, VersionManifest};
+use crate::loader::LoaderKind;
+use crate::loader::forge::GENERATED_FILE;
+use crate::meta::{
+    ArgValue, MANIFEST_URL, OneOrMany, PartialVersionJson, RuleEnv, VersionJson, VersionManifest,
+    merge_versions,
+};
 use crate::paths::DataDirs;
 use crate::platform;
 use crate::resolve::{
@@ -84,6 +89,9 @@ pub enum PrepareError {
     /// A file name from downloaded metadata would escape its directory.
     #[error("{}", rust_i18n::t!("errors.prepare.unsafe_metadata", name = .0))]
     UnsafeMetadata(String),
+    /// The loader profile or a file its install generated is gone.
+    #[error("{}", rust_i18n::t!("errors.prepare.loader_needs_reinstall", kind = .kind.display_name(), version = .version))]
+    LoaderNeedsReinstall { kind: LoaderKind, version: String },
 }
 
 #[derive(Debug)]
@@ -218,17 +226,70 @@ impl Launcher {
         mc: &str,
         version: &VersionJson,
     ) -> Result<PathBuf, PrepareError> {
+        let job = self.client_jar_job(mc, version)?;
+        let dest = job.dest.clone();
+        self.downloader.run(vec![job], None).await?;
+        Ok(dest)
+    }
+
+    /// Download job for the vanilla client jar at `versions/<mc>/<mc>.jar`
+    /// (absolute destination).
+    fn client_jar_job(&self, mc: &str, version: &VersionJson) -> Result<DownloadJob, PrepareError> {
         let mc = checked_name(mc)?;
         let dest = std::path::absolute(self.data.versions().join(mc).join(format!("{mc}.jar")))?;
         let client = &version.downloads.client;
-        let job = DownloadJob {
+        Ok(DownloadJob {
             url: client.url.clone(),
-            dest: dest.clone(),
+            dest,
             sha1: Some(client.sha1.clone()),
             size: Some(client.size),
+        })
+    }
+
+    /// Vanilla `vanilla` merged with the instance's loader profile (if any).
+    /// A missing or unreadable profile means the loader must be reinstalled.
+    async fn merged_version(
+        &self,
+        inst: &Instance,
+        vanilla: VersionJson,
+    ) -> Result<VersionJson, PrepareError> {
+        let Some((kind, comp)) = inst.config.loader() else {
+            return Ok(vanilla);
         };
-        self.downloader.run(vec![job], None).await?;
-        Ok(dest)
+        let reinstall = || PrepareError::LoaderNeedsReinstall {
+            kind,
+            version: comp.version.clone(),
+        };
+        let id = comp.profile.as_deref().ok_or_else(reinstall)?;
+        let id = checked_name(id)?;
+        let dir = self.data.versions().join(id);
+        let bytes = tokio::fs::read(dir.join(format!("{id}.json")))
+            .await
+            .map_err(|_| reinstall())?;
+        let profile: PartialVersionJson =
+            serde_json::from_slice(&bytes).map_err(|_| reinstall())?;
+        let merged = merge_versions(&vanilla, &profile);
+
+        // Modern Forge/NeoForge installs (1.17+) record the processor-generated
+        // libraries in GENERATED_FILE as their last install step. Such a
+        // profile is recognised by `${library_directory}` in its JVM arguments
+        // (module-path launch); without the file the install is incomplete.
+        let list = dir.join(GENERATED_FILE);
+        let is_modern = kind != LoaderKind::Fabric && uses_library_directory(&profile);
+        match std::fs::read(&list) {
+            Ok(b) => {
+                let rels: Vec<String> = serde_json::from_slice(&b).map_err(|_| reinstall())?;
+                for rel in rels {
+                    let ok = safe_join(&self.data.libraries(), &rel).is_some_and(|p| p.is_file());
+                    if !ok {
+                        return Err(reinstall());
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !is_modern => {}
+            Err(_) => return Err(reinstall()),
+        }
+        Ok(merged)
     }
 
     /// `java_path`, or (when `None`) the managed runtime `version` asks for,
@@ -282,7 +343,9 @@ impl Launcher {
         // The client jar is keyed on the requested id, the same id
         // `ensure_version` caches the JSON under (may differ from `version.id`).
         let jar_id = inst.config.mc_version();
-        let version = self.ensure_version(jar_id).await?;
+        let vanilla = self.ensure_version(jar_id).await?;
+        checked_name(&vanilla.id)?;
+        let version = self.merged_version(inst, vanilla).await?;
         checked_name(&version.id)?;
 
         // 2. Java.
@@ -342,7 +405,17 @@ impl Launcher {
 
         let env = RuleEnv::current();
         let libs = resolve_libraries(&version.libraries, &env, &data.libraries());
+        // Libraries a loader install generated are never downloaded.
+        if let Some((kind, comp)) = inst.config.loader()
+            && libs.generated.iter().any(|p| !p.is_file())
+        {
+            return Err(PrepareError::LoaderNeedsReinstall {
+                kind,
+                version: comp.version.clone(),
+            });
+        }
         let mut jobs = libs.jobs.clone();
+        jobs.push(self.client_jar_job(jar_id, &version)?);
         jobs.extend(asset_jobs(&index, &assets_dir));
         let logging = version.logging.as_ref().and_then(|l| l.client.as_ref());
         let logging_config = match logging {
@@ -358,10 +431,8 @@ impl Launcher {
             }
             _ => None,
         };
-        // The client jar downloads alongside the rest (outside `progress`).
-        let (client_jar, ()) = tokio::try_join!(self.ensure_client_jar(jar_id, &version), async {
-            Ok::<(), PrepareError>(self.downloader.run(jobs, progress).await?)
-        },)?;
+        self.downloader.run(jobs, progress).await?;
+        let client_jar = self.client_jar_job(jar_id, &version)?.dest;
 
         // 6. Natives, legacy asset layout, game directory.
         extract_natives(&libs.natives, &natives_dir)?;
@@ -390,6 +461,22 @@ impl Launcher {
         });
         Ok(Prepared { command, warnings })
     }
+}
+
+/// Whether a loader profile's JVM arguments use `${library_directory}`.
+fn uses_library_directory(profile: &PartialVersionJson) -> bool {
+    let has = |s: &String| s.contains("${library_directory}");
+    profile
+        .arguments
+        .iter()
+        .flat_map(|a| &a.jvm)
+        .any(|a| match a {
+            ArgValue::Plain(s) => has(s),
+            ArgValue::Conditional { value, .. } => match value {
+                OneOrMany::One(s) => has(s),
+                OneOrMany::Many(v) => v.iter().any(has),
+            },
+        })
 }
 
 async fn probe_blocking(bin: PathBuf) -> Result<JavaInstall, PrepareError> {
@@ -426,6 +513,20 @@ mod tests {
         assert!(e.to_string().contains("../evil") && e.to_string().is_ascii());
         set_language(Language::ZhCn);
         assert!(e.to_string().contains("../evil") && e.to_string().contains("不安全"));
+    }
+
+    #[test]
+    fn reinstall_error_is_localized() {
+        use crate::i18n::{Language, locale_lock, set_language};
+        let _locale = locale_lock();
+        let e = PrepareError::LoaderNeedsReinstall {
+            kind: LoaderKind::Fabric,
+            version: "0.16.10".into(),
+        };
+        set_language(Language::En);
+        assert!(e.to_string().contains("Fabric") && e.to_string().contains("0.16.10"));
+        set_language(Language::ZhCn);
+        assert!(e.to_string().contains("重新安装") && e.to_string().contains("0.16.10"));
     }
 
     #[test]
