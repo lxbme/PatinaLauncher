@@ -8,10 +8,10 @@ use serde_json::Value;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
-use super::fetch_sidecar;
+use super::{fetch_sidecar, parse_sha1_sidecar};
 use crate::download::mirror::canonical_url;
-use crate::download::{DownloadJob, Downloader};
-use crate::fsutil::is_safe_name;
+use crate::download::{DownloadJob, Downloader, sha1_file};
+use crate::fsutil::{is_safe_name, write_atomic};
 use crate::loader::list::{LoaderError, LoaderVersion};
 use crate::loader::{InstallPhase, LoaderKind, ProgressSink, report};
 use crate::meta::{PartialVersionJson, maven_path};
@@ -72,17 +72,14 @@ pub(crate) fn is_safe_version(s: &str) -> bool {
         && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Downloads the installer jar to `cache/installers/<kind>/<file>`, verified by the
-/// `.sha1` sidecar when one is available (an unavailable sidecar is not an
-/// error). An already cached jar that matches is reused.
-pub async fn fetch_installer(
-    dl: &Downloader,
+/// Canonical download URL and cache path (`cache/installers/<kind>/<file>`)
+/// of the installer jar for `v`, after checking `mc` and `v` are safe.
+fn installer_target(
     data: &DataDirs,
     kind: LoaderKind,
     mc: &str,
     v: &LoaderVersion,
-    progress: &ProgressSink,
-) -> Result<PathBuf, LoaderError> {
+) -> Result<(String, PathBuf), LoaderError> {
     if kind == LoaderKind::Fabric {
         return Err(invalid("Fabric has no installer jar"));
     }
@@ -103,18 +100,65 @@ pub async fn fetch_installer(
         .join("installers")
         .join(kind_dir(kind))
         .join(file_name);
+    Ok((url, dest))
+}
 
+/// `<jar>.sha1`: the SHA-1 a cached installer was verified against.
+fn sidecar_path(jar: &Path) -> PathBuf {
+    let mut name = jar.as_os_str().to_owned();
+    name.push(".sha1");
+    PathBuf::from(name)
+}
+
+/// Downloads the installer jar to `cache/installers/<kind>/<file>`, verified by the
+/// `.sha1` sidecar when one is available (an unavailable sidecar is not an
+/// error). An already cached jar that matches is reused. A verified jar gets
+/// its SHA-1 recorded in `<file>.sha1` next to it (see [`cached_installer`]).
+pub async fn fetch_installer(
+    dl: &Downloader,
+    data: &DataDirs,
+    kind: LoaderKind,
+    mc: &str,
+    v: &LoaderVersion,
+    progress: &ProgressSink,
+) -> Result<PathBuf, LoaderError> {
+    let (url, dest) = installer_target(data, kind, mc, v)?;
     report(progress, InstallPhase::DownloadInstaller, 0, 1);
     let sha1 = fetch_sidecar(dl, &canonical_url(&format!("{url}.sha1"))).await;
     let job = DownloadJob {
         url,
         dest: dest.clone(),
-        sha1,
+        sha1: sha1.clone(),
         size: None,
     };
     dl.run(vec![job], None).await?;
+    let sidecar = sidecar_path(&dest);
+    match sha1 {
+        Some(h) => write_atomic(&sidecar, h.as_bytes())?,
+        // Unverified: no record, so the jar is never trusted offline.
+        None => match std::fs::remove_file(&sidecar) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        },
+    }
     report(progress, InstallPhase::DownloadInstaller, 1, 1);
     Ok(dest)
+}
+
+/// The installer jar [`fetch_installer`] cached for `v`, without any network
+/// access: `Some` only when the jar's SHA-1 matches the one recorded next to
+/// it when it was downloaded and verified.
+pub(crate) fn cached_installer(
+    data: &DataDirs,
+    kind: LoaderKind,
+    mc: &str,
+    v: &LoaderVersion,
+) -> Option<PathBuf> {
+    let (_, jar) = installer_target(data, kind, mc, v).ok()?;
+    let recorded = parse_sha1_sidecar(&std::fs::read(sidecar_path(&jar)).ok()?)?;
+    sha1_file(&jar)
+        .is_ok_and(|h| h.eq_ignore_ascii_case(&recorded))
+        .then_some(jar)
 }
 
 fn kind_dir(kind: LoaderKind) -> &'static str {
@@ -340,6 +384,16 @@ mod tests {
                 .join("installers/forge/forge-1.20.1-47.4.28-installer.jar")
         );
         assert_eq!(std::fs::read(&jar).unwrap(), body);
+        // The verified SHA-1 is recorded, so the jar can be trusted offline.
+        assert_eq!(
+            cached_installer(&data, LoaderKind::Forge, "1.20.1", &v),
+            Some(jar.clone())
+        );
+        std::fs::write(&jar, b"changed").unwrap();
+        assert_eq!(
+            cached_installer(&data, LoaderKind::Forge, "1.20.1", &v),
+            None
+        );
     }
 
     #[tokio::test]
@@ -360,6 +414,11 @@ mod tests {
         .await
         .unwrap();
         assert!(jar.is_file());
+        // Unverified: never trusted without the network.
+        assert_eq!(
+            cached_installer(&data, LoaderKind::Forge, "1.20.1", &v),
+            None
+        );
     }
 
     #[tokio::test]

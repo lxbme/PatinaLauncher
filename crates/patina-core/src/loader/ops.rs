@@ -4,13 +4,15 @@
 use std::fmt;
 
 use super::fabric::install_fabric;
+use super::forge::installed::{installed_forge, is_installed};
 use super::forge::installer::is_safe_version;
 use super::forge::{
     InstallerProfile, fetch_installer, install_legacy, install_modern, read_installer,
 };
 use super::list::{LoaderError, LoaderVersion, VersionPick, list_versions};
-use super::{LoaderKind, ProgressSink};
+use super::{InstallPhase, InstalledProfile, LoaderKind, ProgressSink, report};
 use crate::instance::{Component, ComponentUid, Instance, InstanceStore};
+use crate::meta::VersionJson;
 use crate::prepare::{Launcher, PrepareError};
 
 /// Something the user should know after a successful operation.
@@ -75,6 +77,7 @@ pub async fn install_loader(
     }
     let mc = inst.config.mc_version();
     check_mc(mc)?;
+    report(&progress, InstallPhase::FetchMetadata, 0, 1);
     let list = list_versions(&launcher.downloader, kind, mc).await?;
     let version = pick.pick(&list).ok_or_else(|| match &pick {
         VersionPick::Exact(v) => LoaderError::VersionNotFound {
@@ -87,7 +90,9 @@ pub async fn install_loader(
             mc: mc.to_string(),
         },
     })?;
-    let component = install_version(launcher, version, &progress).await?;
+    let vanilla = launcher.ensure_version(mc).await?;
+    report(&progress, InstallPhase::FetchMetadata, 1, 1);
+    let component = install_version(launcher, version, &vanilla, &progress).await?;
 
     let mut config = inst.config.clone();
     config.set_loader(Some(component))?;
@@ -113,15 +118,16 @@ pub fn remove_loader(store: &InstanceStore, id: &str) -> Result<OpOutcome, Loade
 /// Changes the instance's Minecraft version to `mc`.
 ///
 /// - Without a loader only the version changes.
+/// - [`LoaderAction::Remove`] always drops the loader, whatever its kind and
+///   whether or not it supports `mc`; nothing is listed or fetched.
 /// - Fabric loader versions work across Minecraft versions: when `mc`'s
 ///   Fabric list has the installed loader version, that version is
 ///   reinstalled for `mc` (Fabric profile ids include the Minecraft version).
 /// - Otherwise (always for Forge and NeoForge, whose builds target one
 ///   Minecraft version) the loader is incompatible: with `action == None`
-///   this fails with [`LoaderError::Incompatible`]; [`LoaderAction::Replace`]
-///   installs the recommended version of the same loader for `mc`, and
-///   [`LoaderAction::Remove`] drops the loader. `action` is ignored when the
-///   loader is compatible.
+///   this fails with [`LoaderError::Incompatible`], and
+///   [`LoaderAction::Replace`] installs the recommended version of the same
+///   loader for `mc`. `Replace` is ignored when the loader is compatible.
 ///
 /// The instance config is saved only once everything succeeded.
 pub async fn set_mc_version(
@@ -142,51 +148,50 @@ pub async fn set_mc_version(
     }
     let mut config = inst.config.clone();
     config.set_mc_version(mc);
-    let Some((kind, current)) = inst.config.loader() else {
-        return Ok(OpOutcome {
-            instance: commit(store, id, config.components)?,
-            notices: Vec::new(),
-        });
+    let (kind, current) = match inst.config.loader() {
+        Some(loader) if action != Some(LoaderAction::Remove) => loader,
+        // No loader, or an explicit Remove: no listing, no network.
+        _ => {
+            config.set_loader(None)?;
+            return Ok(OpOutcome {
+                instance: commit(store, id, config.components)?,
+                notices: Vec::new(),
+            });
+        }
     };
 
-    // Forge / NeoForge removal needs no version list (and no network).
-    let list = if kind == LoaderKind::Fabric || action != Some(LoaderAction::Remove) {
-        match list_versions(&launcher.downloader, kind, mc).await {
-            Ok(list) => list,
-            Err(LoaderError::NoVersions { .. }) => Vec::new(),
-            Err(e) => return Err(e),
-        }
-    } else {
-        Vec::new()
+    report(&progress, InstallPhase::FetchMetadata, 0, 1);
+    let list = match list_versions(&launcher.downloader, kind, mc).await {
+        Ok(list) => list,
+        Err(LoaderError::NoVersions { .. }) => Vec::new(),
+        Err(e) => return Err(e),
     };
     let same = match kind {
         LoaderKind::Fabric => VersionPick::Exact(current.version.clone()).pick(&list),
         LoaderKind::Forge | LoaderKind::Neoforge => None,
     };
-    let target = match (same, action) {
-        (Some(v), _) => Some(v),
-        (None, None) => {
-            return Err(LoaderError::Incompatible {
-                kind,
-                version: current.version.clone(),
-                can_replace: !list.is_empty(),
-            });
-        }
-        (None, Some(LoaderAction::Replace)) => Some(
-            VersionPick::Recommended
+    let target =
+        match (same, action) {
+            (Some(v), _) => v,
+            (None, Some(LoaderAction::Replace)) => VersionPick::Recommended
                 .pick(&list)
                 .ok_or_else(|| LoaderError::NoVersions {
                     kind,
                     mc: mc.to_string(),
                 })?,
-        ),
-        (None, Some(LoaderAction::Remove)) => None,
-    };
-    let component = match target {
-        Some(v) => Some(install_version(launcher, v, &progress).await?),
-        None => None,
-    };
-    config.set_loader(component)?;
+            // `Remove` returned above.
+            (None, _) => {
+                return Err(LoaderError::Incompatible {
+                    kind,
+                    version: current.version.clone(),
+                    can_replace: !list.is_empty(),
+                });
+            }
+        };
+    let vanilla = launcher.ensure_version(mc).await?;
+    report(&progress, InstallPhase::FetchMetadata, 1, 1);
+    let component = install_version(launcher, target, &vanilla, &progress).await?;
+    config.set_loader(Some(component))?;
     Ok(OpOutcome {
         instance: commit(store, id, config.components)?,
         notices: Vec::new(),
@@ -211,17 +216,20 @@ fn component_uid(kind: LoaderKind) -> ComponentUid {
     }
 }
 
-/// Installs loader version `v` (for `v.mc`) into the shared data dirs and
-/// returns its instance component. Touches no instance.
+/// Installs loader version `v` (for `v.mc`, whose version JSON is
+/// `vanilla`) into the shared data dirs and returns its instance component.
+/// A version that is already completely installed (another instance uses
+/// it) is reused as it is: no installer is fetched or run and no shared file
+/// is rewritten. Touches no instance.
 async fn install_version(
     launcher: &Launcher,
     v: &LoaderVersion,
+    vanilla: &VersionJson,
     progress: &ProgressSink,
 ) -> Result<Component, LoaderError> {
     let (dl, data, kind, mc) = (&launcher.downloader, &launcher.data, v.kind, v.mc.as_str());
     // Processors patch the vanilla client jar, and every loader launches on it.
-    let vanilla = launcher.ensure_version(mc).await?;
-    launcher.ensure_client_jar(mc, &vanilla).await?;
+    launcher.ensure_client_jar(mc, vanilla).await?;
     let installed = match kind {
         LoaderKind::Fabric => {
             for s in [mc, v.maven_version.as_str()] {
@@ -229,31 +237,19 @@ async fn install_version(
                     return Err(LoaderError::UnsafeMetadata(s.to_string()));
                 }
             }
-            install_fabric(dl, data, mc, &v.maven_version, progress).await?
+            // The id Fabric's metadata server gives its profiles.
+            let id = format!("fabric-loader-{}-{mc}", v.maven_version);
+            if is_installed(data, &id, false).await {
+                reused(progress, id)
+            } else {
+                install_fabric(dl, data, mc, &v.maven_version, progress).await?
+            }
         }
         LoaderKind::Forge | LoaderKind::Neoforge => {
-            let jar = fetch_installer(dl, data, kind, mc, v, progress).await?;
-            let read_from = jar.clone();
-            let profile = tokio::task::spawn_blocking(move || read_installer(&read_from))
-                .await
-                .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
-            match profile {
-                InstallerProfile::Legacy { .. } if kind == LoaderKind::Forge => {
-                    install_legacy(dl, data, &jar, profile, progress).await?
-                }
-                InstallerProfile::Legacy { .. } => {
-                    return Err(LoaderError::InstallerInvalid(
-                        "a NeoForge installer cannot use the legacy (versionInfo) format".into(),
-                    ));
-                }
-                InstallerProfile::Modern { .. } => {
-                    // Processors run on the managed runtime for this version.
-                    let java = launcher.select_java(None, &vanilla).await?;
-                    install_modern(
-                        dl, data, kind, &jar, profile, &vanilla, &java.path, progress,
-                    )
-                    .await?
-                }
+            if let Some(found) = installed_forge(data, kind, mc, v).await {
+                reused(progress, found.profile_id)
+            } else {
+                install_forge(launcher, v, vanilla, progress).await?
             }
         }
     };
@@ -262,6 +258,41 @@ async fn install_version(
         version: v.version.clone(),
         profile: Some(installed.profile_id),
     })
+}
+
+/// An already installed profile, reported as finalized.
+fn reused(progress: &ProgressSink, profile_id: String) -> InstalledProfile {
+    report(progress, InstallPhase::Finalize, 0, 1);
+    report(progress, InstallPhase::Finalize, 1, 1);
+    InstalledProfile { profile_id }
+}
+
+/// Fetches and runs the Forge / NeoForge installer for `v`.
+async fn install_forge(
+    launcher: &Launcher,
+    v: &LoaderVersion,
+    vanilla: &VersionJson,
+    progress: &ProgressSink,
+) -> Result<InstalledProfile, LoaderError> {
+    let (dl, data, kind, mc) = (&launcher.downloader, &launcher.data, v.kind, v.mc.as_str());
+    let jar = fetch_installer(dl, data, kind, mc, v, progress).await?;
+    let read_from = jar.clone();
+    let profile = tokio::task::spawn_blocking(move || read_installer(&read_from))
+        .await
+        .map_err(|e| LoaderError::Io(std::io::Error::other(e)))??;
+    match profile {
+        InstallerProfile::Legacy { .. } if kind == LoaderKind::Forge => {
+            install_legacy(dl, data, &jar, profile, progress).await
+        }
+        InstallerProfile::Legacy { .. } => Err(LoaderError::InstallerInvalid(
+            "a NeoForge installer cannot use the legacy (versionInfo) format".into(),
+        )),
+        InstallerProfile::Modern { .. } => {
+            // Processors run on the managed runtime for this version.
+            let java = launcher.select_java(None, vanilla).await?;
+            install_modern(dl, data, kind, &jar, profile, vanilla, &java.path, progress).await
+        }
+    }
 }
 
 /// Saves `components` into instance `id` as it is on disk now, so changes to
@@ -283,6 +314,7 @@ mod tests {
     use crate::download::{Downloader, Mirror};
     use crate::i18n::{Language, locale_lock, set_language};
     use crate::java::{ManagedRuntimes, RUNTIME_INDEX_URL};
+    use crate::loader::InstallProgress;
     use crate::loader::forge::processors::test_java::{FakeJava, processor_jar};
     use crate::loader::forge::test_support::{OFFICIAL_HOSTS, sha1_hex, write_zip};
     use crate::paths::DataDirs;
@@ -626,13 +658,22 @@ mod tests {
             ] {
                 let jar = dir.join(format!("installer-{maven}.jar"));
                 write_zip(&jar, entries);
-                serve(
-                    server,
-                    &format!("/net/minecraftforge/forge/{maven}/forge-{maven}-installer.jar"),
-                    std::fs::read(&jar).unwrap(),
-                )
-                .await;
+                let bytes = std::fs::read(&jar).unwrap();
+                let at = format!("/net/minecraftforge/forge/{maven}/forge-{maven}-installer.jar");
+                serve(server, &format!("{at}.sha1"), sha1_hex(&bytes)).await;
+                serve(server, &at, bytes).await;
             }
+        }
+
+        /// Requests the mock server received for path `p`.
+        async fn hits(&self, p: &str) -> usize {
+            let all = self.server.received_requests().await.unwrap();
+            all.iter().filter(|r| r.url.path() == p).count()
+        }
+
+        /// Every request the mock server received.
+        async fn requests(&self) -> usize {
+            self.server.received_requests().await.unwrap().len()
         }
 
         fn load(&self, id: &str) -> Instance {
@@ -893,6 +934,21 @@ mod tests {
         );
         assert_eq!(env.config_text(&id), before);
 
+        // An explicit Remove always removes, even a compatible Fabric
+        // loader, and needs no network.
+        let id = env.store.create("fabric-rm", "1.20.1").unwrap().id;
+        env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+            .await
+            .unwrap();
+        let before = env.requests().await;
+        let out = env
+            .set_mc(&id, "1.21.1", Some(LoaderAction::Remove))
+            .await
+            .unwrap();
+        assert_eq!(out.instance.config.components, minecraft_only("1.21.1"));
+        assert_eq!(env.load(&id), out.instance);
+        assert_eq!(env.requests().await, before, "Remove made requests");
+
         // Forge: always incompatible with another Minecraft version.
         let a = env.store.create("forge-a", "1.20.1").unwrap().id;
         let b = env.store.create("forge-b", "1.20.1").unwrap().id;
@@ -945,6 +1001,148 @@ mod tests {
         let universal = env.launcher.data.libraries().join(UNIVERSAL);
         assert_eq!(std::fs::read(universal).unwrap(), b"universal jar");
         assert!(env.profile_json(FORGE_LEGACY_ID).is_file());
+    }
+
+    fn mtime(p: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(p).unwrap().modified().unwrap()
+    }
+
+    const FORGE_INSTALLER: &str =
+        "/net/minecraftforge/forge/1.20.1-47.1.0/forge-1.20.1-47.1.0-installer.jar";
+
+    #[tokio::test]
+    async fn installed_forge_version_is_reused_by_another_instance() {
+        let env = Env::new().await;
+        let a = env.store.create("a", "1.20.1").unwrap().id;
+        env.install(&a, LoaderKind::Forge, VersionPick::Recommended, false)
+            .await
+            .unwrap();
+        assert_eq!(env.java.runs().len(), 1);
+        let dir = env.launcher.data.versions().join(FORGE_MODERN_ID);
+        let shared = [
+            env.profile_json(FORGE_MODERN_ID),
+            dir.join(crate::loader::forge::GENERATED_FILE),
+            env.launcher.data.libraries().join(PATCHED),
+        ];
+        let stamps: Vec<_> = shared.iter().map(|p| mtime(p)).collect();
+        let installer_hits = env.hits(FORGE_INSTALLER).await;
+
+        // A second instance on the same version: nothing is fetched or run.
+        let b = env.store.create("b", "1.20.1").unwrap().id;
+        let out = env
+            .install(&b, LoaderKind::Forge, VersionPick::Recommended, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            loader_of(&out.instance),
+            Some((
+                LoaderKind::Forge,
+                FORGE_MODERN.into(),
+                Some(FORGE_MODERN_ID.into())
+            ))
+        );
+        assert_eq!(env.java.runs().len(), 1, "a processor ran again");
+        assert_eq!(env.hits(FORGE_INSTALLER).await, installer_hits);
+        let after: Vec<_> = shared.iter().map(|p| mtime(p)).collect();
+        assert_eq!(after, stamps, "shared files were rewritten");
+
+        // A generated file is gone: that install is incomplete and is redone.
+        std::fs::remove_file(&shared[2]).unwrap();
+        let c = env.store.create("c", "1.20.1").unwrap().id;
+        env.install(&c, LoaderKind::Forge, VersionPick::Recommended, false)
+            .await
+            .unwrap();
+        assert_eq!(env.java.runs().len(), 2);
+        assert_eq!(std::fs::read(&shared[2]).unwrap(), b"generated");
+    }
+
+    #[tokio::test]
+    async fn installed_fabric_and_legacy_forge_are_reused() {
+        let env = Env::new().await;
+        let fabric_profile = "/v2/versions/loader/1.20.1/0.16.10/profile/json";
+        let legacy_installer = format!(
+            "/net/minecraftforge/forge/1.12.2-{FORGE_LEGACY}/forge-1.12.2-{FORGE_LEGACY}-installer.jar"
+        );
+        for name in ["one", "two"] {
+            let id = env.store.create(name, "1.20.1").unwrap().id;
+            env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+                .await
+                .unwrap();
+            let id = env
+                .store
+                .create(&format!("{name}-old"), "1.12.2")
+                .unwrap()
+                .id;
+            let out = env
+                .install(&id, LoaderKind::Forge, VersionPick::Recommended, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                loader_of(&out.instance),
+                Some((
+                    LoaderKind::Forge,
+                    FORGE_LEGACY.into(),
+                    Some(FORGE_LEGACY_ID.into())
+                ))
+            );
+        }
+        assert_eq!(env.hits(fabric_profile).await, 1);
+        assert_eq!(env.hits(&legacy_installer).await, 1);
+
+        // A missing library means the install is redone.
+        let (lib, _) = fabric_lib("0.16.10");
+        std::fs::remove_file(env.launcher.data.libraries().join(&lib[1..])).unwrap();
+        let id = env.store.create("three", "1.20.1").unwrap().id;
+        env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+            .await
+            .unwrap();
+        assert_eq!(env.hits(fabric_profile).await, 2);
+        assert!(env.launcher.data.libraries().join(&lib[1..]).is_file());
+    }
+
+    #[tokio::test]
+    async fn metadata_progress_comes_first() {
+        let env = Env::new().await;
+        let id = env.store.create("p", "1.20.1").unwrap().id;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        install_loader(
+            &env.launcher,
+            &env.store,
+            &id,
+            LoaderKind::Forge,
+            VersionPick::Recommended,
+            false,
+            Some(tx),
+        )
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            events.push(p);
+        }
+        let meta = |done| InstallProgress {
+            phase: InstallPhase::FetchMetadata,
+            done,
+            total: 1,
+        };
+        assert_eq!(events[..2], [meta(0), meta(1)], "{events:?}");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        set_mc_version(
+            &env.launcher,
+            &env.store,
+            &id,
+            "1.12.2",
+            Some(LoaderAction::Replace),
+            Some(tx),
+        )
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            events.push(p);
+        }
+        assert_eq!(events[..2], [meta(0), meta(1)], "{events:?}");
     }
 
     #[test]

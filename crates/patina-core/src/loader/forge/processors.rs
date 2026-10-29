@@ -336,7 +336,7 @@ pub async fn run_processors(
         if p.is_download_mojmaps() {
             download_mojmaps(p, env, dl, vanilla).await?;
         } else {
-            run_one(java, index, p, env).await?;
+            run_one(java, index, done + 1, p, env).await?;
         }
         report(progress, InstallPhase::RunProcessor, done + 1, total);
     }
@@ -372,9 +372,12 @@ async fn download_mojmaps(
     Ok(())
 }
 
+/// Runs processor `index` (into all processors), the `step`th (1-based)
+/// client-side one.
 async fn run_one(
     java: &Path,
     index: usize,
+    step: usize,
     p: &Processor,
     env: &ProcessorEnv,
 ) -> Result<(), LoaderError> {
@@ -431,6 +434,7 @@ async fn run_one(
     if !out.status.success() {
         return Err(LoaderError::ProcessorFailed {
             index,
+            step,
             exit_code: out.status.code(),
             stderr_tail: stderr_tail(&out.stderr),
         });
@@ -1054,15 +1058,18 @@ mod tests {
             let st = setup(&[]).await;
             let p = procs(json!([
                 {"sides": ["server"], "jar": "x:server:1", "args": ["--fail", "9"]},
+                {"sides": ["server"], "jar": "x:server:1", "args": ["--fail", "9"]},
                 {"jar": "x:first:1", "args": ["--fail", "3"]},
                 {"jar": "x:second:1", "args": []}
             ]));
             let r = st.run(&p).await;
+            // `index` is into all processors, `step` counts client ones.
             assert!(
                 matches!(
                     r,
                     Err(LoaderError::ProcessorFailed {
-                        index: 1,
+                        index: 2,
+                        step: 1,
                         exit_code: Some(3),
                         ..
                     })

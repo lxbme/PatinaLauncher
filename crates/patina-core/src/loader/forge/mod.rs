@@ -1,5 +1,6 @@
 //! Forge and NeoForge installers.
 
+pub mod installed;
 pub mod installer;
 pub mod legacy;
 pub mod modern;
@@ -231,22 +232,30 @@ pub(crate) mod test_support {
     /// SHA-1 of the fixture's pack200 data with the signature trailer cut.
     pub const PACK_SHA1: &str = "3b4099f9edaac04db6f1fe1270a1bbe1268f11a0";
 
-    /// A client that can never reach the real official hosts: they resolve
-    /// to a closed local port, so the "original URL" candidate fails fast.
-    fn offline_client() -> reqwest::Client {
+    /// Fabric's official hosts (metadata and maven).
+    pub const FABRIC_HOSTS: [&str; 2] = ["https://meta.fabricmc.net", "https://maven.fabricmc.net"];
+
+    /// A client that can never reach the real `hosts` (`https://host[/path]`):
+    /// they resolve to a closed local port and no proxy is used, so an
+    /// "original URL" candidate fails fast instead of reaching the network.
+    pub fn dead_hosts_client(hosts: &[&str]) -> reqwest::Client {
         let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut b = reqwest::Client::builder().no_proxy();
-        for host in [
-            "maven.minecraftforge.net",
-            "files.minecraftforge.net",
-            "maven.neoforged.net",
-            "libraries.minecraft.net",
-            "piston-meta.mojang.com",
-            "piston-data.mojang.com",
-        ] {
+        for h in hosts {
+            let host = h.trim_start_matches("https://").split('/').next().unwrap();
             b = b.resolve(host, dead);
         }
         b.build().unwrap()
+    }
+
+    /// [`dead_hosts_client`] for every official loader, Mojang and Fabric host.
+    pub fn offline_client() -> reqwest::Client {
+        let hosts: Vec<&str> = OFFICIAL_HOSTS
+            .iter()
+            .chain(&FABRIC_HOSTS)
+            .copied()
+            .collect();
+        dead_hosts_client(&hosts)
     }
 
     /// Serves a managed `jre-legacy` (runtime index, manifest and a

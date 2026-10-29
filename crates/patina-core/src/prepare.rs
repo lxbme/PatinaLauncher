@@ -11,8 +11,8 @@ use crate::download::{
     DownloadError, DownloadJob, Downloader, Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT,
     pick_fastest, resolve_choice, sha1_file,
 };
-use crate::fsutil::write_atomic;
 use crate::fsutil::{is_safe_name, safe_join};
+use crate::fsutil::{replace_atomic, write_atomic};
 use crate::instance::{Instance, effective_java};
 use crate::java::{JavaInstall, ManagedRuntimes, RuntimeError, probe};
 use crate::jvm::{
@@ -487,10 +487,8 @@ fn loader_client_jar(vanilla: &Path, versions: &Path, id: &str, sha1: &str) -> i
     if sha1_file(&dest).is_ok_and(|h| h.eq_ignore_ascii_case(sha1)) {
         return Ok(dest);
     }
-    std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!("{id}.jar.tmp"));
-    std::fs::copy(vanilla, &tmp)?;
-    std::fs::rename(&tmp, &dest)?;
+    // Two launches of instances on one loader may copy at once.
+    replace_atomic(&dest, |tmp| std::fs::copy(vanilla, tmp).map(drop))?;
     Ok(dest)
 }
 
@@ -533,6 +531,33 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_loader_client_jar_copies_all_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vanilla = tmp.path().join("vanilla.jar");
+        let body = vec![7u8; 256 * 1024];
+        std::fs::write(&vanilla, &body).unwrap();
+        let sha1 = sha1_file(&vanilla).unwrap();
+        let versions = tmp.path().join("versions");
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        loader_client_jar(&vanilla, &versions, "fabric-x", &sha1)
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().unwrap();
+            }
+        });
+        let dir = versions.join("fabric-x");
+        assert_eq!(std::fs::read(dir.join("fabric-x.jar")).unwrap(), body);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 
     #[test]

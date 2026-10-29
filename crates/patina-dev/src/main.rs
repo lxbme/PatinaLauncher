@@ -125,9 +125,7 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
                 let result = run_install(&launcher, &store, &inst.id, kind, pick, false).await;
                 if let Err(e) = result {
                     // Leave nothing half-made behind: the same command can be re-run.
-                    store.delete(&inst.id)?;
-                    println!("Deleted instance {:?} again", inst.id);
-                    return Err(e);
+                    return Err(undo_create(&inst.id, e, || store.delete(&inst.id)));
                 }
             }
         }
@@ -155,6 +153,11 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
             )
             .await;
             let _ = printer.await;
+            if let Err(e) = &result
+                && let Some(hint) = loader_error_hint(e)
+            {
+                println!("{hint}");
+            }
             let outcome = loader_result(result)?;
             println!(
                 "Instance {id:?} is now Minecraft {} with {} ({:.1}s; {} download(s) fell back to another source)",
@@ -236,8 +239,10 @@ async fn run_install(
     let (tx, printer) = install_printer(start);
     let result = install_loader(launcher, store, id, kind, pick, replace, Some(tx)).await;
     let _ = printer.await;
-    if let Err(LoaderError::Conflict { .. }) = &result {
-        println!("Pass --replace to replace the existing loader.");
+    if let Err(e) = &result
+        && let Some(hint) = loader_error_hint(e)
+    {
+        println!("{hint}");
     }
     let outcome = loader_result(result)?;
     println!(
@@ -248,6 +253,38 @@ async fn run_install(
     );
     print_notices(&outcome);
     Ok(())
+}
+
+/// The command-line flag that gets past `e`, when there is one.
+fn loader_error_hint(e: &LoaderError) -> Option<&'static str> {
+    match e {
+        LoaderError::Conflict { .. } => Some("Pass --replace to replace the existing loader."),
+        LoaderError::Incompatible {
+            can_replace: true, ..
+        } => Some(
+            "Pass --loader-action replace to install the recommended version of the same loader, \
+             or --loader-action remove to remove the loader.",
+        ),
+        LoaderError::Incompatible {
+            can_replace: false, ..
+        } => Some("Pass --loader-action remove to remove the loader."),
+        _ => None,
+    }
+}
+
+/// Undoes `create --loader` after the install failed with `err`: deletes
+/// instance `id` through `delete`. A failed delete is reported on stderr and
+/// never hides `err`, which is returned either way.
+fn undo_create<E: std::fmt::Display>(
+    id: &str,
+    err: anyhow::Error,
+    delete: impl FnOnce() -> std::result::Result<(), E>,
+) -> anyhow::Error {
+    match delete() {
+        Ok(()) => println!("Deleted instance {id:?} again"),
+        Err(d) => eprintln!("Could not delete the half-made instance {id:?}: {d}"),
+    }
+    err
 }
 
 /// Turns a core loader error into an anyhow error that keeps its Debug
@@ -546,4 +583,49 @@ async fn launch(ctx: &mut Ctx, id: &str, player: &str) -> Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(3), logs).await;
     println!("Game exited: {status}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_cleanup_keeps_the_install_error() {
+        let e = undo_create("x", anyhow::anyhow!("install failed"), || {
+            Err::<(), _>("disk full")
+        });
+        assert_eq!(e.to_string(), "install failed");
+        let mut deleted = false;
+        let e = undo_create("x", anyhow::anyhow!("install failed"), || {
+            deleted = true;
+            Ok::<(), String>(())
+        });
+        assert!(deleted);
+        assert_eq!(e.to_string(), "install failed");
+    }
+
+    #[test]
+    fn loader_errors_hint_at_their_flags() {
+        let incompatible = |can_replace| LoaderError::Incompatible {
+            kind: LoaderKind::Forge,
+            version: "47.1.0".into(),
+            can_replace,
+        };
+        let both = loader_error_hint(&incompatible(true)).unwrap();
+        assert!(
+            both.contains("--loader-action replace") && both.contains("--loader-action remove"),
+            "{both}"
+        );
+        let remove = loader_error_hint(&incompatible(false)).unwrap();
+        assert!(
+            remove.contains("--loader-action remove") && !remove.contains("replace"),
+            "{remove}"
+        );
+        let conflict = LoaderError::Conflict {
+            existing: LoaderKind::Fabric,
+            existing_version: "0.16.10".into(),
+        };
+        assert!(loader_error_hint(&conflict).unwrap().contains("--replace"));
+        assert_eq!(loader_error_hint(&LoaderError::Parse("x".into())), None);
+    }
 }

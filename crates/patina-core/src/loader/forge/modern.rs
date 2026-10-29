@@ -439,6 +439,7 @@ mod tests {
                 r,
                 Err(LoaderError::ProcessorFailed {
                     index: 2,
+                    step: 2,
                     exit_code: Some(2),
                     ..
                 })

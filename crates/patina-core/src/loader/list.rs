@@ -30,13 +30,17 @@ pub enum LoaderError {
     UnsafeMetadata(String),
     #[error("{}", rust_i18n::t!("errors.loader.installer_invalid", reason = .0))]
     InstallerInvalid(String),
-    /// Processor `index` (0-based, into the profile's `processors`) exited
-    /// unsuccessfully; `exit_code` is `None` when it was killed by a signal.
+    /// Processor `index` (0-based, into the profile's `processors`; kept for
+    /// diagnostics) exited unsuccessfully. `step` is its 1-based position
+    /// among the client-side processors, as `RunProcessor` progress counts
+    /// them, and is the number users see. `exit_code` is `None` when it was
+    /// killed by a signal.
     /// `stderr_tail` (its last 4 KiB of stderr) is for diagnostics only: it
     /// shows in `Debug`, never in the localized message.
-    #[error("{}", processor_failed_text(*.index, *.exit_code))]
+    #[error("{}", processor_failed_text(*.step, *.exit_code))]
     ProcessorFailed {
         index: usize,
+        step: usize,
         exit_code: Option<i32>,
         stderr_tail: String,
     },
@@ -83,9 +87,8 @@ fn incompatible_text(kind: LoaderKind, version: &str, can_replace: bool) -> Stri
     .to_string()
 }
 
-/// Steps are shown 1-based.
-fn processor_failed_text(index: usize, exit_code: Option<i32>) -> String {
-    let step = index + 1;
+/// `step` is already 1-based.
+fn processor_failed_text(step: usize, exit_code: Option<i32>) -> String {
     match exit_code {
         Some(code) => rust_i18n::t!("errors.loader.processor_failed", step = step, code = code),
         None => rust_i18n::t!("errors.loader.processor_killed", step = step),
@@ -245,16 +248,15 @@ pub fn parse_forge(
     }
     out.sort_by(newest_first);
 
-    let promos = match promotions {
-        Some(bytes) => {
-            #[derive(Deserialize)]
-            struct P {
-                promos: std::collections::HashMap<String, String>,
-            }
-            Some(serde_json::from_slice::<P>(bytes)?.promos)
-        }
-        None => None,
-    };
+    #[derive(Deserialize)]
+    struct P {
+        promos: std::collections::HashMap<String, String>,
+    }
+    // Promotions only mark versions: an unparseable body (an error page, a
+    // changed format) counts as missing, not as a failed listing.
+    let promos = promotions
+        .and_then(|bytes| serde_json::from_slice::<P>(bytes).ok())
+        .map(|p| p.promos);
     let promo = |kind: &str| promos.as_ref().and_then(|p| p.get(&format!("{mc}-{kind}")));
     let rec = promo("recommended");
     let lat = promo("latest");
@@ -417,8 +419,9 @@ mod tests {
     use super::*;
     use crate::download::Mirror;
     use crate::i18n::{Language, locale_lock, set_language};
+    use crate::loader::forge::test_support::offline_client;
     use std::time::Duration;
-    use wiremock::matchers::path;
+    use wiremock::matchers::{path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const FABRIC: &[u8] = include_bytes!("../../tests/fixtures/fabric_loader_list_1.21.1.json");
@@ -484,6 +487,37 @@ mod tests {
     }
 
     #[test]
+    fn malformed_promotions_are_ignored() {
+        let none = parse_forge(FORGE_XML, None, "1.12.2").unwrap();
+        for bad in [&b"<html>502</html>"[..], b"", b"{\"promos\": 3}", b"[]"] {
+            let l = parse_forge(FORGE_XML, Some(bad), "1.12.2").unwrap();
+            assert_eq!(l, none, "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn processor_failure_shows_the_client_step() {
+        let _locale = locale_lock();
+        set_language(Language::En);
+        let failed = LoaderError::ProcessorFailed {
+            index: 4,
+            step: 2,
+            exit_code: Some(1),
+            stderr_tail: String::new(),
+        };
+        let killed = LoaderError::ProcessorFailed {
+            index: 4,
+            step: 2,
+            exit_code: None,
+            stderr_tail: String::new(),
+        };
+        for e in [&failed, &killed] {
+            let s = e.to_string();
+            assert!(s.contains("step 2 ") && !s.contains('5'), "{s}");
+        }
+    }
+
+    #[test]
     fn neoforge_version_mapping() {
         let l = parse_neoforge(NEO_XML, "26.3").unwrap();
         assert!(l.iter().any(|v| v.version == "26.3.0.99"));
@@ -526,21 +560,24 @@ mod tests {
         assert!(VersionPick::Latest.pick(&[]).is_none());
     }
 
+    /// The Fabric and NeoForge hosts map to `server/fabric` and `server/neo`,
+    /// with a fallback mirror at `server/fb/...`. The real hosts are
+    /// unreachable, so a request never leaves the machine: the "original URL"
+    /// candidate between the two mirrors fails with a connection error.
     fn dl_for(server: &MockServer) -> Downloader {
-        let mirror = Mirror {
-            id: "m".into(),
+        let mirror = |id: &str, base: String| Mirror {
+            id: id.into(),
             rules: vec![
-                (
-                    "https://meta.fabricmc.net".into(),
-                    format!("{}/fabric", server.uri()),
-                ),
+                ("https://meta.fabricmc.net".into(), format!("{base}/fabric")),
                 (
                     "https://maven.neoforged.net/releases".into(),
-                    format!("{}/neo", server.uri()),
+                    format!("{base}/neo"),
                 ),
             ],
         };
-        Downloader::new(reqwest::Client::new(), mirror).with_retry(1, Duration::ZERO)
+        Downloader::new(offline_client(), mirror("m", server.uri()))
+            .with_fallback(Some(mirror("fb", format!("{}/fb", server.uri()))))
+            .with_retry(1, Duration::ZERO)
     }
 
     #[tokio::test]
@@ -573,8 +610,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
             .mount(&server)
             .await;
-        // Fabric: 404 for an unknown mc.
-        Mock::given(path("/fabric/v2/versions/loader/9.9.9"))
+        // Fabric: 404 for an unknown mc, from both mirrors (the last
+        // candidate's answer is the one reported).
+        Mock::given(path_regex(r"^(/fb)?/fabric/v2/versions/loader/9\.9\.9$"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;

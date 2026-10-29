@@ -210,7 +210,9 @@ impl Downloader {
         Ok(())
     }
 
-    async fn existing_ok(job: &DownloadJob) -> bool {
+    /// Whether `job.dest` already holds the file: its SHA-1 matches when
+    /// known, else its size when known, else it merely exists.
+    pub(crate) async fn existing_ok(job: &DownloadJob) -> bool {
         let dest = job.dest.clone();
         let (sha1, size) = (job.sha1.clone(), job.size);
         tokio::task::spawn_blocking(move || {
@@ -454,7 +456,7 @@ mod tests {
         let url = "https://piston-data.mojang.com/v1/objects/abc/client.jar";
         let bm = "https://bmclapi2.bangbang93.com/v1/objects/abc/client.jar";
         let c = reqwest::Client::new;
-        // Explicit Official: strict, no third candidate.
+        // No fallback mirror configured: only the mirror and the original URL.
         let d = Downloader::new(c(), Mirror::official());
         assert_eq!(d.candidates(url), vec![url.to_string()]);
         let d = Downloader::new(c(), Mirror::official()).with_fallback(Some(Mirror::bmclapi()));

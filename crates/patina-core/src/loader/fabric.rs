@@ -56,6 +56,7 @@ mod tests {
     use super::*;
     use crate::download::Mirror;
     use crate::loader::InstallProgress;
+    use crate::loader::forge::test_support::{FABRIC_HOSTS, offline_client};
     use serde_json::{Value, json};
     use sha1::{Digest, Sha1};
     use std::time::Duration;
@@ -64,8 +65,9 @@ mod tests {
 
     const PROFILE: &str = include_str!("../../tests/fixtures/fabric_profile_1.21.1.json");
 
+    /// Fabric hosts map to `server`; the real ones are unreachable.
     fn downloader(server: &MockServer) -> Downloader {
-        let rules = ["https://meta.fabricmc.net", "https://maven.fabricmc.net"]
+        let rules = FABRIC_HOSTS
             .iter()
             .map(|h| (h.to_string(), server.uri()))
             .collect();
@@ -73,7 +75,7 @@ mod tests {
             id: "fake".into(),
             rules,
         };
-        Downloader::new(reqwest::Client::new(), mirror).with_retry(1, Duration::ZERO)
+        Downloader::new(offline_client(), mirror).with_retry(1, Duration::ZERO)
     }
 
     /// Serves the profile and every library; library `fail` (if any) gets a 500.
@@ -106,8 +108,6 @@ mod tests {
                 .mount(server)
                 .await;
         }
-        let id = v["id"].as_str().unwrap();
-        let _ = id;
         Mock::given(method("GET"))
             .and(path("/v2/versions/loader/1.21.1/0.16.10/profile/json"))
             .respond_with(
