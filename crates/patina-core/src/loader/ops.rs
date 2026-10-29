@@ -94,7 +94,7 @@ pub async fn install_loader(
     })?;
     let vanilla = launcher.ensure_version(mc).await?;
     report(&progress, Phase::FetchMetadata, 1, 1, Unit::Items);
-    let component = install_version(launcher, version, &vanilla, &progress).await?;
+    let component = install_version(launcher, version, &vanilla, false, &progress).await?;
 
     let mut config = inst.config.clone();
     config.set_loader(Some(component))?;
@@ -104,6 +104,43 @@ pub async fn install_loader(
         _ => Vec::new(),
     };
     Ok(OpOutcome { instance, notices })
+}
+
+/// Reinstalls the instance's current loader (same kind and version) even
+/// when the shared install looks complete, repairing damaged files. The
+/// "already installed" reuse check is skipped; the instance lock and the
+/// version's exclusive lock are still taken. Fails with
+/// [`LoaderError::NoLoader`] for a vanilla instance.
+pub async fn reinstall_loader(
+    launcher: &Launcher,
+    store: &InstanceStore,
+    id: &str,
+    progress: ProgressSink,
+) -> Result<OpOutcome, LoaderError> {
+    let _lock = store.lock(id)?;
+    let inst = store.load(id)?;
+    let (kind, current) = inst.config.loader().ok_or(LoaderError::NoLoader)?;
+    let pick = VersionPick::Exact(current.version.clone());
+    tracing::info!(instance = %id, loader = ?kind, version = %current.version, "reinstalling loader");
+    let mc = inst.config.mc_version();
+    check_mc(mc)?;
+    report(&progress, Phase::FetchMetadata, 0, 1, Unit::Items);
+    let list = list_versions(&launcher.downloader, kind, mc).await?;
+    let version = pick
+        .pick(&list)
+        .ok_or_else(|| LoaderError::VersionNotFound {
+            kind,
+            version: current.version.clone(),
+        })?;
+    let vanilla = launcher.ensure_version(mc).await?;
+    report(&progress, Phase::FetchMetadata, 1, 1, Unit::Items);
+    let component = install_version(launcher, version, &vanilla, true, &progress).await?;
+    let mut config = inst.config.clone();
+    config.set_loader(Some(component))?;
+    Ok(OpOutcome {
+        instance: commit(store, id, config.components)?,
+        notices: Vec::new(),
+    })
 }
 
 /// Removes the instance's loader (a no-op for a vanilla instance).
@@ -194,7 +231,7 @@ pub async fn set_mc_version(
         };
     let vanilla = launcher.ensure_version(mc).await?;
     report(&progress, Phase::FetchMetadata, 1, 1, Unit::Items);
-    let component = install_version(launcher, target, &vanilla, &progress).await?;
+    let component = install_version(launcher, target, &vanilla, false, &progress).await?;
     config.set_loader(Some(component))?;
     Ok(OpOutcome {
         instance: commit(store, id, config.components)?,
@@ -224,11 +261,12 @@ fn component_uid(kind: LoaderKind) -> ComponentUid {
 /// `vanilla`) into the shared data dirs and returns its instance component.
 /// A version that is already completely installed (another instance uses
 /// it) is reused as it is: no installer is fetched or run and no shared file
-/// is rewritten. Touches no instance.
+/// is rewritten, unless `force`, which always reinstalls. Touches no instance.
 async fn install_version(
     launcher: &Launcher,
     v: &LoaderVersion,
     vanilla: &VersionJson,
+    force: bool,
     progress: &ProgressSink,
 ) -> Result<Component, LoaderError> {
     let (dl, data, kind, mc) = (&launcher.downloader, &launcher.data, v.kind, v.mc.as_str());
@@ -244,7 +282,7 @@ async fn install_version(
             // The id Fabric's metadata server gives its profiles.
             let id = format!("fabric-loader-{}-{mc}", v.maven_version);
             // The shared lock is dropped before an install takes the exclusive one.
-            let present = {
+            let present = !force && {
                 let _shared = data.lock_version_shared(&id)?;
                 is_installed(data, &id, false).await
             };
@@ -256,7 +294,7 @@ async fn install_version(
             }
         }
         LoaderKind::Forge | LoaderKind::Neoforge => {
-            let found = match installed_forge(data, kind, mc, v).await {
+            let found = match installed_forge(data, kind, mc, v).await.filter(|_| !force) {
                 Some(f) => {
                     let _shared = data.lock_version_shared(&f.profile_id)?;
                     Some(f)
@@ -1167,6 +1205,84 @@ mod tests {
             .unwrap();
         assert_eq!(env.hits(fabric_profile).await, 2);
         assert!(env.launcher.data.libraries().join(&lib[1..]).is_file());
+    }
+
+    #[tokio::test]
+    async fn reinstall_bypasses_short_circuit() {
+        let env = Env::new().await;
+        let id = env.store.create("a", "1.20.1").unwrap().id;
+        env.install(&id, LoaderKind::Forge, VersionPick::Recommended, false)
+            .await
+            .unwrap();
+        assert_eq!(env.java.runs().len(), 1);
+        let out = reinstall_loader(&env.launcher, &env.store, &id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.java.runs().len(),
+            2,
+            "reinstall did not run the installer"
+        );
+        assert_eq!(
+            loader_of(&out.instance),
+            Some((
+                LoaderKind::Forge,
+                FORGE_MODERN.into(),
+                Some(FORGE_MODERN_ID.into())
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn reinstall_fabric_refetches_profile() {
+        let env = Env::new().await;
+        let id = env.store.create("f", "1.20.1").unwrap().id;
+        env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+            .await
+            .unwrap();
+        let profile = "/v2/versions/loader/1.20.1/0.16.10/profile/json";
+        assert_eq!(env.hits(profile).await, 1);
+        reinstall_loader(&env.launcher, &env.store, &id, None)
+            .await
+            .unwrap();
+        assert_eq!(env.hits(profile).await, 2);
+    }
+
+    #[tokio::test]
+    async fn reinstall_is_busy_while_version_is_in_use() {
+        let env = Env::new().await;
+        let id = env.store.create("a", "1.20.1").unwrap().id;
+        env.install(&id, LoaderKind::Forge, VersionPick::Recommended, false)
+            .await
+            .unwrap();
+        let config_before = env.config_text(&id);
+        let profile_path = env.profile_json(FORGE_MODERN_ID);
+        let profile_before = std::fs::read(&profile_path).unwrap();
+        let runs = env.java.runs().len();
+        {
+            let _shared = env
+                .launcher
+                .data
+                .lock_version_shared(FORGE_MODERN_ID)
+                .unwrap();
+            let err = reinstall_loader(&env.launcher, &env.store, &id, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LoaderError::Busy(_)), "{err:?}");
+        }
+        assert_eq!(env.config_text(&id), config_before);
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_before);
+        assert_eq!(env.java.runs().len(), runs);
+    }
+
+    #[tokio::test]
+    async fn reinstall_without_loader_errors() {
+        let env = Env::new().await;
+        let id = env.store.create("v", "1.20.1").unwrap().id;
+        let err = reinstall_loader(&env.launcher, &env.store, &id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoaderError::NoLoader));
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ errors:
       not_a_loader: "该组件不是模组加载器"
       bad_icon_name: "图标名称不是有效的文件名"
   loader:
+    no_loader: "此实例没有安装加载器"
     no_versions: "Minecraft %{mc} 没有可用的 %{kind} 版本"
     version_not_found: "%{kind} 版本 %{version} 不存在"
     parse: "解析加载器版本数据失败：%{error}"

@@ -25,6 +25,7 @@ errors:
       not_a_loader: "the component is not a mod loader"
       bad_icon_name: "the icon name is not a valid file name"
   loader:
+    no_loader: "No loader is installed on this instance"
     no_versions: "No %{kind} versions are available for Minecraft %{mc}"
     version_not_found: "%{kind} version %{version} does not exist"
     parse: "Failed to parse the loader version data: %{error}"

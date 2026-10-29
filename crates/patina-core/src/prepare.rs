@@ -542,9 +542,16 @@ impl Launcher {
         };
 
         // 6. Natives, legacy asset layout, game directory.
-        extract_natives(&libs.natives, &natives_dir).map_err(io_at(&natives_dir))?;
+        let natives = libs.natives;
+        let dest = natives_dir.clone();
+        tokio::task::spawn_blocking(move || extract_natives(&natives, &dest))
+            .await?
+            .map_err(io_at(&natives_dir))?;
         let layout = asset_layout(&index, &ai.id, &assets_dir, &game_dir);
-        materialize_legacy(&index, &assets_dir, &layout).map_err(io_at(&assets_dir))?;
+        let (index_owned, assets, lay) = (index.clone(), assets_dir.clone(), layout.clone());
+        tokio::task::spawn_blocking(move || materialize_legacy(&index_owned, &assets, &lay))
+            .await?
+            .map_err(io_at(&assets_dir))?;
         std::fs::create_dir_all(&game_dir).map_err(io_at(&game_dir))?;
 
         // 7. Command line.

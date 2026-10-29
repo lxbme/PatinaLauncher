@@ -5,6 +5,7 @@ pub mod download;
 pub mod fsutil;
 pub mod i18n;
 pub mod instance;
+pub mod instance_files;
 pub mod java;
 pub mod jvm;
 pub mod launch;

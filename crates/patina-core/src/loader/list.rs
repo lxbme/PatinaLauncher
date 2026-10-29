@@ -27,6 +27,9 @@ pub enum LoaderError {
     /// A background task failed (panicked or was cancelled).
     #[error("{}", rust_i18n::t!("errors.loader.internal", error = .0))]
     Internal(String),
+    /// The instance has no loader to reinstall.
+    #[error("{}", rust_i18n::t!("errors.loader.no_loader"))]
+    NoLoader,
     #[error("{}", rust_i18n::t!("errors.loader.json", error = .0))]
     Json(String),
     #[error("{}", rust_i18n::t!("errors.loader.unsafe_metadata", name = .0))]
