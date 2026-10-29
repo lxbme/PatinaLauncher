@@ -28,6 +28,29 @@ pub enum LoaderError {
     UnsafeMetadata(String),
     #[error("{}", rust_i18n::t!("errors.loader.installer_invalid", reason = .0))]
     InstallerInvalid(String),
+    /// Processor `index` (0-based, into the profile's `processors`) exited
+    /// unsuccessfully; `exit_code` is `None` when it was killed by a signal.
+    /// `stderr_tail` (its last 4 KiB of stderr) is for diagnostics only: it
+    /// shows in `Debug`, never in the localized message.
+    #[error("{}", processor_failed_text(*.index, *.exit_code))]
+    ProcessorFailed {
+        index: usize,
+        exit_code: Option<i32>,
+        stderr_tail: String,
+    },
+    /// A processor output does not have the SHA-1 the installer declares.
+    #[error("{}", rust_i18n::t!("errors.loader.processor_output_mismatch", path = .path))]
+    ProcessorOutputMismatch { path: String },
+}
+
+/// Steps are shown 1-based.
+fn processor_failed_text(index: usize, exit_code: Option<i32>) -> String {
+    let step = index + 1;
+    match exit_code {
+        Some(code) => rust_i18n::t!("errors.loader.processor_failed", step = step, code = code),
+        None => rust_i18n::t!("errors.loader.processor_killed", step = step),
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

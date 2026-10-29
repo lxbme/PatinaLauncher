@@ -2,11 +2,15 @@
 
 pub mod installer;
 pub mod legacy;
+pub mod modern;
+pub mod processors;
 
 pub use installer::{
     InstallerProfile, fetch_installer, installer_coordinate, installer_url, read_installer,
 };
 pub use legacy::install_legacy;
+pub use modern::{GENERATED_FILE, install_modern};
+pub use processors::{Processor, ProcessorEnv, expand_arg, resolve_data, run_processors};
 
 use futures::StreamExt;
 

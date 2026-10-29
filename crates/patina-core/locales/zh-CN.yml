@@ -25,6 +25,9 @@ errors:
     json: "加载器版本数据无效：%{error}"
     unsafe_metadata: "加载器元数据包含不安全的名称：%{name}"
     installer_invalid: "加载器安装器无效：%{reason}"
+    processor_failed: "加载器安装的第 %{step} 步失败（退出码 %{code}）"
+    processor_killed: "加载器安装的第 %{step} 步在完成前被终止"
+    processor_output_mismatch: "加载器安装生成的文件不正确：%{path}"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"
