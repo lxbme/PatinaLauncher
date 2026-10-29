@@ -90,14 +90,24 @@ pub fn split_mod_name(name: &str) -> Option<(&str, bool)> {
     (!stem.is_empty()).then_some((stem, enabled))
 }
 
+/// A mod file found on disk, before its metadata is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModFile {
+    pub file_name: String,
+    pub path: PathBuf,
+    pub enabled: bool,
+    pub size: u64,
+    /// Modification time in unix seconds (0 when unknown).
+    pub modified: u64,
+    /// Modification time in unix nanoseconds (0 when unknown), for change
+    /// detection that notices a same-second rewrite.
+    pub modified_nanos: u64,
+}
+
 /// Lists `*.jar` and `*.jar.disabled` in `dir` (symlinks are followed),
-/// sorted by file name (case-insensitive, ties by exact name). A missing
-/// directory yields an empty list; a jar whose metadata cannot be read gets
-/// `meta: None`. `prefer` is the instance's loader, see [`read_mod_meta`].
-///
-/// This is blocking (it opens every jar): the GUI must call it through
-/// `tokio::task::spawn_blocking`.
-pub fn scan_mods(dir: &Path, prefer: Option<ModFormat>) -> io::Result<Vec<ModEntry>> {
+/// sorted by file name (case-insensitive, ties by exact name), without
+/// opening any jar. A missing directory yields an empty list.
+pub fn list_mod_files(dir: &Path) -> io::Result<Vec<ModFile>> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -119,23 +129,45 @@ pub fn scan_mods(dir: &Path, prefer: Option<ModFormat>) -> io::Result<Vec<ModEnt
         if !md.is_file() {
             continue;
         }
-        let modified = md
+        let since_epoch = md
             .modified()
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
-        let meta = read_mod_meta(&path, prefer);
-        out.push(ModEntry {
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        out.push(ModFile {
             file_name,
             path,
             enabled,
             size: md.len(),
-            modified,
-            meta,
+            modified: since_epoch.map_or(0, |d| d.as_secs()),
+            modified_nanos: since_epoch
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
         });
     }
     out.sort_by_cached_key(|e| (e.file_name.to_lowercase(), e.file_name.clone()));
     Ok(out)
+}
+
+/// Lists the mods in `dir` (see [`list_mod_files`]) and reads each jar's
+/// metadata; a jar whose metadata cannot be read gets `meta: None`. `prefer`
+/// is the instance's loader, see [`read_mod_meta`].
+///
+/// This is blocking (it opens every jar): the GUI must call it through
+/// `tokio::task::spawn_blocking`.
+pub fn scan_mods(dir: &Path, prefer: Option<ModFormat>) -> io::Result<Vec<ModEntry>> {
+    Ok(list_mod_files(dir)?
+        .into_iter()
+        .map(|f| {
+            let meta = read_mod_meta(&f.path, prefer);
+            ModEntry {
+                file_name: f.file_name,
+                path: f.path,
+                enabled: f.enabled,
+                size: f.size,
+                modified: f.modified,
+                meta,
+            }
+        })
+        .collect())
 }
 
 /// Reads the metadata of one jar. Candidate metadata files are tried in the

@@ -3,6 +3,7 @@
 //! Shared hostile-input helpers live here: everything read from disk or from
 //! an archive goes through a hard size cap, and no declared size is trusted.
 
+pub mod index;
 pub mod mods;
 mod nbt;
 pub mod packs;

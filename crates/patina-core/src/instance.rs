@@ -456,6 +456,25 @@ impl InstanceStore {
         Ok(inst)
     }
 
+    /// Healthy instances whose display name or id (both are matched) contains
+    /// `query`, case-insensitively, sorted by name. A blank query matches
+    /// nothing.
+    pub fn search_instances<'a>(outcome: &'a ListOutcome, query: &str) -> Vec<&'a Instance> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<&Instance> = outcome
+            .instances
+            .iter()
+            .filter(|i| {
+                i.config.name.to_lowercase().contains(&q) || i.id.to_lowercase().contains(&q)
+            })
+            .collect();
+        hits.sort_by_cached_key(|i| (i.config.name.to_lowercase(), i.id.clone()));
+        hits
+    }
+
     pub fn load(&self, id: &str) -> Result<Instance, InstanceError> {
         Self::check_id(id)?;
         self.read(id)
@@ -607,6 +626,26 @@ mod tests {
     fn write_raw(tmp: &std::path::Path, id: &str, body: &str) {
         std::fs::create_dir_all(tmp.join(id)).unwrap();
         std::fs::write(tmp.join(id).join("instance.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn search_instances_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        store.create("zeta Pack", "1.20.1").unwrap();
+        store.create("Alpha pack", "1.20.1").unwrap();
+        store.create("Other", "1.20.1").unwrap();
+        let out = store.list().unwrap();
+        let names = |q: &str| -> Vec<String> {
+            InstanceStore::search_instances(&out, q)
+                .into_iter()
+                .map(|i| i.config.name.clone())
+                .collect()
+        };
+        assert_eq!(names(" PACK "), ["Alpha pack", "zeta Pack"]);
+        assert_eq!(names("oth"), ["Other"]);
+        assert!(names("  ").is_empty());
+        assert!(names("nomatch").is_empty());
     }
 
     #[test]
