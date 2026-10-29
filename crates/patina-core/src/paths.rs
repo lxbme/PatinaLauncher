@@ -40,6 +40,9 @@ impl DataDirs {
     pub fn versions(&self) -> PathBuf {
         self.root.join("versions")
     }
+    pub fn cache(&self) -> PathBuf {
+        self.root.join("cache")
+    }
     pub fn runtimes(&self) -> PathBuf {
         self.root.join("runtimes")
     }

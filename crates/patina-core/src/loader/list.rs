@@ -26,6 +26,8 @@ pub enum LoaderError {
     Json(#[from] serde_json::Error),
     #[error("{}", rust_i18n::t!("errors.loader.unsafe_metadata", name = .0))]
     UnsafeMetadata(String),
+    #[error("{}", rust_i18n::t!("errors.loader.installer_invalid", reason = .0))]
+    InstallerInvalid(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -24,6 +24,7 @@ errors:
     io: "File operation failed: %{error}"
     json: "Invalid loader version data: %{error}"
     unsafe_metadata: "The loader metadata contains an unsafe name: %{name}"
+    installer_invalid: "The loader installer is invalid: %{reason}"
   jvm:
     memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"

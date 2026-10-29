@@ -1,5 +1,6 @@
 //! Installing a Fabric loader profile.
 
+pub use super::InstalledProfile;
 use super::list::LoaderError;
 use super::{InstallPhase, ProgressSink, report};
 use crate::download::{Downloader, Progress};
@@ -7,12 +8,6 @@ use crate::fsutil::{is_safe_name, safe_join, write_atomic};
 use crate::meta::{PartialVersionJson, RuleEnv};
 use crate::paths::DataDirs;
 use crate::resolve::resolve_libraries;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledProfile {
-    /// Id of the loader version JSON (`Component.profile`).
-    pub profile_id: String,
-}
 
 /// Fetches the Fabric profile for `mc` + `loader_version`, downloads its
 /// libraries and, as the very last step, writes `versions/<id>/<id>.json`.

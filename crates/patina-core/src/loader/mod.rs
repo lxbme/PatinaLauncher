@@ -1,6 +1,7 @@
 //! Mod loader support (Forge, NeoForge, Fabric).
 
 pub mod fabric;
+pub mod forge;
 pub mod list;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,13 @@ impl LoaderKind {
             LoaderKind::Fabric => rust_i18n::t!("loader.fabric").to_string(),
         }
     }
+}
+
+/// Result of a successful loader install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledProfile {
+    /// Id of the loader version JSON (`Component.profile`).
+    pub profile_id: String,
 }
 
 /// Receives install progress; `None` discards it.
