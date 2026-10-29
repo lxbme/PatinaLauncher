@@ -435,12 +435,54 @@ async fn run_one(
             stderr_tail: stderr_tail(&out.stderr),
         });
     }
-    if let Some(path) = first_mismatch(&outputs).await {
+    if let Some(path) = first_unaccepted(&outputs).await {
         return Err(LoaderError::ProcessorOutputMismatch {
             path: path.display().to_string(),
         });
     }
     Ok(())
+}
+
+/// After a successful run: the first output that is missing, or has another
+/// SHA-1 and is not an intact zip archive.
+///
+/// The declared SHA-1s of jar outputs (Forge's jarsplitter and
+/// binarypatcher results) are of archives deflated by classic zlib. Java's
+/// `java.util.zip` uses the system zlib on Linux, and where that is zlib-ng
+/// (Fedora 40+) the same entries deflate to other bytes, so the SHA-1 can
+/// never match there. Such an output is accepted when it is a non-empty
+/// zip whose every entry reads back with a matching CRC-32: that still
+/// catches truncated or damaged files. Any other output must match exactly.
+async fn first_unaccepted(outputs: &[(PathBuf, String)]) -> Option<PathBuf> {
+    let first = outputs.first().map(|(path, _)| path.clone());
+    let outputs = outputs.to_vec();
+    tokio::task::spawn_blocking(move || {
+        outputs.into_iter().find_map(|(path, sha1)| {
+            let ok = sha1_file(&path).is_ok_and(|a| a.eq_ignore_ascii_case(&sha1))
+                || is_intact_zip(&path);
+            (!ok).then_some(path)
+        })
+    })
+    .await
+    .unwrap_or(first)
+}
+
+/// A zip archive with at least one entry, every entry readable to the end
+/// (the zip reader checks each entry's CRC-32 there).
+fn is_intact_zip(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+        return false;
+    };
+    if zip.is_empty() {
+        return false;
+    }
+    (0..zip.len()).all(|i| {
+        zip.by_index(i)
+            .is_ok_and(|mut entry| std::io::copy(&mut entry, &mut std::io::sink()).is_ok())
+    })
 }
 
 /// Most bytes of a failed processor's stderr kept for diagnostics.
@@ -506,6 +548,7 @@ pub(crate) mod test_java {
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) mkdir -p "$(dirname "$2")"; printf 'generated' > "$2" ;;
+    --copy-out) mkdir -p "$(dirname "$3")"; cp "$2" "$3"; shift ;;
     --fail) echo "processor error: boom" >&2; exit "$2" ;;
   esac
   shift
@@ -916,6 +959,62 @@ mod tests {
                 other => panic!("expected an output mismatch, got {other:?}"),
             }
             assert_eq!(st.java.runs().len(), 1);
+        }
+
+        /// A stored (uncompressed) zip, so a byte of `body` can be flipped.
+        fn stored_zip(path: &Path, body: &[u8]) {
+            use std::io::Write;
+            let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("a/B.class", opts).unwrap();
+            w.write_all(body).unwrap();
+            w.finish().unwrap();
+        }
+
+        /// The declared SHA-1s were made with classic zlib; a Java on a
+        /// system zlib-ng (Fedora 40+) deflates the same entries to other
+        /// bytes. An intact archive is accepted; a damaged one is not.
+        #[tokio::test]
+        async fn intact_zip_output_with_other_deflate_bytes_is_accepted() {
+            let st = setup(&[
+                ("OUT", "$ROOT/libraries/x/o/1/o-1.jar"),
+                ("OUT_SHA", &sha1_hex(b"bytes from classic zlib")),
+            ])
+            .await;
+            let p = |src: &Path| {
+                procs(json!([
+                    {"jar": "x:first:1", "args": ["--copy-out", s(src), "{OUT}"],
+                     "outputs": {"{OUT}": "{OUT_SHA}"}}
+                ]))
+            };
+            let good = st.env.root.join("good.jar");
+            write_zip(&good, &[("a/B.class", b"class bytes"), ("c.txt", b"text")]);
+            st.run(&p(&good)).await.unwrap();
+            let out = PathBuf::from(&st.env.data["OUT"]);
+            assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&good).unwrap());
+
+            // Entry data that fails its CRC-32.
+            let bad = st.env.root.join("bad.jar");
+            stored_zip(&bad, b"class bytes");
+            let mut bytes = std::fs::read(&bad).unwrap();
+            let at = bytes.windows(11).position(|w| w == b"class bytes").unwrap();
+            bytes[at] ^= 0xff;
+            std::fs::write(&bad, bytes).unwrap();
+            // A truncated archive, and an empty one.
+            let cut = st.env.root.join("cut.jar");
+            let whole = std::fs::read(&good).unwrap();
+            std::fs::write(&cut, &whole[..whole.len() / 2]).unwrap();
+            let empty = st.env.root.join("empty.jar");
+            write_zip(&empty, &[]);
+            for src in [&bad, &cut, &empty] {
+                match st.run(&p(src)).await {
+                    Err(LoaderError::ProcessorOutputMismatch { path }) => {
+                        assert_eq!(path, st.env.data["OUT"])
+                    }
+                    other => panic!("{}: expected a mismatch, got {other:?}", src.display()),
+                }
+            }
         }
 
         #[tokio::test]

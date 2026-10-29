@@ -4,101 +4,21 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use patina_core::config::{GlobalConfig, SourceChoice};
 use patina_core::download::{Mirror, PROBE_URL, Progress, SPEEDTEST_TIMEOUT, fastest, measure_all};
 use patina_core::instance::{InstanceStore, effective_java};
 use patina_core::java::{ManagedRuntimes, detect_all};
 use patina_core::launch::{GameProcess, LogLine, dev_offline_account};
+use patina_core::loader::list::{LoaderError, VersionPick, list_versions};
+use patina_core::loader::ops::{OpOutcome, install_loader, remove_loader, set_mc_version};
+use patina_core::loader::{InstallPhase, InstallProgress, LoaderKind};
 use patina_core::paths::DataDirs;
 use patina_core::prepare::{Launcher, http_client, resolve_mirror};
+use patina_dev::cli::{
+    Cli, Cmd, InstanceCmd, JavaCmd, LoaderCmd, LoaderSpec, SourceCmd, parse_pick,
+};
 use tokio::sync::mpsc;
-
-#[derive(Parser)]
-#[command(name = "patina-dev", version, about = "Patina development CLI")]
-struct Cli {
-    /// Data directory (overrides PATINA_DATA_DIR and the default location)
-    #[arg(long, global = true, value_name = "PATH")]
-    data_dir: Option<PathBuf>,
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Manage instances
-    Instance {
-        #[command(subcommand)]
-        cmd: InstanceCmd,
-    },
-    /// Manage Java installations
-    Java {
-        #[command(subcommand)]
-        cmd: JavaCmd,
-    },
-    /// Download source
-    Source {
-        #[command(subcommand)]
-        cmd: SourceCmd,
-    },
-    /// Launch an instance
-    Launch {
-        /// Instance ID (directory name)
-        id: String,
-        /// Offline player name (development only)
-        #[arg(long, value_name = "PLAYER")]
-        offline: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum InstanceCmd {
-    /// List instances
-    List,
-    /// Create an instance
-    Create {
-        name: String,
-        /// Version id, or `latest` for the latest release
-        version: String,
-    },
-    /// Delete an instance
-    Delete { id: String },
-}
-
-#[derive(Subcommand)]
-enum JavaCmd {
-    /// List detected Java installations and managed runtimes
-    List,
-    /// Remove a managed runtime
-    Remove { component: String },
-}
-
-#[derive(Subcommand)]
-enum SourceCmd {
-    /// Show the current download source
-    Show,
-    /// Set the preferred download source (the other one is still the fallback)
-    Set { source: SourceArg },
-    /// Measure the built-in mirrors and store the fastest for auto mode
-    Speedtest,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum SourceArg {
-    Auto,
-    Official,
-    Bmclapi,
-}
-
-impl From<SourceArg> for SourceChoice {
-    fn from(s: SourceArg) -> Self {
-        match s {
-            SourceArg::Auto => SourceChoice::Auto,
-            SourceArg::Official => SourceChoice::Official,
-            SourceArg::Bmclapi => SourceChoice::Bmclapi,
-        }
-    }
-}
 
 struct Ctx {
     data: DataDirs,
@@ -167,16 +87,24 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
                     .config
                     .last_played
                     .map_or("never".to_string(), |t| t.to_string());
+                let loader = i.config.loader().map_or("vanilla".to_string(), |(k, c)| {
+                    format!("{}@{}", kind_name(k), c.version)
+                });
                 println!(
-                    "{:<20} {:<20} {:<10} last played: {}",
+                    "{:<20} {:<20} {:<10} {:<28} last played: {}",
                     i.id,
                     i.config.name,
                     i.config.mc_version(),
+                    loader,
                     played
                 );
             }
         }
-        InstanceCmd::Create { name, version } => {
+        InstanceCmd::Create {
+            name,
+            version,
+            loader,
+        } => {
             let launcher = ctx.launcher().await?;
             let manifest = launcher.manifest().await?;
             let version = if version == "latest" {
@@ -187,18 +115,241 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
             if manifest.find(&version).is_none() {
                 bail!("version {version} is not in the version manifest");
             }
-            let inst = ctx.store().create(&name, &version)?;
+            let store = ctx.store();
+            let inst = store.create(&name, &version)?;
             println!(
                 "Created instance {:?} (ID: {:?}, version {version})",
                 name, inst.id
             );
+            if let Some(LoaderSpec { kind, pick }) = loader {
+                let result = run_install(&launcher, &store, &inst.id, kind, pick, false).await;
+                if let Err(e) = result {
+                    // Leave nothing half-made behind: the same command can be re-run.
+                    store.delete(&inst.id)?;
+                    println!("Deleted instance {:?} again", inst.id);
+                    return Err(e);
+                }
+            }
         }
         InstanceCmd::Delete { id } => {
             ctx.store().delete(&id)?;
             println!("Deleted instance {id:?}");
         }
+        InstanceCmd::Loader { cmd } => loader(ctx, cmd).await?,
+        InstanceCmd::SetVersion {
+            id,
+            mc_version,
+            loader_action,
+        } => {
+            let launcher = ctx.launcher().await?;
+            let store = ctx.store();
+            let start = Instant::now();
+            let (tx, printer) = install_printer(start);
+            let result = set_mc_version(
+                &launcher,
+                &store,
+                &id,
+                &mc_version,
+                loader_action.map(Into::into),
+                Some(tx),
+            )
+            .await;
+            let _ = printer.await;
+            let outcome = loader_result(result)?;
+            println!(
+                "Instance {id:?} is now Minecraft {} with {} ({:.1}s; {} download(s) fell back to another source)",
+                outcome.instance.config.mc_version(),
+                loader_label(&outcome),
+                start.elapsed().as_secs_f64(),
+                launcher.downloader.fallback_count()
+            );
+            print_notices(&outcome);
+        }
     }
     Ok(())
+}
+
+async fn loader(ctx: &mut Ctx, cmd: LoaderCmd) -> Result<()> {
+    match cmd {
+        LoaderCmd::List { id, kind } => {
+            let kind: LoaderKind = kind.into();
+            let inst = ctx.store().load(&id)?;
+            let mc = inst.config.mc_version().to_string();
+            let launcher = ctx.launcher().await?;
+            let list = loader_result(list_versions(&launcher.downloader, kind, &mc).await)?;
+            println!("{} versions for Minecraft {mc}:", kind_name(kind));
+            for v in list {
+                let mut tags = Vec::new();
+                if v.recommended {
+                    tags.push("[recommended]");
+                }
+                if v.latest {
+                    tags.push("[latest]");
+                }
+                if !v.stable {
+                    tags.push("[beta]");
+                }
+                if tags.is_empty() {
+                    println!("{}", v.version);
+                } else {
+                    println!("{} {}", v.version, tags.join(" "));
+                }
+            }
+        }
+        LoaderCmd::Install {
+            id,
+            kind,
+            version,
+            replace,
+        } => {
+            let pick = match version {
+                Some(v) => parse_pick(&v).map_err(anyhow::Error::msg)?,
+                None => VersionPick::Recommended,
+            };
+            let launcher = ctx.launcher().await?;
+            run_install(&launcher, &ctx.store(), &id, kind.into(), pick, replace).await?;
+        }
+        LoaderCmd::Remove { id } => {
+            let outcome = loader_result(remove_loader(&ctx.store(), &id))?;
+            println!(
+                "Instance {id:?} is now Minecraft {} with {}",
+                outcome.instance.config.mc_version(),
+                loader_label(&outcome)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Installs a loader into an existing instance, printing progress, timing,
+/// the fallback count and any notices.
+async fn run_install(
+    launcher: &Launcher,
+    store: &InstanceStore,
+    id: &str,
+    kind: LoaderKind,
+    pick: VersionPick,
+    replace: bool,
+) -> Result<()> {
+    println!("Installing {} ({pick:?}) into {id:?}", kind_name(kind));
+    let start = Instant::now();
+    let (tx, printer) = install_printer(start);
+    let result = install_loader(launcher, store, id, kind, pick, replace, Some(tx)).await;
+    let _ = printer.await;
+    if let Err(LoaderError::Conflict { .. }) = &result {
+        println!("Pass --replace to replace the existing loader.");
+    }
+    let outcome = loader_result(result)?;
+    println!(
+        "Installed {} into {id:?} in {:.1}s; {} download(s) fell back to another source",
+        loader_label(&outcome),
+        start.elapsed().as_secs_f64(),
+        launcher.downloader.fallback_count()
+    );
+    print_notices(&outcome);
+    Ok(())
+}
+
+/// Turns a core loader error into an anyhow error that keeps its Debug
+/// details (processor stderr tails, causes) for the developer.
+fn loader_result<T>(r: Result<T, LoaderError>) -> Result<T> {
+    r.map_err(|e| {
+        let details = format!("{e:?}");
+        anyhow::anyhow!("{e}\n\nDetails: {details}")
+    })
+}
+
+fn kind_name(kind: LoaderKind) -> &'static str {
+    match kind {
+        LoaderKind::Forge => "forge",
+        LoaderKind::Neoforge => "neoforge",
+        LoaderKind::Fabric => "fabric",
+    }
+}
+
+fn loader_label(outcome: &OpOutcome) -> String {
+    match outcome.instance.config.loader() {
+        Some((k, c)) => format!(
+            "{} {} (profile {})",
+            kind_name(k),
+            c.version,
+            c.profile.as_deref().unwrap_or("-")
+        ),
+        None => "no loader".to_string(),
+    }
+}
+
+fn print_notices(outcome: &OpOutcome) {
+    for n in &outcome.notices {
+        println!("Notice ({n:?}): {n}");
+    }
+}
+
+fn phase_name(p: InstallPhase) -> &'static str {
+    match p {
+        InstallPhase::FetchMetadata => "fetch-metadata",
+        InstallPhase::DownloadInstaller => "download-installer",
+        InstallPhase::DownloadLibraries => "download-libraries",
+        InstallPhase::RunProcessor => "run-processor",
+        InstallPhase::Finalize => "finalize",
+    }
+}
+
+/// A progress sink plus the task printing it as one `[phase] done/total`
+/// line, refreshed with `\r` every 200 ms; it ends when the sender is dropped.
+fn install_printer(
+    start: Instant,
+) -> (
+    mpsc::UnboundedSender<InstallProgress>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (tx, tokio::spawn(print_install_progress(rx, start)))
+}
+
+async fn print_install_progress(mut rx: mpsc::UnboundedReceiver<InstallProgress>, start: Instant) {
+    use std::io::Write;
+    let mut current: Option<InstallProgress> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let render = |p: &InstallProgress, newline: bool| {
+        let line = format!(
+            "[{}] {}/{} ({:.1}s)",
+            phase_name(p.phase),
+            p.done,
+            p.total,
+            start.elapsed().as_secs_f64()
+        );
+        if newline {
+            println!("\r{line:<60}");
+        } else {
+            print!("\r{line:<60}");
+            let _ = std::io::stdout().flush();
+        }
+    };
+    loop {
+        tokio::select! {
+            p = rx.recv() => match p {
+                Some(p) => {
+                    // A finished phase keeps its own line.
+                    if let Some(c) = current
+                        && c.phase != p.phase
+                    {
+                        render(&c, true);
+                    }
+                    current = Some(p);
+                }
+                None => break,
+            },
+            _ = tick.tick() => {
+                if let Some(c) = &current {
+                    render(c, false);
+                }
+            }
+        }
+    }
+    if let Some(c) = &current {
+        render(c, true);
+    }
 }
 
 fn java(ctx: &Ctx, cmd: JavaCmd) -> Result<()> {

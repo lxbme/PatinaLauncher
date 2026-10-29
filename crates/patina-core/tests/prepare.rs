@@ -451,10 +451,62 @@ async fn prepare_merges_fabric_profile() {
     let brig: Vec<_> = cp.iter().filter(|p| p.contains("brigadier")).collect();
     assert_eq!(brig.len(), 1, "{cp:?}");
     assert!(brig[0].ends_with("brigadier-9.9.9.jar"));
-    assert!(cp.last().unwrap().ends_with("versions/26.3/26.3.jar"));
+    // Like the official launcher, a loader launches on a copy of the
+    // vanilla jar named after its profile.
+    let jar = format!("versions/{PROFILE_ID}/{PROFILE_ID}.jar");
+    assert!(cp.last().unwrap().ends_with(&jar), "{cp:?}");
     let v = args.iter().position(|a| a == "--version").unwrap();
     assert_eq!(args[v + 1], PROFILE_ID);
     assert!(s.data.join("versions/26.3/26.3.jar").is_file());
+    assert_eq!(
+        std::fs::read(s.data.join(&jar)).unwrap(),
+        b"client jar bytes"
+    );
+}
+
+/// NeoForge and Forge 1.17+ keep the client jar out of the module layer with
+/// `-DignoreList=...,${version_name}.jar`, matched against the classpath
+/// file names: with the jar at `versions/<mc>/<mc>.jar` the game fails with
+/// "Modules _1._21._1 and minecraft export package net.minecraft.server".
+#[tokio::test]
+async fn loader_client_jar_matches_ignore_list() {
+    let fake = fake_mojang(8).await;
+    let s = setup();
+    let l = launcher(&fake.server, &s.data);
+    let id = "neoforge-21.1.265";
+    write_profile(
+        &s.data,
+        id,
+        &json!({
+            "id": id, "inheritsFrom": "26.3", "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "arguments": { "game": [], "jvm": [
+                "-DignoreList=client-extra,${version_name}.jar",
+                "-DlibraryDirectory=${library_directory}"
+            ] },
+            "libraries": []
+        }),
+    );
+    std::fs::write(s.data.join("versions").join(id).join(GENERATED_FILE), "[]").unwrap();
+    let inst = loader_instance(&l, ComponentUid::Neoforge, Some(id));
+    let prepared = l.prepare(&inst, &s.global, &account(), None).await.unwrap();
+    let args = &prepared.command.args;
+    let ignore = args
+        .iter()
+        .find_map(|a| a.strip_prefix("-DignoreList="))
+        .unwrap();
+    let cp = classpath(args);
+    let client = Path::new(cp.last().unwrap());
+    let name = client.file_name().unwrap().to_str().unwrap();
+    assert!(
+        ignore.split(',').any(|i| name.starts_with(i)) && name == format!("{id}.jar"),
+        "{ignore} vs {cp:?}"
+    );
+    assert_eq!(std::fs::read(client).unwrap(), b"client jar bytes");
+
+    // A damaged copy is replaced from the verified vanilla jar.
+    std::fs::write(client, b"damaged").unwrap();
+    l.prepare(&inst, &s.global, &account(), None).await.unwrap();
+    assert_eq!(std::fs::read(client).unwrap(), b"client jar bytes");
 }
 
 #[tokio::test]

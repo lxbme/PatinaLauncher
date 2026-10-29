@@ -50,19 +50,15 @@ pub fn resolve_libraries(
                     out.classpath.push(dest);
                 }
             }
+            // An old-style natives library has no plain jar, only the
+            // classifier jar `resolve_old_native` handled.
+            None if lib.natives.is_some() => {}
             None => {
-                let Some(rel) = maven_path(&lib.name) else {
+                let Some((rel, dest)) = maven_dest(&lib.name, libraries_dir) else {
                     continue;
                 };
-                let Some(dest) = safe_join(libraries_dir, &rel) else {
-                    continue;
-                };
-                let mut base = lib.url.as_deref().unwrap_or(LIBRARIES_URL).to_string();
-                if !base.ends_with('/') {
-                    base.push('/');
-                }
                 out.jobs.push(DownloadJob {
-                    url: canonical_url(&format!("{base}{rel}")),
+                    url: maven_url(lib, &rel),
                     dest: dest.clone(),
                     sha1: lib.sha1.clone(),
                     size: lib.size,
@@ -79,6 +75,22 @@ pub fn resolve_libraries(
 fn artifact_dest(file: &FileRef, name: &str, libraries_dir: &Path) -> Option<PathBuf> {
     let rel = file.path.clone().or_else(|| maven_path(name))?;
     safe_join(libraries_dir, &rel)
+}
+
+/// Maven path of coordinate `name` and its destination under `libraries_dir`.
+fn maven_dest(name: &str, libraries_dir: &Path) -> Option<(String, PathBuf)> {
+    let rel = maven_path(name)?;
+    let dest = safe_join(libraries_dir, &rel)?;
+    Some((rel, dest))
+}
+
+/// `rel` under the library's own maven base (`url`), else Mojang's.
+fn maven_url(lib: &Library, rel: &str) -> String {
+    let mut base = lib.url.as_deref().unwrap_or(LIBRARIES_URL).to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    canonical_url(&format!("{base}{rel}"))
 }
 
 fn job_from(file: &FileRef, dest: PathBuf) -> DownloadJob {
@@ -102,17 +114,36 @@ fn resolve_old_native(
     };
     let bits = if env.arch == "x86" { "32" } else { "64" };
     let classifier = template.replace("${arch}", bits);
-    let Some(file) = lib
-        .downloads
-        .as_ref()
-        .and_then(|d| d.classifiers.get(&classifier))
-    else {
-        return;
+    let (job, dest) = match &lib.downloads {
+        Some(downloads) => {
+            let Some(file) = downloads.classifiers.get(&classifier) else {
+                return;
+            };
+            let Some(dest) = artifact_dest(file, &lib.name, libraries_dir) else {
+                return;
+            };
+            (job_from(file, dest.clone()), dest)
+        }
+        // Old-style entry (e.g. Forge 1.6.4's `versionInfo`): the classifier
+        // jar sits next to the library at its maven base.
+        // TODO(forge-1.6/1.7.2): these entries also shadow vanilla's lwjgl
+        // natives by group:artifact; launching stays best effort.
+        None => {
+            let Some((rel, dest)) =
+                maven_dest(&format!("{}:{classifier}", lib.name), libraries_dir)
+            else {
+                return;
+            };
+            let job = DownloadJob {
+                url: maven_url(lib, &rel),
+                dest: dest.clone(),
+                sha1: None,
+                size: None,
+            };
+            (job, dest)
+        }
     };
-    let Some(dest) = artifact_dest(file, &lib.name, libraries_dir) else {
-        return;
-    };
-    out.jobs.push(job_from(file, dest.clone()));
+    out.jobs.push(job);
     out.natives.push(NativeJar {
         path: dest,
         exclude: lib
@@ -302,6 +333,50 @@ mod tests {
         assert_eq!(r.classpath, vec![p.clone()]);
         assert_eq!(r.generated, vec![p]);
         assert!(r.jobs.is_empty());
+    }
+
+    /// Old-style natives libraries (no `downloads`, as in Forge 1.6.4's
+    /// `versionInfo`) have no plain jar: only `<name>-<classifier>.jar`
+    /// exists, at the library's maven base.
+    #[test]
+    fn natives_library_without_downloads_fetches_only_the_classifier() {
+        let l = libs(
+            r#"[{"name":"org.lwjgl.lwjgl:lwjgl-platform:2.9.0","natives":{"linux":"natives-linux","windows":"natives-windows-${arch}"},"extract":{"exclude":["META-INF/"]}},
+            {"name":"net.java.jinput:jinput-platform:2.0.5","url":"https://example.net/m","natives":{"linux":"natives-linux"}},
+            {"name":"org.lwjgl.lwjgl:lwjgl:2.9.0"}]"#,
+        );
+        let r = resolve_libraries(&l, &linux(), Path::new("/L"));
+        let urls: Vec<&str> = r.jobs.iter().map(|j| j.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://libraries.minecraft.net/org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-linux.jar",
+                "https://example.net/m/net/java/jinput/jinput-platform/2.0.5/jinput-platform-2.0.5-natives-linux.jar",
+                "https://libraries.minecraft.net/org/lwjgl/lwjgl/lwjgl/2.9.0/lwjgl-2.9.0.jar",
+            ]
+        );
+        assert_eq!(
+            r.natives,
+            vec![
+                NativeJar {
+                    path: Path::new("/L/org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-linux.jar").into(),
+                    exclude: vec!["META-INF/".into()],
+                },
+                NativeJar {
+                    path: Path::new("/L/net/java/jinput/jinput-platform/2.0.5/jinput-platform-2.0.5-natives-linux.jar").into(),
+                    exclude: vec![],
+                },
+            ]
+        );
+        assert_eq!(
+            r.classpath,
+            vec![Path::new("/L/org/lwjgl/lwjgl/lwjgl/2.9.0/lwjgl-2.9.0.jar").to_path_buf()]
+        );
+        // No classifier for this OS: nothing at all.
+        let mut env = linux();
+        env.os_name = "freebsd".into();
+        let r = resolve_libraries(&l[..1], &env, Path::new("/L"));
+        assert!(r.jobs.is_empty() && r.natives.is_empty() && r.classpath.is_empty());
     }
 
     #[test]

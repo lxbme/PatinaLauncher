@@ -432,7 +432,18 @@ impl Launcher {
             _ => None,
         };
         self.downloader.run(jobs, progress).await?;
-        let client_jar = self.client_jar_job(jar_id, &version)?.dest;
+        let vanilla_jar = self.client_jar_job(jar_id, &version)?.dest;
+        let client_jar = if inst.config.loader().is_some() {
+            let (versions, id) = (data.versions(), version.id.clone());
+            let sha1 = version.downloads.client.sha1.clone();
+            tokio::task::spawn_blocking(move || {
+                loader_client_jar(&vanilla_jar, &versions, &id, &sha1)
+            })
+            .await
+            .map_err(io::Error::other)??
+        } else {
+            vanilla_jar
+        };
 
         // 6. Natives, legacy asset layout, game directory.
         extract_natives(&libs.natives, &natives_dir)?;
@@ -461,6 +472,26 @@ impl Launcher {
         });
         Ok(Prepared { command, warnings })
     }
+}
+
+/// The client jar a loader profile `id` launches on: a copy of the verified
+/// vanilla jar at `versions/<id>/<id>.jar`, as the official launcher makes.
+/// NeoForge and Forge 1.17+ rely on that name: `-DignoreList=...,${version_name}.jar`
+/// keeps the classpath entry with that file name out of the module layer,
+/// and a jar named after the Minecraft version would clash with the
+/// patched `minecraft` module. A copy whose SHA-1 differs is replaced.
+/// `id` must already be a safe name.
+fn loader_client_jar(vanilla: &Path, versions: &Path, id: &str, sha1: &str) -> io::Result<PathBuf> {
+    let dir = versions.join(id);
+    let dest = dir.join(format!("{id}.jar"));
+    if sha1_file(&dest).is_ok_and(|h| h.eq_ignore_ascii_case(sha1)) {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{id}.jar.tmp"));
+    std::fs::copy(vanilla, &tmp)?;
+    std::fs::rename(&tmp, &dest)?;
+    Ok(dest)
 }
 
 /// Whether a loader profile's JVM arguments use `${library_directory}`.

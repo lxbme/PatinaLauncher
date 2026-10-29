@@ -1,0 +1,3 @@
+//! `patina-dev` internals shared by the binary and its tests.
+
+pub mod cli;
