@@ -10,6 +10,12 @@ errors:
     not_found: "找不到实例：%{id}"
     invalid_id: "无效的实例 ID：%{id}"
     invalid_config: "实例配置无效：%{reason}"
+    invalid_icon: "图标无效：%{reason}"
+    icon_reason:
+      too_large: "图标文件超过 8 MiB"
+      format: "仅支持 PNG、JPEG 和 WebP 图片"
+      decode: "无法解码该图片"
+      encode: "无法将图片保存为图标"
     config_reason:
       no_minecraft: "第一个组件必须是 minecraft"
       multiple_loaders: "最多只能有一个加载器组件"
@@ -17,6 +23,7 @@ errors:
       empty_version: "Minecraft 版本不能为空"
       duplicate_minecraft: "只能有一个 minecraft 组件"
       not_a_loader: "该组件不是模组加载器"
+      bad_icon_name: "图标名称不是有效的文件名"
   loader:
     no_versions: "Minecraft %{mc} 没有可用的 %{kind} 版本"
     version_not_found: "%{kind} 版本 %{version} 不存在"

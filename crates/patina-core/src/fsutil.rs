@@ -3,6 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// `rel` is a non-empty relative path made only of normal components: no
 /// root, no `.` or `..`, no empty segment, no backslash.
@@ -102,6 +103,154 @@ fn replace_via(
 /// Writes `data` to a unique temp file next to `path`, then renames.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     replace_atomic(path, |tmp| std::fs::write(tmp, data))
+}
+
+/// Deletes stale temp files under `root` (recursively, never following
+/// symlinks) and returns how many were removed. A file qualifies when its
+/// name has exactly the shape [`unique_sibling`] produces
+/// (`<name>.<pid>.<n>.tmp`, or `<name>.<pid>.<n>[.pack.xz|.pack|.unpacked].part`),
+/// its `<pid>` is neither this process nor a live process, and it was last
+/// modified more than `older_than` ago.
+///
+/// `root` must be a directory Patina owns: any file of that shape below it is
+/// deleted, so never pass a game directory or anything holding user files
+/// (see [`sweep_owned_temps`]). A missing `root` yields `Ok(0)`; an
+/// unreadable `root` is an error; problems with deeper entries are skipped.
+pub fn sweep_stale_temps(root: &Path, older_than: Duration) -> std::io::Result<usize> {
+    let mut sw = Sweeper::new(older_than);
+    sw.dir(root, true, true)?;
+    Ok(sw.removed)
+}
+
+/// Sweeps only the places in a Patina data directory where Patina writes temp
+/// files: `versions/`, `libraries/`, `assets/` and `runtimes/` recursively,
+/// and the top level of each `instances/<id>/` (never `minecraft/` or any
+/// other subdirectory, which hold user game files). Missing directories are
+/// skipped.
+pub fn sweep_owned_temps(data_dir: &Path, min_age: Duration) -> std::io::Result<usize> {
+    let mut sw = Sweeper::new(min_age);
+    for name in ["versions", "libraries", "assets", "runtimes"] {
+        sw.dir(&data_dir.join(name), true, true)?;
+    }
+    let instances = data_dir.join("instances");
+    let entries = match std::fs::read_dir(&instances) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(sw.removed),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            sw.dir(&entry.path(), false, false)?;
+        }
+    }
+    Ok(sw.removed)
+}
+
+struct Sweeper {
+    older_than: Duration,
+    sys: Option<sysinfo::System>,
+    removed: usize,
+}
+
+impl Sweeper {
+    fn new(older_than: Duration) -> Self {
+        Self {
+            older_than,
+            sys: None,
+            removed: 0,
+        }
+    }
+
+    /// Sweeps `dir`. With `strict`, an unreadable `dir` (other than missing)
+    /// is an error; otherwise it is skipped.
+    fn dir(&mut self, dir: &Path, recurse: bool, strict: bool) -> std::io::Result<()> {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if strict => return Err(e),
+            Err(e) => {
+                tracing::debug!("temp sweep skipped {}: {e}", dir.display());
+                return Ok(());
+            }
+        };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                if recurse {
+                    self.dir(&path, true, false)?;
+                }
+                continue;
+            }
+            let Some(pid) = entry.file_name().to_str().and_then(temp_pid) else {
+                continue;
+            };
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > self.older_than);
+            if !old || self.pid_alive(pid) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => self.removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("could not remove stale temp {}: {e}", path.display()),
+            }
+        }
+        Ok(())
+    }
+
+    fn pid_alive(&mut self, pid: u32) -> bool {
+        if pid == std::process::id() {
+            return true;
+        }
+        if self.sys.is_none() {
+            match sysinfo::System::new() {
+                Ok(mut s) => {
+                    s.refresh_processes_specifics(
+                        sysinfo::ProcessesToUpdate::All,
+                        true,
+                        sysinfo::ProcessRefreshKind::nothing(),
+                    );
+                    self.sys = Some(s);
+                }
+                Err(e) => {
+                    // Cannot tell: assume alive so nothing is deleted.
+                    tracing::warn!("cannot list processes, keeping temp files: {e}");
+                    return true;
+                }
+            }
+        }
+        match &self.sys {
+            Some(sys) => sys.process(sysinfo::Pid::from_u32(pid)).is_some(),
+            None => true,
+        }
+    }
+}
+
+/// The `<pid>` of a file name shaped like a Patina temp file, if it is one.
+fn temp_pid(name: &str) -> Option<u32> {
+    let (stem, rests): (&str, &[&str]) = if let Some(s) = name.strip_suffix(TMP_SUFFIX) {
+        (s, &[""])
+    } else {
+        let s = name.strip_suffix(PART_SUFFIX)?;
+        (s, &["", ".pack.xz", ".pack", ".unpacked"])
+    };
+    rests.iter().find_map(|rest| {
+        let s = stem.strip_suffix(rest)?;
+        let (s, counter) = s.rsplit_once('.')?;
+        let (base, pid) = s.rsplit_once('.')?;
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        (!base.is_empty() && digits(counter) && digits(pid))
+            .then(|| pid.parse().ok())
+            .flatten()
+    })
 }
 
 #[cfg(test)]
@@ -256,5 +405,133 @@ mod tests {
         assert!(!is_safe_name(".."));
         assert!(!is_safe_name(""));
         assert!(!is_safe_name("/abs"));
+    }
+    fn dead_pid() -> u32 {
+        // Above any Linux pid_max (4194304), so never a live process.
+        4_000_000_000
+    }
+
+    fn age(path: &Path, secs: u64) {
+        let t = std::time::SystemTime::now() - Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn sweep_removes_only_old_temps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("sub/deep")).unwrap();
+        let dead = dead_pid();
+        let me = std::process::id();
+        let stale = [
+            format!("a.json.{dead}.0.tmp"),
+            format!("sub/lib.jar.{dead}.7.part"),
+            format!("sub/deep/f.{dead}.1.pack.xz.part"),
+            format!("sub/deep/f.{dead}.2.pack.part"),
+            format!("f.{dead}.3.unpacked.part"),
+        ];
+        let kept = [
+            "plain.txt".to_string(),
+            "real.part".to_string(),
+            "real.tmp".to_string(),
+            format!("x.{dead}.tmp"),
+            format!("x.{dead}.a.tmp"),
+            format!(".{dead}.1.tmp"),
+            format!("mine.{me}.1.tmp"),
+            format!("fresh.{dead}.9.tmp"),
+            format!("fresh.{dead}.9.part"),
+        ];
+        for n in stale.iter().chain(kept.iter()) {
+            std::fs::write(d.join(n), b"x").unwrap();
+        }
+        for n in stale
+            .iter()
+            .chain(kept.iter().filter(|n| !n.starts_with("fresh")))
+        {
+            age(&d.join(n), 3600);
+        }
+        let n = sweep_stale_temps(d, Duration::from_secs(60)).unwrap();
+        assert_eq!(n, stale.len());
+        for s in &stale {
+            assert!(!d.join(s).exists(), "{s}");
+        }
+        for k in &kept {
+            assert!(d.join(k).exists(), "{k}");
+        }
+    }
+
+    #[test]
+    fn sweep_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join(format!("v.{}.0.tmp", dead_pid()));
+        std::fs::write(&victim, b"x").unwrap();
+        age(&victim, 3600);
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(format!("l.{}.1.tmp", dead_pid()))).unwrap();
+        assert_eq!(
+            sweep_stale_temps(&root, Duration::from_secs(60)).unwrap(),
+            0
+        );
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn sweep_keeps_files_of_live_other_processes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = std::os::unix::process::parent_id();
+        let f = tmp.path().join(format!("live.{parent}.1.tmp"));
+        std::fs::write(&f, b"x").unwrap();
+        age(&f, 3600);
+        assert_eq!(
+            sweep_stale_temps(tmp.path(), Duration::from_secs(60)).unwrap(),
+            0
+        );
+        assert!(f.exists());
+    }
+
+    #[test]
+    fn sweep_missing_root_is_ok_and_file_root_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let none = sweep_stale_temps(&tmp.path().join("nope"), Duration::ZERO);
+        assert_eq!(none.unwrap(), 0);
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(sweep_stale_temps(&file, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn owned_sweep_never_enters_game_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let name = format!("t.{}.1.tmp", dead_pid());
+        let removed = ["versions/1.20", "instances/x", "libraries/a/b"];
+        let kept = ["instances/x/minecraft/mods", "instances/x/natives", "other"];
+        for dir in removed.iter().chain(kept.iter()) {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+            let f = d.join(dir).join(&name);
+            std::fs::write(&f, b"x").unwrap();
+            age(&f, 3600);
+        }
+        // assets/ and runtimes/ are absent: skipped.
+        let n = sweep_owned_temps(d, Duration::from_secs(60)).unwrap();
+        assert_eq!(n, removed.len());
+        for dir in removed {
+            assert!(!d.join(dir).join(&name).exists(), "{dir}");
+        }
+        for dir in kept {
+            assert!(d.join(dir).join(&name).exists(), "{dir}");
+        }
+        assert_eq!(
+            sweep_owned_temps(&d.join("nope"), Duration::ZERO).unwrap(),
+            0
+        );
     }
 }

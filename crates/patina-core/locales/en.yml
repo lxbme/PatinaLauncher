@@ -10,6 +10,12 @@ errors:
     not_found: "Instance not found: %{id}"
     invalid_id: "Invalid instance ID: %{id}"
     invalid_config: "Invalid instance config: %{reason}"
+    invalid_icon: "Invalid icon: %{reason}"
+    icon_reason:
+      too_large: "the icon file is larger than 8 MiB"
+      format: "only PNG, JPEG and WebP images are supported"
+      decode: "the image could not be decoded"
+      encode: "the image could not be saved as an icon"
     config_reason:
       no_minecraft: "the first component must be minecraft"
       multiple_loaders: "at most one loader component is allowed"
@@ -17,6 +23,7 @@ errors:
       empty_version: "the Minecraft version must not be empty"
       duplicate_minecraft: "only one minecraft component is allowed"
       not_a_loader: "the component is not a mod loader"
+      bad_icon_name: "the icon name is not a valid file name"
   loader:
     no_versions: "No %{kind} versions are available for Minecraft %{mc}"
     version_not_found: "%{kind} version %{version} does not exist"

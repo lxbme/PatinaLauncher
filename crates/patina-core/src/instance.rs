@@ -1,13 +1,13 @@
 //! Instance storage: one directory per instance with `instance.toml`.
 
 use crate::config::JavaSettings;
-use crate::fsutil::write_atomic;
+use crate::fsutil::{is_safe_name, write_atomic};
 use crate::loader::LoaderKind;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum InstanceError {
     #[error("{}", rust_i18n::t!("errors.instance.io", error = .0))]
     Io(String),
@@ -21,6 +21,8 @@ pub enum InstanceError {
     InvalidId(String),
     #[error("{}", rust_i18n::t!("errors.instance.invalid_config", reason = .0))]
     InvalidConfig(String),
+    #[error("{}", rust_i18n::t!("errors.instance.invalid_icon", reason = .0))]
+    InvalidIcon(String),
 }
 
 impl From<std::io::Error> for InstanceError {
@@ -38,6 +40,34 @@ impl From<toml::de::Error> for InstanceError {
 impl From<toml::ser::Error> for InstanceError {
     fn from(e: toml::ser::Error) -> Self {
         InstanceError::Serialize(e.to_string())
+    }
+}
+
+/// Instance icon. Serialized as `"builtin:<name>"` or `"custom"` (the image
+/// is `icon.png` in the instance directory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceIcon {
+    Builtin(String),
+    Custom,
+}
+
+impl Serialize for InstanceIcon {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            InstanceIcon::Builtin(n) => s.serialize_str(&format!("builtin:{n}")),
+            InstanceIcon::Custom => s.serialize_str("custom"),
+        }
+    }
+}
+
+impl InstanceIcon {
+    /// Parses the on-disk form; `None` for anything unknown or unsafe.
+    fn parse(text: &str) -> Option<Self> {
+        if text == "custom" {
+            return Some(InstanceIcon::Custom);
+        }
+        let name = text.strip_prefix("builtin:")?;
+        is_safe_name(name).then(|| InstanceIcon::Builtin(name.to_string()))
     }
 }
 
@@ -91,6 +121,8 @@ struct RawConfig {
     java_override: Option<JavaSettings>,
     created_at: u64,
     last_played: Option<u64>,
+    /// Cosmetic: an unparseable value is dropped on load, not an error.
+    icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -104,6 +136,7 @@ pub struct InstanceConfig {
     pub created_at: u64,
     /// Unix seconds.
     pub last_played: Option<u64>,
+    pub icon: Option<InstanceIcon>,
 }
 
 impl InstanceConfig {
@@ -118,6 +151,13 @@ impl InstanceConfig {
             java_override: raw.java_override,
             created_at: raw.created_at,
             last_played: raw.last_played,
+            icon: raw.icon.and_then(|text| {
+                let icon = InstanceIcon::parse(&text);
+                if icon.is_none() {
+                    tracing::warn!("ignoring invalid instance icon {text:?}");
+                }
+                icon
+            }),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -125,6 +165,11 @@ impl InstanceConfig {
 
     fn validate(&self) -> Result<(), InstanceError> {
         let bad = |reason: String| Err(InstanceError::InvalidConfig(reason));
+        if let Some(InstanceIcon::Builtin(n)) = &self.icon
+            && !is_safe_name(n)
+        {
+            return bad(rust_i18n::t!("errors.instance.config_reason.bad_icon_name").to_string());
+        }
         match self.components.first() {
             Some(c) if c.uid == ComponentUid::Minecraft => {
                 if c.version.trim().is_empty() {
@@ -215,9 +260,33 @@ impl Instance {
     pub fn natives_dir(&self) -> PathBuf {
         self.dir.join("natives")
     }
+    /// The custom icon file, only when the icon is custom and the file exists.
+    pub fn icon_path(&self) -> Option<PathBuf> {
+        let p = self.dir.join(ICON_FILE);
+        (self.config.icon == Some(InstanceIcon::Custom) && p.is_file()).then_some(p)
+    }
 }
 
 const CONFIG_FILE: &str = "instance.toml";
+const ICON_FILE: &str = "icon.png";
+const ICON_SIZE: u32 = 128;
+const MAX_ICON_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ICON_SOURCE_SIDE: u32 = 8192;
+const MAX_ICON_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// An instance directory whose entry could not be loaded.
+#[derive(Debug, Clone)]
+pub struct BrokenInstance {
+    pub id: String,
+    pub dir: PathBuf,
+    pub error: InstanceError,
+}
+
+#[derive(Debug, Default)]
+pub struct ListOutcome {
+    pub instances: Vec<Instance>,
+    pub broken: Vec<BrokenInstance>,
+}
 
 /// Longest directory name `create` derives from a display name, before any
 /// ` (n)` dedup suffix. Well under the usual 255-byte file name limit.
@@ -306,31 +375,43 @@ impl InstanceStore {
         })
     }
 
-    /// Sorted by `last_played` descending (never played last), then name.
-    pub fn list(&self) -> Result<Vec<Instance>, InstanceError> {
+    /// Instances sorted by `last_played` descending (never played last), then
+    /// name; `broken` sorted by id. Only a failure to read the root itself is
+    /// an error; a bad directory name or config lands in `broken`.
+    pub fn list(&self) -> Result<ListOutcome, InstanceError> {
         let rd = match std::fs::read_dir(&self.root) {
             Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ListOutcome::default());
+            }
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
+        let mut out = ListOutcome::default();
         for entry in rd {
             let entry = entry?;
-            if !entry.path().join(CONFIG_FILE).is_file() {
+            let dir = entry.path();
+            if !dir.join(CONFIG_FILE).is_file() {
                 continue;
             }
-            let Some(id) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
+            let name = entry.file_name();
+            let id = name.to_string_lossy().into_owned();
+            let result = match name.to_str() {
+                Some(_) => self.load(&id),
+                None => Err(InstanceError::InvalidId(id.clone())),
             };
-            out.push(self.read(&id)?);
+            match result {
+                Ok(inst) => out.instances.push(inst),
+                Err(error) => out.broken.push(BrokenInstance { id, dir, error }),
+            }
         }
-        out.sort_by(|a, b| {
+        out.instances.sort_by(|a, b| {
             b.config
                 .last_played
                 .cmp(&a.config.last_played)
                 .then_with(|| a.config.name.cmp(&b.config.name))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        out.broken.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
     }
 
@@ -360,6 +441,7 @@ impl InstanceStore {
                 java_override: None,
                 created_at: now_secs(),
                 last_played: None,
+                icon: None,
             },
         };
         std::fs::create_dir_all(inst.game_dir())?;
@@ -388,6 +470,53 @@ impl InstanceStore {
         Ok(inst)
     }
 
+    pub fn set_builtin_icon(&self, id: &str, name: &str) -> Result<Instance, InstanceError> {
+        let mut inst = self.load(id)?;
+        inst.config.icon = Some(InstanceIcon::Builtin(name.to_string()));
+        self.save(&inst)?;
+        remove_icon_file(&inst.dir)?;
+        Ok(inst)
+    }
+
+    /// Crops `src` (png, jpeg or webp, at most 8 MiB) to a centered square,
+    /// scales it to 128x128 and stores it as the instance's `icon.png`.
+    pub fn set_custom_icon(&self, id: &str, src: &Path) -> Result<Instance, InstanceError> {
+        let mut inst = self.load(id)?;
+        let png = render_icon(src)?;
+        write_atomic(&inst.dir.join(ICON_FILE), &png)?;
+        inst.config.icon = Some(InstanceIcon::Custom);
+        self.save(&inst)?;
+        Ok(inst)
+    }
+
+    pub fn clear_icon(&self, id: &str) -> Result<Instance, InstanceError> {
+        let mut inst = self.load(id)?;
+        inst.config.icon = None;
+        self.save(&inst)?;
+        remove_icon_file(&inst.dir)?;
+        Ok(inst)
+    }
+
+    /// Removes a directory reported in [`ListOutcome::broken`]. Refuses
+    /// anything that is not a real (non-symlink) direct child of the
+    /// instances root.
+    pub fn delete_broken(&self, b: &BrokenInstance) -> Result<(), InstanceError> {
+        let refuse = || InstanceError::InvalidId(b.id.clone());
+        if !std::fs::symlink_metadata(&b.dir)?.is_dir() {
+            return Err(refuse());
+        }
+        match b.dir.file_name() {
+            Some(n) if n != ".." && n != "." => {}
+            _ => return Err(refuse()),
+        }
+        let parent = b.dir.parent().ok_or_else(refuse)?;
+        if std::fs::canonicalize(parent)? != std::fs::canonicalize(&self.root)? {
+            return Err(refuse());
+        }
+        std::fs::remove_dir_all(&b.dir)?;
+        Ok(())
+    }
+
     pub fn delete(&self, id: &str) -> Result<(), InstanceError> {
         Self::check_id(id)?;
         let dir = self.root.join(id);
@@ -397,6 +526,57 @@ impl InstanceStore {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+}
+
+fn remove_icon_file(dir: &Path) -> Result<(), InstanceError> {
+    match std::fs::remove_file(dir.join(ICON_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn render_icon(src: &Path) -> Result<Vec<u8>, InstanceError> {
+    use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, imageops};
+    use std::io::{Cursor, Read};
+    let bad = |key: &str| InstanceError::InvalidIcon(rust_i18n::t!(key).to_string());
+    let decode_err = |_| bad("errors.instance.icon_reason.decode");
+    let mut bytes = Vec::new();
+    std::fs::File::open(src)?
+        .take(MAX_ICON_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ICON_SOURCE_BYTES {
+        return Err(bad("errors.instance.icon_reason.too_large"));
+    }
+    let format = match image::guess_format(&bytes) {
+        Ok(f @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)) => f,
+        _ => return Err(bad("errors.instance.icon_reason.format")),
+    };
+    let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_ICON_SOURCE_SIDE);
+    limits.max_image_height = Some(MAX_ICON_SOURCE_SIDE);
+    limits.max_alloc = Some(MAX_ICON_DECODE_ALLOC);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(decode_err)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(decode_err)?;
+    img.apply_orientation(orientation);
+    let side = img.width().min(img.height());
+    let view = imageops::crop_imm(
+        &img,
+        (img.width() - side) / 2,
+        (img.height() - side) / 2,
+        side,
+        side,
+    );
+    let icon = imageops::resize(&*view, ICON_SIZE, ICON_SIZE, imageops::FilterType::Lanczos3);
+    let mut out = Cursor::new(Vec::new());
+    icon.write_to(&mut out, ImageFormat::Png)
+        .map_err(|_| bad("errors.instance.icon_reason.encode"))?;
+    Ok(out.into_inner())
 }
 
 #[cfg(test)]
@@ -412,6 +592,7 @@ mod tests {
             assert!(e.source().is_none(), "{e:?}");
         }
     }
+
     use crate::config::JavaSettings;
 
     fn write_raw(tmp: &std::path::Path, id: &str, body: &str) {
@@ -586,7 +767,7 @@ mod tests {
         assert_eq!(a.id, id);
         assert_eq!(b.id, format!("{id} (2)"));
         assert_eq!(store.load(&b.id).unwrap().config.name, name);
-        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(store.list().unwrap().instances.len(), 2);
     }
 
     #[test]
@@ -614,7 +795,7 @@ mod tests {
         let a = store.create("X", "1.20").unwrap();
         store.delete(&a.id).unwrap();
         assert!(!a.dir.exists());
-        assert!(store.list().unwrap().is_empty());
+        assert!(store.list().unwrap().instances.is_empty());
     }
 
     #[test]
@@ -630,7 +811,13 @@ mod tests {
         for i in [&a, &b, &c] {
             store.save(i).unwrap();
         }
-        let ids: Vec<_> = store.list().unwrap().into_iter().map(|i| i.id).collect();
+        let ids: Vec<_> = store
+            .list()
+            .unwrap()
+            .instances
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
         assert_eq!(ids, ["C", "B", "A"]);
     }
 
@@ -641,7 +828,13 @@ mod tests {
         std::fs::create_dir(tmp.path().join("junk")).unwrap();
         store.create("b", "1").unwrap();
         store.create("a", "1").unwrap();
-        let ids: Vec<_> = store.list().unwrap().into_iter().map(|i| i.id).collect();
+        let ids: Vec<_> = store
+            .list()
+            .unwrap()
+            .instances
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
         assert_eq!(ids, ["a", "b"]);
     }
 
@@ -671,5 +864,193 @@ mod tests {
         store.save(&i).unwrap();
         let re = store.load("J").unwrap();
         assert_eq!(effective_java(&g, &re.config), &o);
+    }
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(w, h, |x, _| image::Rgba([(x % 256) as u8, 9, 9, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn list_reports_broken_instances_without_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        store.create("good", "1.20").unwrap();
+        write_raw(tmp.path(), "torn", "name = [");
+        write_raw(tmp.path(), "bad:name", "name = \"x\"\nmc_version = \"1\"\n");
+        let out = store.list().unwrap();
+        assert_eq!(out.instances.len(), 1);
+        assert_eq!(out.broken.len(), 2);
+        let torn = out.broken.iter().find(|b| b.id == "torn").unwrap();
+        assert!(matches!(torn.error, InstanceError::Parse(_)));
+        assert_eq!(torn.dir, tmp.path().join("torn"));
+        let bad = out.broken.iter().find(|b| b.id == "bad:name").unwrap();
+        assert!(matches!(bad.error, InstanceError::InvalidId(_)));
+    }
+
+    #[test]
+    fn custom_icon_is_cropped_and_resized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path().join("inst"));
+        let a = store.create("I", "1.20").unwrap();
+        assert!(a.icon_path().is_none());
+        let src = tmp.path().join("src.png");
+        std::fs::write(&src, png_bytes(300, 200)).unwrap();
+        let inst = store.set_custom_icon("I", &src).unwrap();
+        let p = inst.icon_path().unwrap();
+        let img = image::open(&p).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (128, 128));
+        // The source red channel is x: a centered 200px crop spans x = 50..250.
+        let left = img.get_pixel(0, 64)[0];
+        let right = img.get_pixel(127, 64)[0];
+        assert!((48..=60).contains(&left), "left {left}");
+        assert!((238..=252).contains(&right), "right {right}");
+        assert_eq!(
+            store.load("I").unwrap().config.icon,
+            Some(InstanceIcon::Custom)
+        );
+        let cleared = store.clear_icon("I").unwrap();
+        assert!(cleared.config.icon.is_none() && !p.exists());
+        assert!(cleared.icon_path().is_none());
+    }
+
+    #[test]
+    fn icon_rejects_oversized_or_unknown_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path().join("inst"));
+        store.create("I", "1.20").unwrap();
+        let write = |name: &str, data: &[u8]| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, data).unwrap();
+            p
+        };
+        let mut big = png_bytes(8, 8);
+        big.resize(8 * 1024 * 1024 + 1, 0);
+        let cases = [
+            (write("big.png", &big), "too_large"),
+            (
+                write("a.gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
+                "format",
+            ),
+            (write("junk.png", b"not an image"), "format"),
+            (write("wide.png", &png_bytes(20000, 1)), "decode"),
+        ];
+        for (p, key) in cases {
+            let want = match key {
+                "too_large" => rust_i18n::t!("errors.instance.icon_reason.too_large"),
+                "format" => rust_i18n::t!("errors.instance.icon_reason.format"),
+                _ => rust_i18n::t!("errors.instance.icon_reason.decode"),
+            }
+            .to_string();
+            match store.set_custom_icon("I", &p) {
+                Err(InstanceError::InvalidIcon(got)) => assert_eq!(got, want, "{p:?}"),
+                other => panic!("{p:?}: {other:?}"),
+            }
+        }
+        // Truncated PNG: right format, undecodable.
+        let trunc = write("trunc.png", &png_bytes(64, 64)[..40]);
+        match store.set_custom_icon("I", &trunc) {
+            Err(InstanceError::InvalidIcon(got)) => assert_eq!(
+                got,
+                rust_i18n::t!("errors.instance.icon_reason.decode").to_string()
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            store
+                .set_custom_icon("I", &tmp.path().join("missing.png"))
+                .is_err()
+        );
+        assert!(store.load("I").unwrap().config.icon.is_none());
+    }
+
+    #[test]
+    fn builtin_icon_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        store.create("B", "1.20").unwrap();
+        let inst = store.set_builtin_icon("B", "grass").unwrap();
+        assert_eq!(
+            inst.config.icon,
+            Some(InstanceIcon::Builtin("grass".into()))
+        );
+        let text = std::fs::read_to_string(inst.dir.join("instance.toml")).unwrap();
+        assert!(text.contains("icon = \"builtin:grass\""), "{text}");
+        assert_eq!(store.load("B").unwrap(), inst);
+        assert!(inst.icon_path().is_none());
+        for bad in ["", "../x", "a/b", "."] {
+            assert!(
+                matches!(
+                    store.set_builtin_icon("B", bad),
+                    Err(InstanceError::InvalidConfig(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(store.load("B").unwrap(), inst);
+    }
+
+    #[test]
+    fn invalid_icon_on_disk_loads_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        for (i, icon) in ["weird", "builtin:", "builtin:../x", ""].iter().enumerate() {
+            write_raw(
+                tmp.path(),
+                &format!("i{i}"),
+                &format!("mc_version = \"1\"\nicon = \"{icon}\"\n"),
+            );
+        }
+        let out = store.list().unwrap();
+        assert!(out.broken.is_empty(), "{:?}", out.broken);
+        assert_eq!(out.instances.len(), 4);
+        assert!(out.instances.iter().all(|i| i.config.icon.is_none()));
+    }
+
+    #[test]
+    fn broken_instances_can_be_deleted_safely() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("inst");
+        let store = InstanceStore::new(&root);
+        store.create("good", "1.20").unwrap();
+        write_raw(&root, "torn", "name = [");
+        let weird = root.join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        std::fs::create_dir(&weird).unwrap();
+        std::fs::write(weird.join("instance.toml"), "x").unwrap();
+        let out = store.list().unwrap();
+        assert_eq!(out.broken.len(), 2);
+        for b in &out.broken {
+            store.delete_broken(b).unwrap();
+            assert!(!b.dir.exists());
+        }
+        assert_eq!(store.list().unwrap().instances.len(), 1);
+        assert!(store.list().unwrap().broken.is_empty());
+
+        // Refuses a path outside the root, a nested path and a symlink.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let fake = |dir: PathBuf| BrokenInstance {
+            id: "x".into(),
+            dir,
+            error: InstanceError::NotFound("x".into()),
+        };
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        for dir in [
+            outside.clone(),
+            root.join("good/minecraft"),
+            root.join("link"),
+            root.join("../outside"),
+        ] {
+            assert!(
+                matches!(
+                    store.delete_broken(&fake(dir.clone())),
+                    Err(InstanceError::InvalidId(_))
+                ),
+                "{dir:?}"
+            );
+        }
+        assert!(outside.exists() && root.join("good/minecraft").exists());
     }
 }

@@ -87,7 +87,11 @@ async fn main() -> Result<()> {
 async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
     match cmd {
         InstanceCmd::List => {
-            let list = ctx.store().list()?;
+            let out = ctx.store().list()?;
+            for b in &out.broken {
+                eprintln!("broken instance {}: {}", b.id, b.error);
+            }
+            let list = out.instances;
             if list.is_empty() {
                 println!("(no instances)");
             }
