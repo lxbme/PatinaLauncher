@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 
 use super::mods::{ModFormat, ModMeta, list_mod_files, read_mod_meta, split_mod_name};
-use crate::fsutil::write_atomic;
+use crate::fsutil::{is_safe_name, write_atomic};
 use crate::instance::{Instance, InstanceStore};
 use crate::loader::LoaderKind;
 use crate::paths::DataDirs;
@@ -131,6 +131,21 @@ impl ModIndex {
                 Some(
                     s.entries
                         .into_iter()
+                        .filter(|r| {
+                            // Untrusted names: keep only what a scan could
+                            // have produced.
+                            let ok = is_safe_name(&r.instance_id)
+                                && is_safe_name(&r.file_name)
+                                && split_mod_name(&r.file_name).is_some();
+                            if !ok {
+                                tracing::warn!(
+                                    "dropping mod index entry with an invalid name: {:?}/{:?}",
+                                    r.instance_id,
+                                    r.file_name
+                                );
+                            }
+                            ok
+                        })
                         .map(|mut r| {
                             // The file is untrusted: never let a crafted hash
                             // reach a path join.
@@ -616,6 +631,44 @@ mod tests {
         assert_eq!(idx.search("alpha", 1)[0].icon_path, None);
         let s = idx.refresh(&e.store).await.unwrap();
         assert_eq!((s.parsed, s.reused), (1, 0));
+    }
+
+    /// The index file is untrusted: records whose instance id or file name
+    /// could not come from a real scan are dropped on load, so a search hit
+    /// never carries a path-like name to a later enable/delete.
+    #[tokio::test]
+    async fn crafted_names_are_dropped_on_load() {
+        let e = env();
+        let inst = e.store.create("P", "1.20.1").unwrap();
+        add_mod(&inst, "a.jar", "a", "Alpha", None);
+        let mut idx = ModIndex::open(&e.data);
+        idx.refresh(&e.store).await.unwrap();
+        let mut v = read_stored(&e);
+        let good = v["entries"][0].clone();
+        let mut entries = vec![good.clone()];
+        for (field, bad) in [
+            ("instance_id", "../evil"),
+            ("instance_id", ""),
+            ("instance_id", "a/b"),
+            ("file_name", "../x.jar"),
+            ("file_name", "a/b.jar"),
+            ("file_name", "notes.txt"),
+            ("file_name", ".jar"),
+            ("file_name", ""),
+        ] {
+            let mut r = good.clone();
+            r[field] = serde_json::json!(bad);
+            entries.push(r);
+        }
+        v["entries"] = serde_json::Value::Array(entries);
+        std::fs::write(e.data.cache().join(INDEX_FILE), v.to_string()).unwrap();
+        let idx = ModIndex::open(&e.data);
+        let hits = idx.search("alpha", 100);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            (hits[0].instance_id.as_str(), hits[0].file_name.as_str()),
+            (inst.id.as_str(), "a.jar")
+        );
     }
 
     #[tokio::test]

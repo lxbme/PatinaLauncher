@@ -212,16 +212,141 @@ pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     })
 }
 
+/// Live (not zombie) processes in process group `pgid`.
+pub fn process_group_members(pgid: u32) -> Vec<u32> {
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    let rest = &s[s.rfind(')')? + 1..];
+                    let mut f = rest.split_whitespace();
+                    let state = f.next()?;
+                    let group: u32 = f.nth(1)?.parse().ok()?;
+                    Some(group == pgid && state != "Z" && state != "X")
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// The group id as a signal target, or an error for ids that must never be
+/// signalled: 0 and 1 (`kill(0)` is the caller's own group, `kill(-1)` every
+/// process the user may signal), this launcher's own process group, and a
+/// group named after this process's pid.
+fn signalable_group(pgid: u32) -> io::Result<rustix::process::Pid> {
+    let own_group = rustix::process::getpgrp().as_raw_nonzero().get();
+    i32::try_from(pgid)
+        .ok()
+        .filter(|&p| p > 1 && p != own_group)
+        .filter(|_| pgid != std::process::id())
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| io::Error::other(format!("refusing to signal process group {pgid}")))
+}
+
+/// Sends `sig` to process group `pgid`; a group that no longer exists is Ok.
+/// Groups refused by [`signalable_group`] are never signalled.
+fn signal_group(pgid: u32, sig: rustix::process::Signal) -> io::Result<()> {
+    let p = signalable_group(pgid)?;
+    match rustix::process::kill_process_group(p, sig) {
+        Err(rustix::io::Errno::SRCH) => Ok(()),
+        r => r.map_err(io::Error::from),
+    }
+}
+
+/// SIGTERM to process group `pgid`, up to 5 s for every member to exit, then
+/// SIGKILL. Works when the group's leader already exited: the kernel keeps a
+/// group id reserved (never handing it out as a new pid) while any member
+/// lives, so a group with members is still the one the leader created. The
+/// caller must know that group is the game's, i.e. its leader passed the
+/// identity check when the game was started or reattached. Ok when the group
+/// is empty.
+pub fn kill_process_group(pgid: u32) -> io::Result<()> {
+    use std::time::{Duration, Instant};
+    let wait_empty = |limit: Duration| {
+        let end = Instant::now() + limit;
+        loop {
+            if process_group_members(pgid).is_empty() {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    if process_group_members(pgid).is_empty() {
+        return Ok(());
+    }
+    signal_group(pgid, rustix::process::Signal::TERM)?;
+    if wait_empty(Duration::from_secs(5)) {
+        return Ok(());
+    }
+    signal_group(pgid, rustix::process::Signal::KILL)?;
+    if !wait_empty(Duration::from_secs(2)) {
+        return Err(io::Error::other(format!(
+            "process group {pgid} did not exit"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `pid` is an exited but unreaped process (a zombie) whose start
+/// token is `start`. While it is unreaped its pid, and so its process group
+/// id, cannot be handed out again.
+pub fn is_zombie_with_start(pid: u32, start: u64) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let state = s[s.rfind(')')? + 1..]
+                .split_whitespace()
+                .next()?
+                .to_string();
+            let (_, st) = parse_stat(&s)?;
+            Some(state == "Z" && st == start)
+        })
+        .unwrap_or(false)
+}
+
 /// Process group id of a live process.
 pub fn process_group_of(pid: u32) -> Option<u32> {
     read_stat(pid).map(|(g, _)| g)
 }
 
+/// Why [`kill_pid_checked`] failed, and whether the process was stopped
+/// anyway.
+#[derive(Debug)]
+pub struct KillFailure {
+    pub error: io::Error,
+    /// SIGKILL had already been delivered when a later step failed, so the
+    /// process is dying because of this kill.
+    pub sigkill_delivered: bool,
+}
+
+/// [`kill_pid`] without the detail of [`KillFailure`].
+pub fn kill_pid(pid: u32) -> io::Result<()> {
+    kill_pid_checked(pid).map_err(|f| f.error)
+}
+
 /// SIGTERM, wait up to 5 s, then SIGKILL. When `pid` leads its own process
 /// group (as `spawn_detached` makes it) the whole group is signalled, so
-/// wrappers and game children die too. Ok if the process is already gone.
-pub fn kill_pid(pid: u32) -> io::Result<()> {
+/// wrappers and game children die too, including members that outlive the
+/// leader. Ok if the process is already gone; a caller that knows the game's
+/// leader exited but its group may remain uses [`kill_process_group`].
+pub fn kill_pid_checked(pid: u32) -> Result<(), KillFailure> {
     use std::time::{Duration, Instant};
+    let before_kill = |error| KillFailure {
+        error,
+        sigkill_delivered: false,
+    };
+    let after_kill = |error| KillFailure {
+        error,
+        sigkill_delivered: true,
+    };
     fn wait_gone(pid: u32, limit: Duration) -> bool {
         let end = Instant::now() + limit;
         loop {
@@ -241,14 +366,7 @@ pub fn kill_pid(pid: u32) -> io::Result<()> {
             } else {
                 rustix::process::Signal::KILL
             };
-            let p = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-                .ok_or_else(|| io::Error::other("invalid pid"))?;
-            return match rustix::process::kill_process_group(p, sig) {
-                Err(rustix::io::Errno::SRCH) => Ok(()),
-                r => r.map_err(io::Error::from),
-            };
+            return signal_group(pid, sig);
         }
         let sys = refresh_one(pid).ok_or_else(|| io::Error::other("cannot query processes"))?;
         let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) else {
@@ -269,17 +387,27 @@ pub fn kill_pid(pid: u32) -> io::Result<()> {
         return Ok(());
     };
     let leader = process_group_of(pid) == Some(pid);
-    send(pid, leader, true)?;
+    send(pid, leader, true).map_err(before_kill)?;
     if wait_gone(pid, Duration::from_secs(5)) {
+        if leader {
+            // Members that ignore SIGTERM outlive the leader.
+            kill_process_group(pid).map_err(before_kill)?;
+        }
         return Ok(());
     }
     // Pid-reuse guard: only escalate while it is still the same process.
     if proc_info(pid).is_none_or(|i| i.start_time != info.start_time) {
         return Ok(());
     }
-    send(pid, leader, false)?;
+    send(pid, leader, false).map_err(before_kill)?;
     if !wait_gone(pid, Duration::from_secs(2)) {
-        return Err(io::Error::other(format!("process {pid} did not exit")));
+        return Err(after_kill(io::Error::other(format!(
+            "process {pid} did not exit"
+        ))));
+    }
+    if leader {
+        // Members that outlived the leader (the group id stays theirs).
+        kill_process_group(pid).map_err(after_kill)?;
     }
     Ok(())
 }
@@ -334,6 +462,21 @@ mod tests {
         assert_eq!(parse_stat(line), Some((777, 123456)));
         assert_eq!(parse_stat("garbage"), None);
         assert_eq!(parse_stat("1 (x) S 1"), None);
+    }
+
+    /// Checks the guard alone: no signal is ever sent by this test.
+    #[test]
+    fn dangerous_group_ids_are_refused() {
+        let own_group = rustix::process::getpgrp().as_raw_nonzero().get() as u32;
+        for g in [0, 1, own_group, std::process::id()] {
+            assert!(signalable_group(g).is_err(), "{g}");
+        }
+        assert!(signalable_group(u32::MAX).is_err());
+        // An ordinary id passes the guard (nothing is signalled here).
+        let other = (2..)
+            .find(|g| *g != own_group && *g != std::process::id())
+            .unwrap();
+        assert!(signalable_group(other).is_ok());
     }
 
     #[test]

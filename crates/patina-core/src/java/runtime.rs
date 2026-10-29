@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use serde::Deserialize;
 
@@ -147,6 +148,48 @@ pub struct ManagedRuntimes {
     root: PathBuf,
 }
 
+/// Per-component install/remove lock, shared by every `ManagedRuntimes` of
+/// this process (callers create a fresh handle per operation).
+type ComponentLock = Arc<tokio::sync::Mutex<()>>;
+type LockMap = HashMap<(PathBuf, String), Weak<tokio::sync::Mutex<()>>>;
+
+fn component_lock(root: &Path, component: &str) -> ComponentLock {
+    static LOCKS: OnceLock<StdMutex<LockMap>> = OnceLock::new();
+    let key = (
+        crate::fsutil::path_key(root).unwrap_or_else(|_| root.to_path_buf()),
+        component.to_string(),
+    );
+    let mut map = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(lock) = map.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    map.retain(|_, w| w.strong_count() > 0);
+    let lock = ComponentLock::default();
+    map.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+/// Creates `link` → `target`; an existing correct link is kept, anything else
+/// at that path is replaced.
+fn ensure_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            if std::fs::read_link(link)? == target {
+                return Ok(());
+            }
+            std::fs::remove_file(link)?;
+        }
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(link)?,
+        Ok(_) => std::fs::remove_file(link)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    platform::symlink(target, link)
+}
+
 impl ManagedRuntimes {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -164,6 +207,12 @@ impl ManagedRuntimes {
         is_safe_name(component) && self.home(component).join(MARKER).is_file()
     }
 
+    /// Downloads (or re-downloads) `component` and returns its `java`.
+    ///
+    /// Installs and removals of one component are serialized in this process.
+    /// A caller that had to wait for another install of the same component
+    /// reuses that result when it left the component installed, instead of
+    /// downloading it again.
     pub async fn install(
         &self,
         dl: &Downloader,
@@ -173,6 +222,26 @@ impl ManagedRuntimes {
         if !is_safe_name(component) {
             return Err(RuntimeError::InvalidComponent(component.to_string()));
         }
+        let lock = component_lock(&self.root, component);
+        let _guard = match lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let g = lock.lock().await;
+                if self.is_installed(component) {
+                    return Ok(self.java_bin(component));
+                }
+                g
+            }
+        };
+        self.install_locked(dl, component, progress).await
+    }
+
+    async fn install_locked(
+        &self,
+        dl: &Downloader,
+        component: &str,
+        progress: &ProgressSink,
+    ) -> Result<PathBuf, RuntimeError> {
         // A failed (re)install must not leave a stale marker behind.
         match tokio::fs::remove_file(self.home(component).join(MARKER)).await {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
@@ -214,10 +283,7 @@ impl ManagedRuntimes {
             platform::set_executable(e)?;
         }
         for (link, target) in &plan.links {
-            if std::fs::symlink_metadata(link).is_ok() {
-                std::fs::remove_file(link)?;
-            }
-            platform::symlink(Path::new(target), link)?;
+            ensure_symlink(Path::new(target), link)?;
         }
         tokio::fs::write(home.join(MARKER), &entry.version.name).await?;
         Ok(self.java_bin(component))
@@ -240,7 +306,7 @@ impl ManagedRuntimes {
         out
     }
 
-    pub fn remove(&self, component: &str) -> io::Result<()> {
+    pub async fn remove(&self, component: &str) -> io::Result<()> {
         if !is_safe_name(component) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -251,7 +317,10 @@ impl ManagedRuntimes {
                 .to_string(),
             ));
         }
-        match std::fs::remove_dir_all(self.home(component)) {
+        // Waits for a running install of the same component.
+        let lock = component_lock(&self.root, component);
+        let _guard = lock.lock().await;
+        match tokio::fs::remove_dir_all(self.home(component)).await {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             r => r,
         }
@@ -318,14 +387,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsafe_component_names_are_rejected() {
+    #[tokio::test]
+    async fn unsafe_component_names_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("runtimes");
         std::fs::create_dir_all(&root).unwrap();
         let rt = ManagedRuntimes::new(root.clone());
         for c in ["..", "", "a/b", "/abs", "."] {
-            let e = rt.remove(c).unwrap_err();
+            let e = rt.remove(c).await.unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
             assert!(!rt.is_installed(c));
         }
@@ -477,9 +546,71 @@ mod tests {
         assert!(!rt.is_installed("jre-legacy"));
         rt.install(&dl, "jre-legacy", &None).await.unwrap();
         assert!(rt.is_installed("jre-legacy"));
-        rt.remove("jre-legacy").unwrap();
+        rt.remove("jre-legacy").await.unwrap();
         assert!(!rt.is_installed("jre-legacy"));
-        rt.remove("jre-legacy").unwrap();
+        rt.remove("jre-legacy").await.unwrap();
+    }
+
+    fn hits(reqs: &[wiremock::Request], path: &str) -> usize {
+        reqs.iter().filter(|r| r.url.path() == path).count()
+    }
+
+    /// Regression: two launches needing the same not-yet-installed runtime
+    /// raced on the marker and the symlinks (EEXIST). The second install now
+    /// waits for the first and reuses its result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_installs_of_one_component_download_once() {
+        let server = MockServer::start().await;
+        serve_fake_runtime(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("runtimes");
+        let dl = downloader(&server);
+        // Separate handles, as two launches would create them.
+        let (a, b) = (
+            ManagedRuntimes::new(root.clone()),
+            ManagedRuntimes::new(root.clone()),
+        );
+        let (ra, rb) = tokio::join!(
+            a.install(&dl, "jre-legacy", &None),
+            b.install(&dl, "jre-legacy", &None)
+        );
+        assert_eq!(ra.unwrap(), a.java_bin("jre-legacy"));
+        assert_eq!(rb.unwrap(), a.java_bin("jre-legacy"));
+        assert!(a.is_installed("jre-legacy"));
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(hits(&reqs, "/m.json"), 1, "manifest fetched once");
+        assert_eq!(hits(&reqs, "/o/java"), 1, "files downloaded once");
+
+        // A link that points elsewhere is replaced on reinstall.
+        let alias = a.home("jre-legacy").join("lib/alias.so");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("release", &alias).unwrap();
+        a.install(&dl, "jre-legacy", &None).await.unwrap();
+        assert_eq!(std::fs::read_link(&alias).unwrap(), Path::new("libjli.so"));
+    }
+
+    /// `remove` waits for a running install instead of deleting under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remove_waits_for_a_running_install() {
+        let server = MockServer::start().await;
+        serve_fake_runtime(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = ManagedRuntimes::new(tmp.path().join("runtimes"));
+        let dl = downloader(&server);
+        let (installed, removed) = tokio::join!(rt.install(&dl, "jre-legacy", &None), async {
+            tokio::task::yield_now().await;
+            rt.remove("jre-legacy").await
+        });
+        installed.unwrap();
+        removed.unwrap();
+        // Either order leaves a consistent state: installed with every file,
+        // or fully removed.
+        let home = rt.home("jre-legacy");
+        if rt.is_installed("jre-legacy") {
+            assert!(rt.java_bin("jre-legacy").is_file());
+        } else {
+            assert!(!home.exists());
+        }
     }
 
     #[tokio::test]

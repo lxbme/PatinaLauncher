@@ -24,7 +24,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
 }
 
 impl LogBuffer {
-    /// Captured lines containing `needle` (use a test-unique string).
+    /// Captured lines containing `needle`. Use a string unique to the test,
+    /// such as a random path segment: a mock server URI is not unique, since
+    /// wiremock reuses pooled servers across tests.
     pub(crate) fn lines_containing(&self, needle: &str) -> Vec<String> {
         String::from_utf8_lossy(&self.0.lock().unwrap())
             .lines()

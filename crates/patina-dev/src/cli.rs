@@ -9,8 +9,20 @@ use patina_core::loader::LoaderKind;
 use patina_core::loader::VersionPick;
 use patina_core::loader::ops::LoaderAction;
 
+/// Patina development CLI.
+///
+/// Offline accounts (`account add-offline`, `launch --offline`) exist only
+/// with the `dev-offline` feature; `cargo dev <ARGS>` (a cargo alias in
+/// `.cargo/config.toml`) runs this tool with it enabled.
 #[derive(Parser, Debug)]
-#[command(name = "patina-dev", version, about = "Patina development CLI")]
+#[command(
+    name = "patina-dev",
+    version,
+    about = "Patina development CLI",
+    long_about = "Patina development CLI.\n\nOffline accounts (`account add-offline`, `launch --offline`) \
+                  need the `dev-offline` feature; run `cargo dev <ARGS>` (a cargo alias for \
+                  `cargo run -p patina-dev --features dev-offline --`) to get them."
+)]
 pub struct Cli {
     /// Data directory (overrides PATINA_DATA_DIR and the default location)
     #[arg(long, global = true, value_name = "PATH")]
@@ -44,9 +56,14 @@ pub enum Cmd {
         /// Instance ID (directory name)
         id: String,
         /// Launch as this stored account instead of the current one
-        #[arg(long, value_name = "ACCOUNT_ID", conflicts_with = "offline")]
+        #[cfg_attr(
+            feature = "dev-offline",
+            arg(long, value_name = "ACCOUNT_ID", conflicts_with = "offline")
+        )]
+        #[cfg_attr(not(feature = "dev-offline"), arg(long, value_name = "ACCOUNT_ID"))]
         account: Option<String>,
         /// Offline player name, without storing an account (development only)
+        #[cfg(feature = "dev-offline")]
         #[arg(long, value_name = "PLAYER")]
         offline: Option<String>,
     },
@@ -77,6 +94,7 @@ pub enum AccountCmd {
     /// List accounts; the current one is marked
     List,
     /// Add an offline account (development only)
+    #[cfg(feature = "dev-offline")]
     AddOffline { name: String },
     /// Make an account the current one
     Use { id: String },

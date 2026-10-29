@@ -94,13 +94,32 @@ pub enum SessionError {
     Io { path: PathBuf, error: String },
 }
 
+/// How a [`KillHandle`] sends signals; tests swap in recorders so they never
+/// signal a process they did not spawn.
+#[derive(Clone, Copy)]
+pub(crate) struct Signals {
+    pub(crate) kill_pid: fn(u32) -> Result<(), platform::KillFailure>,
+    pub(crate) kill_group: fn(u32) -> io::Result<()>,
+}
+
+impl Signals {
+    pub(crate) const REAL: Signals = Signals {
+        kill_pid: platform::kill_pid_checked,
+        kill_group: platform::kill_process_group,
+    };
+}
+
 /// Terminates the game; cloneable so it can be used while `wait` is pending.
+/// Once the session's `wait` has seen the exit, it never signals anything.
 #[derive(Clone)]
 pub struct KillHandle {
     pid: u32,
     /// Process identity token; `None` when the game was already gone at start.
     token: Option<u64>,
     killed: Arc<AtomicBool>,
+    /// The session's state (`RUNNING` / `EXITED` / `ABANDONED`).
+    state: Arc<AtomicU8>,
+    signals: Signals,
 }
 
 impl KillHandle {
@@ -113,18 +132,45 @@ impl KillHandle {
             .map_err(io::Error::other)?
     }
 
-    /// Blocking form of [`KillHandle::kill`]; marks the session as user-killed
-    /// only when the kill succeeded.
+    /// Blocking form of [`KillHandle::kill`]. The session is marked as
+    /// user-killed before signalling, so `wait` seeing the exit can never
+    /// miss it, and unmarked again if the kill failed before SIGKILL was
+    /// delivered.
+    ///
+    /// When the game's leader already exited but is not yet reaped (a zombie
+    /// with the game's start token), members it left in its process group
+    /// are still stopped: an unreaped leader keeps its pid, and so the group
+    /// id, reserved. A reaped leader's group is never signalled, since its
+    /// id may name an unrelated group by now.
     pub(crate) fn kill_blocking(&self) -> io::Result<()> {
-        let alive = matches!(
-            (self.token, platform::proc_info(self.pid)),
-            (Some(t), Some(info)) if info.start_time == t
-        );
-        if alive {
-            platform::kill_pid(self.pid)?;
-            self.killed.store(true, Ordering::SeqCst);
+        if self.state.load(Ordering::SeqCst) == EXITED {
+            tracing::debug!("game {} already exited; nothing to kill", self.pid);
+            return Ok(());
         }
-        Ok(())
+        let Some(token) = self.token else {
+            return Ok(());
+        };
+        match platform::proc_info(self.pid) {
+            Some(info) if info.start_time == token => {
+                self.killed.store(true, Ordering::SeqCst);
+                if let Err(f) = (self.signals.kill_pid)(self.pid) {
+                    if !f.sigkill_delivered {
+                        self.killed.store(false, Ordering::SeqCst);
+                    }
+                    return Err(f.error);
+                }
+                Ok(())
+            }
+            // The pid now names another process.
+            Some(_) => Ok(()),
+            None if platform::is_zombie_with_start(self.pid, token) => {
+                (self.signals.kill_group)(self.pid)
+            }
+            None => {
+                tracing::debug!("game {} is gone; not signalling its group", self.pid);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -379,6 +425,8 @@ impl GameSession {
             pid: self.pid,
             token: self.token,
             killed: self.killed.clone(),
+            state: self.state.clone(),
+            signals: Signals::REAL,
         }
     }
 
@@ -426,52 +474,65 @@ impl GameSession {
         // A game the user stopped exits non-zero by design.
         // Death by signal (SIGABRT, SIGSEGV, OOM kill) has no exit code but is a crash.
         let bad_code = failed && !killed;
-        let crashed = bad_code || self.crash_evidence();
-        let saved_log = crashed.then(|| self.save_log()).flatten();
-        clear_record(&self.inst);
+        // Directory scans, a 64 KiB read and a rename: off the async workers.
+        // The locks (held by `self`) are released only after this finished.
+        let (inst, started_at) = (self.inst.clone(), self.started_at);
+        let finish = tokio::task::spawn_blocking(move || {
+            let crashed = bad_code || crash_evidence(&inst, started_at);
+            let saved_log = crashed.then(|| save_log(&inst)).flatten();
+            clear_record(&inst);
+            (crashed, saved_log)
+        })
+        .await;
+        let (crashed, saved_log) = finish.unwrap_or_else(|e| {
+            tracing::warn!("cannot finish the game session: {e}");
+            (bad_code, None)
+        });
         SessionExit {
             code,
             crashed,
             saved_log,
         }
     }
+}
 
-    fn crash_evidence(&self) -> bool {
-        let reports = self.inst.game_dir().join("crash-reports");
-        if let Ok(rd) = std::fs::read_dir(&reports) {
-            for e in rd.flatten() {
-                let secs = e
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs());
-                if secs.is_some_and(|s| s >= self.started_at) {
-                    return true;
-                }
+/// A crash report written since `started_at`, or a crash marker near the end
+/// of the log.
+fn crash_evidence(inst: &Instance, started_at: u64) -> bool {
+    let reports = inst.game_dir().join("crash-reports");
+    if let Ok(rd) = std::fs::read_dir(&reports) {
+        for e in rd.flatten() {
+            let secs = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            if secs.is_some_and(|s| s >= started_at) {
+                return true;
             }
         }
-        let tail = read_tail(&self.inst.dir.join(CURRENT_LOG), CRASH_SCAN_BYTES);
-        CRASH_MARKERS.iter().any(|m| tail.contains(m))
     }
+    let tail = read_tail(&inst.dir.join(CURRENT_LOG), CRASH_SCAN_BYTES);
+    CRASH_MARKERS.iter().any(|m| tail.contains(m))
+}
 
-    /// Renames the current log to `patina-logs/<UTC time>-crash.log`.
-    fn save_log(&self) -> Option<PathBuf> {
-        let src = self.inst.dir.join(CURRENT_LOG);
-        let dir = src.parent()?;
-        let stamp = format_utc_compact(now_secs());
-        let mut dest = dir.join(format!("{stamp}-crash.log"));
-        let mut n = 0;
-        while dest.exists() {
-            n += 1;
-            dest = dir.join(format!("{stamp}-crash-{n}.log"));
-        }
-        match std::fs::rename(&src, &dest) {
-            Ok(()) => Some(dest),
-            Err(e) => {
-                tracing::warn!("cannot save the crash log: {e}");
-                None
-            }
+/// Renames the current log to `patina-logs/<UTC time>-crash.log`.
+fn save_log(inst: &Instance) -> Option<PathBuf> {
+    let src = inst.dir.join(CURRENT_LOG);
+    let dir = src.parent()?;
+    let stamp = format_utc_compact(now_secs());
+    let mut dest = dir.join(format!("{stamp}-crash.log"));
+    let mut n = 0;
+    while dest.exists() {
+        n += 1;
+        dest = dir.join(format!("{stamp}-crash-{n}.log"));
+    }
+    match std::fs::rename(&src, &dest) {
+        Ok(()) => Some(dest),
+        Err(e) => {
+            tracing::warn!("cannot save the crash log: {e}");
+            None
         }
     }
 }
@@ -923,6 +984,178 @@ mod tests {
         killer.kill().await.unwrap(); // after exit: harmless
         assert!(drain(rx).await.is_empty());
         poll_until("record cleared", || read_record(&e.inst).is_none()).await;
+    }
+
+    thread_local! {
+        /// Signals the recording `Signals` "sent" on this thread.
+        static SENT: std::cell::RefCell<Vec<(&'static str, u32)>> = Default::default();
+    }
+
+    fn sent() -> Vec<(&'static str, u32)> {
+        SENT.with(|s| s.borrow().clone())
+    }
+
+    /// Records every signal instead of sending it; `kill_pid` answers with
+    /// `outcome`.
+    fn recording(outcome: Option<bool>) -> Signals {
+        fn group(pid: u32) -> io::Result<()> {
+            SENT.with(|s| s.borrow_mut().push(("group", pid)));
+            Ok(())
+        }
+        fn ok(pid: u32) -> Result<(), platform::KillFailure> {
+            SENT.with(|s| s.borrow_mut().push(("pid", pid)));
+            Ok(())
+        }
+        fn fail(pid: u32, sigkill_delivered: bool) -> Result<(), platform::KillFailure> {
+            SENT.with(|s| s.borrow_mut().push(("pid", pid)));
+            Err(platform::KillFailure {
+                error: io::Error::other("injected"),
+                sigkill_delivered,
+            })
+        }
+        fn fail_early(pid: u32) -> Result<(), platform::KillFailure> {
+            fail(pid, false)
+        }
+        fn fail_late(pid: u32) -> Result<(), platform::KillFailure> {
+            fail(pid, true)
+        }
+        Signals {
+            kill_pid: match outcome {
+                None => ok,
+                Some(false) => fail_early,
+                Some(true) => fail_late,
+            },
+            kill_group: group,
+        }
+    }
+
+    fn handle(pid: u32, token: Option<u64>, state: u8, signals: Signals) -> KillHandle {
+        KillHandle {
+            pid,
+            token,
+            killed: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(AtomicU8::new(state)),
+            signals,
+        }
+    }
+
+    /// A test-owned detached `exec sleep 60` (its own group leader).
+    fn own_sleeper(dir: &Path) -> (Child, u32, u64) {
+        let cmd = LaunchCommand {
+            program: "sh".into(),
+            args: vec!["-c".into(), "exec sleep 60".into()],
+            cwd: std::env::temp_dir(),
+        };
+        let child = platform::spawn_detached(&cmd, &dir.join("sleeper.log")).unwrap();
+        let pid = child.id();
+        let token = platform::proc_info(pid).unwrap().start_time;
+        (child, pid, token)
+    }
+
+    /// Waits until no live process is left in group `pgid`.
+    async fn group_gone(pgid: u32) -> bool {
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            if crate::platform::process_group_members(pgid).is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    async fn poll_zombie(pid: u32, token: u64) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !platform::is_zombie_with_start(pid, token) {
+            assert!(Instant::now() < end, "leader never became a zombie");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The leader exited but is unreaped (the session has not waited yet),
+    /// and left a member of its group behind: the kill handle stops it.
+    #[tokio::test]
+    async fn kill_reaches_the_group_of_an_unreaped_leader() {
+        let e = env("i1");
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "sleep 60 & exit 0"))
+            .unwrap();
+        let (pid, token) = (s.pid(), s.token.unwrap());
+        let killer = s.killer();
+        poll_zombie(pid, token).await;
+        assert!(
+            !platform::process_group_members(pid).is_empty(),
+            "the sleep must outlive the leader"
+        );
+        killer.kill().await.unwrap();
+        assert!(group_gone(pid).await, "group members survived the kill");
+        s.wait().await;
+    }
+
+    /// Regression (re-review): a reaped leader's pid may be recycled, so its
+    /// group is never signalled, even while members are left.
+    #[tokio::test]
+    async fn reaped_leader_group_is_not_signalled() {
+        let e = env("i1");
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "sleep 60 & exit 0"))
+            .unwrap();
+        let (pid, token) = (s.pid(), s.token.unwrap());
+        s.wait().await; // reaps the leader
+        assert!(!platform::process_group_members(pid).is_empty());
+        SENT.with(|s| s.borrow_mut().clear());
+        handle(pid, Some(token), RUNNING, recording(None))
+            .kill_blocking()
+            .unwrap();
+        assert_eq!(sent(), []);
+        // Clean up the test's own leftover member (its group is still ours).
+        platform::kill_process_group(pid).unwrap();
+        assert!(group_gone(pid).await);
+    }
+
+    /// Regression (re-review): after `wait` the handle never signals, even a
+    /// live process with the right identity.
+    #[tokio::test]
+    async fn handle_after_wait_signals_nothing() {
+        let e = env("i1");
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "exit 0")).unwrap();
+        let mut h = s.killer();
+        h.signals = recording(None);
+        s.wait().await;
+        SENT.with(|s| s.borrow_mut().clear());
+        h.kill_blocking().unwrap();
+        assert_eq!(sent(), []);
+
+        let (mut child, pid, token) = own_sleeper(&e.inst.dir);
+        handle(pid, Some(token), EXITED, recording(None))
+            .kill_blocking()
+            .unwrap();
+        assert_eq!(sent(), [], "an exited session's handle stays silent");
+        handle(pid, Some(token), RUNNING, recording(None))
+            .kill_blocking()
+            .unwrap();
+        assert_eq!(sent(), [("pid", pid)], "the seam is what would signal");
+        platform::kill_pid(pid).unwrap();
+        child.wait().unwrap();
+    }
+
+    /// A kill that fails before SIGKILL leaves the session not marked as
+    /// user-killed; once SIGKILL was delivered the mark stays. Signals are
+    /// injected: nothing is sent to any process.
+    #[tokio::test]
+    async fn failed_kill_rolls_back_the_killed_flag_until_sigkill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, pid, token) = own_sleeper(dir.path());
+        for (sigkill_delivered, flag) in [(false, false), (true, true)] {
+            let h = handle(
+                pid,
+                Some(token),
+                RUNNING,
+                recording(Some(sigkill_delivered)),
+            );
+            assert!(h.kill_blocking().is_err());
+            assert_eq!(h.killed.load(Ordering::SeqCst), flag);
+        }
+        platform::kill_pid(pid).unwrap();
+        child.wait().unwrap();
     }
 
     #[tokio::test]

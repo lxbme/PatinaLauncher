@@ -11,6 +11,7 @@ errors:
     invalid_id: "无效的实例 ID：%{id}"
     invalid_config: "实例配置无效：%{reason}"
     invalid_icon: "图标无效：%{reason}"
+    not_broken: "实例 %{id} 现在可以正常读取，因此没有删除"
     icon_reason:
       too_large: "图标文件超过 8 MiB"
       format: "仅支持 PNG、JPEG 和 WebP 图片"
@@ -68,6 +69,7 @@ errors:
   locks:
     instance_busy: "该实例（%{id}）正在执行其他操作，请等它完成后再试"
     version_busy: "版本 %{id} 正在使用或安装中，请稍后再试"
+    processors_busy: "另一个 Minecraft %{mc} 的 Forge 或 NeoForge 安装正在进行，请等它完成后再试"
   session:
     already_running: "实例 %{id} 已在运行"
     io: "文件操作失败（%{path}）：%{error}"

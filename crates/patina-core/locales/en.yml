@@ -11,6 +11,7 @@ errors:
     invalid_id: "Invalid instance ID: %{id}"
     invalid_config: "Invalid instance config: %{reason}"
     invalid_icon: "Invalid icon: %{reason}"
+    not_broken: "Instance %{id} loads correctly again, so it was not deleted"
     icon_reason:
       too_large: "the icon file is larger than 8 MiB"
       format: "only PNG, JPEG and WebP images are supported"
@@ -68,6 +69,7 @@ errors:
   locks:
     instance_busy: "Another operation is already running on instance %{id}; try again when it finishes"
     version_busy: "The version %{id} is in use or being installed; try again later"
+    processors_busy: "Another Forge or NeoForge installation for Minecraft %{mc} is in progress; try again when it finishes"
   session:
     already_running: "Instance %{id} is already running"
     io: "File operation failed (%{path}): %{error}"

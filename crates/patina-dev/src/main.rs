@@ -1,7 +1,7 @@
 //! `patina-dev`: development CLI over patina-core.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -17,8 +17,10 @@ use patina_core::instance::Instance;
 use patina_core::instance::{InstanceStore, effective_java};
 use patina_core::instance_files::{early_window_disabled, set_early_window_disabled};
 use patina_core::java::{ManagedRuntimes, detect_all};
+#[cfg(feature = "dev-offline")]
+use patina_core::launch::dev_offline_account;
 use patina_core::launch::running::CURRENT_LOG;
-use patina_core::launch::{GameSession, LogLine, SessionExit, dev_offline_account};
+use patina_core::launch::{GameSession, LogLine, SessionExit};
 use patina_core::loader::LoaderKind;
 use patina_core::loader::list::{LoaderError, VersionPick, list_versions};
 use patina_core::loader::ops::{
@@ -32,6 +34,7 @@ use patina_dev::cli::{
     Toggle, parse_pick,
 };
 use patina_dev::follow::follow_logs;
+use patina_dev::{out, outln};
 use tokio::sync::mpsc;
 
 struct Ctx {
@@ -65,7 +68,7 @@ impl Ctx {
         let before = self.config.download.auto_pick.clone();
         let source = resolve_mirror(&client, &mut self.config).await;
         if self.config.download.auto_pick != before {
-            println!("Speed test picked download source: {}", source.mirror.id);
+            outln!("Speed test picked download source: {}", source.mirror.id);
             self.save()?;
         }
         Ok(Launcher {
@@ -80,14 +83,15 @@ async fn main() -> Result<()> {
     // Developer tool: core errors printed here must be English.
     patina_core::i18n::set_language(patina_core::i18n::Language::En);
     let cli = Cli::parse();
-    let default_level = if cli.verbose { "debug" } else { "warn" };
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let (filter, warning) = log_filter(cli.verbose, rust_log.as_deref());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
     let mut ctx = Ctx::load(cli.data_dir)?;
     // After argument parsing, so `--help` and usage errors stay fast. The
     // explicit `sweep` command reports its own result instead.
@@ -96,13 +100,16 @@ async fn main() -> Result<()> {
     }
     match cli.cmd {
         Cmd::Instance { cmd } => instance(&mut ctx, cmd).await,
-        Cmd::Java { cmd } => java(&ctx, cmd),
+        Cmd::Java { cmd } => java(&ctx, cmd).await,
         Cmd::Source { cmd } => source(&mut ctx, cmd).await,
+        #[cfg(feature = "dev-offline")]
         Cmd::Launch {
             id,
             account,
             offline,
         } => launch(&mut ctx, &id, account.as_deref(), offline.as_deref()).await,
+        #[cfg(not(feature = "dev-offline"))]
+        Cmd::Launch { id, account } => launch(&mut ctx, &id, account.as_deref(), None).await,
         Cmd::Status => status(&ctx),
         Cmd::Kill { id } => kill(&ctx, &id).await,
         Cmd::Logs { id, follow } => logs(&ctx, &id, follow).await,
@@ -110,9 +117,34 @@ async fn main() -> Result<()> {
         Cmd::Account { cmd } => account(&ctx, cmd),
         Cmd::Sweep => {
             let n = sweep(&ctx.data)?;
-            println!("Removed {n} stale temp file(s)");
+            outln!("Removed {n} stale temp file(s)");
             Ok(())
         }
+    }
+}
+
+/// Log level when neither `-v` nor `RUST_LOG` says otherwise.
+const DEFAULT_LOG: &str = "warn";
+/// `-v`: debug output from Patina's own crates only; dependencies stay at warn.
+const VERBOSE_LOG: &str = "warn,patina_core=debug,patina_dev=debug";
+
+/// The tracing filter: a valid, non-empty `RUST_LOG` wins; otherwise the
+/// `-v` / default directives. An invalid `RUST_LOG` yields a warning to print.
+fn log_filter(
+    verbose: bool,
+    rust_log: Option<&str>,
+) -> (tracing_subscriber::EnvFilter, Option<String>) {
+    use tracing_subscriber::EnvFilter;
+    let fallback = || EnvFilter::new(if verbose { VERBOSE_LOG } else { DEFAULT_LOG });
+    match rust_log.map(str::trim).filter(|v| !v.is_empty()) {
+        None => (fallback(), None),
+        Some(v) => match EnvFilter::try_new(v) {
+            Ok(f) => (f, None),
+            Err(e) => (
+                fallback(),
+                Some(format!("warning: ignoring invalid RUST_LOG {v:?}: {e}")),
+            ),
+        },
     }
 }
 
@@ -144,22 +176,22 @@ fn list_healthy(store: &InstanceStore) -> Result<patina_core::instance::ListOutc
 fn status(ctx: &Ctx) -> Result<()> {
     let out = list_healthy(&ctx.store())?;
     if out.instances.is_empty() {
-        println!("(no instances)");
+        outln!("(no instances)");
     }
     for inst in &out.instances {
         // Dropping a reattached session releases its locks and keeps the record.
         match GameSession::reattach(inst) {
-            Some(s) => println!("{}  running pid={}", inst.id, s.pid()),
-            None => println!("{}  stopped", inst.id),
+            Some(s) => outln!("{}  running pid={}", inst.id, s.pid()),
+            None => outln!("{}  stopped", inst.id),
         }
     }
     Ok(())
 }
 
 fn print_exit(exit: &SessionExit) {
-    println!("Game exited: {exit:?}");
+    outln!("Game exited: {exit:?}");
     if let Some(p) = &exit.saved_log {
-        println!("Crash log saved to {}", p.display());
+        outln!("Crash log saved to {}", p.display());
     }
 }
 
@@ -172,7 +204,7 @@ async fn kill(ctx: &Ctx, id: &str) -> Result<()> {
     session.kill().await?;
     // Waiting clears the running record and reports a crash if there was one.
     let exit = session.wait().await;
-    println!("Stopped pid {pid}");
+    outln!("Stopped pid {pid}");
     print_exit(&exit);
     Ok(())
 }
@@ -207,8 +239,8 @@ async fn logs(ctx: &Ctx, id: &str, follow: bool) -> Result<()> {
     let inst = ctx.store().load(id)?;
     let Some(session) = GameSession::reattach(&inst) else {
         match newest_crash_log(&inst.dir.join("patina-logs")) {
-            Some(p) => println!("{}", p.display()),
-            None => println!("no crash logs"),
+            Some(p) => outln!("{}", p.display()),
+            None => outln!("no crash logs"),
         }
         return Ok(());
     };
@@ -216,10 +248,13 @@ async fn logs(ctx: &Ctx, id: &str, follow: bool) -> Result<()> {
         drop(session);
         let mut f = std::fs::File::open(inst.dir.join(CURRENT_LOG))
             .with_context(|| format!("opening the log of {id:?}"))?;
-        std::io::copy(&mut f, &mut std::io::stdout().lock())?;
+        if let Err(e) = std::io::copy(&mut f, &mut std::io::stdout().lock()) {
+            patina_dev::out::exit_if_broken_pipe(&e);
+            return Err(e.into());
+        }
         return Ok(());
     }
-    let print = |l: LogLine| println!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
+    let print = |l: LogLine| outln!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
     // Ctrl-C only stops watching; the game keeps running.
     let stop = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -235,21 +270,21 @@ async fn search(ctx: &Ctx, query: &str) -> Result<()> {
     let out = list_healthy(&store)?;
     let mut index = ModIndex::open(&ctx.data);
     index.refresh(&store).await?;
-    println!("Instances:");
+    outln!("Instances:");
     let found = InstanceStore::search_instances(&out, query);
     if found.is_empty() {
-        println!("  (none)");
+        outln!("  (none)");
     }
     for i in found {
-        println!("  {}  {}  {}", i.id, i.config.name, i.config.mc_version());
+        outln!("  {}  {}  {}", i.id, i.config.name, i.config.mc_version());
     }
-    println!("Mods:");
+    outln!("Mods:");
     let hits = index.search(query, 50);
     if hits.is_empty() {
-        println!("  (none)");
+        outln!("  (none)");
     }
     for h in hits {
-        println!(
+        outln!(
             "  {} {} \u{2014} {}/{}",
             h.name,
             h.version.as_deref().unwrap_or("-"),
@@ -257,8 +292,8 @@ async fn search(ctx: &Ctx, query: &str) -> Result<()> {
             h.file_name
         );
     }
-    println!("Online:");
-    println!("  (online search: coming in P1)");
+    outln!("Online:");
+    outln!("  (online search: coming in P1)");
     Ok(())
 }
 
@@ -267,7 +302,7 @@ fn account(ctx: &Ctx, cmd: AccountCmd) -> Result<()> {
     match cmd {
         AccountCmd::List => {
             if store.accounts().is_empty() {
-                println!("(no accounts)");
+                outln!("(no accounts)");
             }
             let current = store.current().map(|a| a.id.clone());
             for a in store.accounts() {
@@ -276,25 +311,38 @@ fn account(ctx: &Ctx, cmd: AccountCmd) -> Result<()> {
                 } else {
                     ' '
                 };
-                println!("{mark} {}  {:?}  {}", a.id, a.kind, a.username);
+                outln!("{mark} {}  {:?}  {}", a.id, a.kind, a.username);
             }
             return Ok(());
         }
+        #[cfg(feature = "dev-offline")]
         AccountCmd::AddOffline { name } => {
             let a = store.add_offline(&name)?;
-            println!("Account {} ({})", a.id, a.username);
+            outln!("Account {} ({})", a.id, a.username);
         }
         AccountCmd::Use { id } => {
             store.set_current(&id)?;
-            println!("Current account: {id}");
+            outln!("Current account: {id}");
         }
         AccountCmd::Remove { id } => {
             store.remove(&id)?;
-            println!("Removed account {id}");
+            outln!("Removed account {id}");
         }
     }
     store.save()?;
     Ok(())
+}
+
+/// The early-window setting only affects NeoForge; a note for anything else.
+fn early_window_warning(inst: &Instance) -> Option<String> {
+    match inst.config.loader() {
+        Some((LoaderKind::Neoforge, _)) => None,
+        other => Some(format!(
+            "warning: the early window setting only affects NeoForge; {:?} uses {}",
+            inst.id,
+            other.map_or("no loader".to_string(), |(k, _)| kind_name(k).to_string())
+        )),
+    }
 }
 
 fn mod_format_for(inst: &Instance) -> Option<ModFormat> {
@@ -305,50 +353,54 @@ fn mod_format_for(inst: &Instance) -> Option<ModFormat> {
     })
 }
 
+/// `dir/file` for a mod file named on the command line; only a plain file
+/// name is accepted.
+fn mod_file_path(dir: &std::path::Path, file: &str) -> Result<PathBuf> {
+    if !is_safe_name(file) {
+        bail!("{file:?} is not a plain file name");
+    }
+    Ok(dir.join(file))
+}
+
 fn mods(ctx: &Ctx, id: &str, cmd: ModsCmd) -> Result<()> {
     let store = ctx.store();
     let inst = store.load(id)?;
     let dir = inst.game_dir().join("mods");
-    let file_path = |file: &str| {
-        if !is_safe_name(file) {
-            bail!("{file:?} is not a plain file name");
-        }
-        Ok(dir.join(file))
-    };
+    let file_path = |file: &str| mod_file_path(&dir, file);
     match cmd {
         ModsCmd::List => {
             let entries = scan_mods(&dir, mod_format_for(&inst))?;
             if entries.is_empty() {
-                println!("(no mods)");
+                outln!("(no mods)");
             }
             for e in entries {
                 let state = if e.enabled { "enabled" } else { "disabled" };
                 match &e.meta {
-                    Some(m) => println!(
+                    Some(m) => outln!(
                         "{}  [{state}]  {} {}  {:?}",
                         e.file_name,
                         m.name,
                         m.version.as_deref().unwrap_or("-"),
                         m.format
                     ),
-                    None => println!("{}  [{state}]  (no metadata)", e.file_name),
+                    None => outln!("{}  [{state}]  (no metadata)", e.file_name),
                 }
             }
         }
         ModsCmd::Enable { file } => {
             let _lock = store.lock(id)?;
             let p = set_mod_enabled(&file_path(&file)?, true)?;
-            println!("{}", p.file_name().unwrap_or_default().to_string_lossy());
+            outln!("{}", p.file_name().unwrap_or_default().to_string_lossy());
         }
         ModsCmd::Disable { file } => {
             let _lock = store.lock(id)?;
             let p = set_mod_enabled(&file_path(&file)?, false)?;
-            println!("{}", p.file_name().unwrap_or_default().to_string_lossy());
+            outln!("{}", p.file_name().unwrap_or_default().to_string_lossy());
         }
         ModsCmd::Delete { file } => {
             let _lock = store.lock(id)?;
             delete_mod(&file_path(&file)?)?;
-            println!("Deleted {file}");
+            outln!("Deleted {file}");
         }
     }
     Ok(())
@@ -356,11 +408,11 @@ fn mods(ctx: &Ctx, id: &str, cmd: ModsCmd) -> Result<()> {
 
 fn print_packs(packs: Vec<patina_core::content::packs::PackEntry>) {
     if packs.is_empty() {
-        println!("(none)");
+        outln!("(none)");
     }
     for p in packs {
         let kind = if p.is_dir { "dir" } else { "zip" };
-        println!(
+        outln!(
             "{}  [{kind}]  {}",
             p.name,
             p.description.as_deref().unwrap_or("-")
@@ -371,13 +423,13 @@ fn print_packs(packs: Vec<patina_core::content::packs::PackEntry>) {
 fn saves(inst: &Instance) -> Result<()> {
     let worlds = scan_saves(&inst.game_dir().join("saves"))?;
     if worlds.is_empty() {
-        println!("(no worlds)");
+        outln!("(no worlds)");
     }
     for w in worlds {
         let played = w
             .last_played
             .map_or("never".to_string(), |ms| format!("{ms} (unix ms)"));
-        println!(
+        outln!(
             "{}  {:?}  last played: {played}",
             w.dir_name,
             w.level_name.as_deref().unwrap_or("-")
@@ -395,7 +447,7 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
             }
             let list = out.instances;
             if list.is_empty() {
-                println!("(no instances)");
+                outln!("(no instances)");
             }
             for i in list {
                 let played = i
@@ -405,7 +457,7 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
                 let loader = i.config.loader().map_or("vanilla".to_string(), |(k, c)| {
                     format!("{}@{}", kind_name(k), c.version)
                 });
-                println!(
+                outln!(
                     "{:<20} {:<20} {:<10} {:<28} last played: {}",
                     i.id,
                     i.config.name,
@@ -432,9 +484,10 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
             }
             let store = ctx.store();
             let inst = store.create(&name, &version)?;
-            println!(
+            outln!(
                 "Created instance {:?} (ID: {:?}, version {version})",
-                name, inst.id
+                name,
+                inst.id
             );
             if let Some(LoaderSpec { kind, pick }) = loader {
                 let result = run_install(&launcher, &store, &inst.id, kind, pick, false).await;
@@ -446,7 +499,7 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
         }
         InstanceCmd::Delete { id } => {
             ctx.store().delete(&id)?;
-            println!("Deleted instance {id:?}");
+            outln!("Deleted instance {id:?}");
         }
         InstanceCmd::Loader { cmd } => loader(ctx, cmd).await?,
         InstanceCmd::Mods { id, cmd } => mods(ctx, &id, cmd)?,
@@ -466,7 +519,7 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
                 IconCmd::Custom { path } => store.set_custom_icon(&id, &path)?,
                 IconCmd::Clear => store.clear_icon(&id)?,
             };
-            println!("Icon of {id:?} is now {:?}", inst.config.icon);
+            outln!("Icon of {id:?} is now {:?}", inst.config.icon);
         }
         InstanceCmd::ReinstallLoader { id } => {
             let launcher = ctx.launcher().await?;
@@ -475,7 +528,7 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
             let result = reinstall_loader(&launcher, &ctx.store(), &id, Some(tx)).await;
             let _ = printer.await;
             let outcome = loader_result(result)?;
-            println!(
+            outln!(
                 "Reinstalled {} for {id:?} in {:.1}s; {} download(s) fell back to another source",
                 loader_label(&outcome),
                 start.elapsed().as_secs_f64(),
@@ -486,10 +539,13 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
         InstanceCmd::EarlyWindow { id, state } => {
             let store = ctx.store();
             let inst = store.load(&id)?;
+            if let Some(w) = early_window_warning(&inst) {
+                eprintln!("{w}");
+            }
             let _lock = store.lock(&id)?;
             set_early_window_disabled(&inst.game_dir(), state == Toggle::Off)?;
             let on = !early_window_disabled(&inst.game_dir())?;
-            println!(
+            outln!(
                 "Early window of {id:?} is now {}",
                 if on { "on" } else { "off" }
             );
@@ -516,10 +572,10 @@ async fn instance(ctx: &mut Ctx, cmd: InstanceCmd) -> Result<()> {
             if let Err(e) = &result
                 && let Some(hint) = loader_error_hint(e)
             {
-                println!("{hint}");
+                outln!("{hint}");
             }
             let outcome = loader_result(result)?;
-            println!(
+            outln!(
                 "Instance {id:?} is now Minecraft {} with {} ({:.1}s; {} download(s) fell back to another source)",
                 outcome.instance.config.mc_version(),
                 loader_label(&outcome),
@@ -540,7 +596,7 @@ async fn loader(ctx: &mut Ctx, cmd: LoaderCmd) -> Result<()> {
             let mc = inst.config.mc_version().to_string();
             let launcher = ctx.launcher().await?;
             let list = loader_result(list_versions(&launcher.downloader, kind, &mc).await)?;
-            println!("{} versions for Minecraft {mc}:", kind_name(kind));
+            outln!("{} versions for Minecraft {mc}:", kind_name(kind));
             for v in list {
                 let mut tags = Vec::new();
                 if v.recommended {
@@ -553,9 +609,9 @@ async fn loader(ctx: &mut Ctx, cmd: LoaderCmd) -> Result<()> {
                     tags.push("[beta]");
                 }
                 if tags.is_empty() {
-                    println!("{}", v.version);
+                    outln!("{}", v.version);
                 } else {
-                    println!("{} {}", v.version, tags.join(" "));
+                    outln!("{} {}", v.version, tags.join(" "));
                 }
             }
         }
@@ -574,7 +630,7 @@ async fn loader(ctx: &mut Ctx, cmd: LoaderCmd) -> Result<()> {
         }
         LoaderCmd::Remove { id } => {
             let outcome = loader_result(remove_loader(&ctx.store(), &id))?;
-            println!(
+            outln!(
                 "Instance {id:?} is now Minecraft {} with {}",
                 outcome.instance.config.mc_version(),
                 loader_label(&outcome)
@@ -594,7 +650,7 @@ async fn run_install(
     pick: VersionPick,
     replace: bool,
 ) -> Result<()> {
-    println!("Installing {} ({pick:?}) into {id:?}", kind_name(kind));
+    outln!("Installing {} ({pick:?}) into {id:?}", kind_name(kind));
     let start = Instant::now();
     let (tx, printer) = install_printer(start);
     let result = install_loader(launcher, store, id, kind, pick, replace, Some(tx)).await;
@@ -602,10 +658,10 @@ async fn run_install(
     if let Err(e) = &result
         && let Some(hint) = loader_error_hint(e)
     {
-        println!("{hint}");
+        outln!("{hint}");
     }
     let outcome = loader_result(result)?;
-    println!(
+    outln!(
         "Installed {} into {id:?} in {:.1}s; {} download(s) fell back to another source",
         loader_label(&outcome),
         start.elapsed().as_secs_f64(),
@@ -641,7 +697,7 @@ fn undo_create<E: std::fmt::Display>(
     delete: impl FnOnce() -> std::result::Result<(), E>,
 ) -> anyhow::Error {
     match delete() {
-        Ok(()) => println!("Deleted instance {id:?} again"),
+        Ok(()) => outln!("Deleted instance {id:?} again"),
         Err(d) => eprintln!("Could not delete the half-made instance {id:?}: {d}"),
     }
     err
@@ -678,7 +734,7 @@ fn loader_label(outcome: &OpOutcome) -> String {
 
 fn print_notices(outcome: &OpOutcome) {
     for n in &outcome.notices {
-        println!("Notice ({n:?}): {n}");
+        outln!("Notice ({n:?}): {n}");
     }
 }
 
@@ -721,7 +777,6 @@ fn install_printer(
 }
 
 async fn print_install_progress(mut rx: mpsc::UnboundedReceiver<TaskProgress>, start: Instant) {
-    use std::io::Write;
     let mut current: Option<TaskProgress> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     let render = |p: &TaskProgress, newline: bool| {
@@ -732,10 +787,9 @@ async fn print_install_progress(mut rx: mpsc::UnboundedReceiver<TaskProgress>, s
             start.elapsed().as_secs_f64()
         );
         if newline {
-            println!("\r{line:<60}");
+            outln!("\r{line:<60}");
         } else {
-            print!("\r{line:<60}");
-            let _ = std::io::stdout().flush();
+            out!("\r{line:<60}");
         }
     };
     loop {
@@ -764,39 +818,39 @@ async fn print_install_progress(mut rx: mpsc::UnboundedReceiver<TaskProgress>, s
     }
 }
 
-fn java(ctx: &Ctx, cmd: JavaCmd) -> Result<()> {
+async fn java(ctx: &Ctx, cmd: JavaCmd) -> Result<()> {
     let runtimes = ManagedRuntimes::new(ctx.data.runtimes());
     match cmd {
         JavaCmd::List => {
-            println!("Detected Java installations:");
+            outln!("Detected Java installations:");
             let found = detect_all();
             if found.is_empty() {
-                println!("  (none found)");
+                outln!("  (none found)");
             }
             for j in found {
                 let bits = if j.is_64bit { "64-bit" } else { "32-bit" };
-                println!(
+                outln!(
                     "  Java {:<3} {:<14} {bits}  {}",
                     j.major,
                     j.version,
                     j.path.display()
                 );
             }
-            println!("Managed runtimes ({}):", ctx.data.runtimes().display());
+            outln!("Managed runtimes ({}):", ctx.data.runtimes().display());
             let installed = runtimes.list_installed();
             if installed.is_empty() {
-                println!("  (none installed)");
+                outln!("  (none installed)");
             }
             for (component, version) in installed {
-                println!(
+                outln!(
                     "  {component:<24} {version:<16} {}",
                     runtimes.java_bin(&component).display()
                 );
             }
         }
         JavaCmd::Remove { component } => {
-            runtimes.remove(&component)?;
-            println!("Removed managed runtime {component}");
+            runtimes.remove(&component).await?;
+            outln!("Removed managed runtime {component}");
         }
     }
     Ok(())
@@ -806,8 +860,8 @@ async fn source(ctx: &mut Ctx, cmd: SourceCmd) -> Result<()> {
     match cmd {
         SourceCmd::Show => {
             let d = &ctx.config.download;
-            println!("Download source: {:?}", d.source);
-            println!(
+            outln!("Download source: {:?}", d.source);
+            outln!(
                 "Auto speed-test pick: {}",
                 d.auto_pick.as_deref().unwrap_or("(none)")
             );
@@ -819,7 +873,7 @@ async fn source(ctx: &mut Ctx, cmd: SourceCmd) -> Result<()> {
                 ctx.config.download.auto_pick = None;
             }
             ctx.save()?;
-            println!("Download source set to {:?}", ctx.config.download.source);
+            outln!("Download source set to {:?}", ctx.config.download.source);
         }
         SourceCmd::Speedtest => {
             let client = http_client()?;
@@ -827,31 +881,25 @@ async fn source(ctx: &mut Ctx, cmd: SourceCmd) -> Result<()> {
             let results = measure_all(&client, &builtin, PROBE_URL, SPEEDTEST_TIMEOUT).await;
             for (m, t) in &results {
                 match t {
-                    Some(t) => println!("  {:<10} {} ms", m.id, t.as_millis()),
-                    None => println!("  {:<10} failed or timed out", m.id),
+                    Some(t) => outln!("  {:<10} {} ms", m.id, t.as_millis()),
+                    None => outln!("  {:<10} failed or timed out", m.id),
                 }
             }
             match fastest(&results) {
                 Some(pick) => {
                     ctx.config.download.auto_pick = Some(pick.id.clone());
                     ctx.save()?;
-                    println!("Auto mode will use: {}", pick.id);
+                    outln!("Auto mode will use: {}", pick.id);
                 }
-                None => println!("Every source failed; nothing stored, auto mode will test again"),
+                None => outln!("Every source failed; nothing stored, auto mode will test again"),
             }
         }
     }
     Ok(())
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// The account to play as: `--offline` (not stored), `--account`, or the
+/// The account to play as: `--offline` (not stored; only with the
+/// `dev-offline` feature, otherwise always `None`), `--account`, or the
 /// current account. A Microsoft account fails with the localized
 /// `MsaUnavailable` message until sign-in exists.
 fn launch_account(
@@ -860,14 +908,23 @@ fn launch_account(
     offline: Option<&str>,
 ) -> Result<patina_core::launch::LaunchAccount> {
     if let Some(name) = offline {
+        #[cfg(feature = "dev-offline")]
         return Ok(dev_offline_account(name));
+        #[cfg(not(feature = "dev-offline"))]
+        bail!("offline account {name:?} needs the dev-offline feature (use `cargo dev`)");
     }
     let accounts = AccountStore::load(&ctx.data)?;
     let id = match account {
         Some(id) => id.to_string(),
         None => match accounts.current() {
             Some(a) => a.id.clone(),
-            None => bail!("no account yet; add one with `account add-offline <NAME>`"),
+            None if patina_core::DEV_OFFLINE => {
+                bail!("no account yet; add one with `account add-offline <NAME>`")
+            }
+            None => bail!(
+                "no account yet; Microsoft sign-in is not available yet, and offline \
+                 accounts need the dev-offline feature (use `cargo dev`)"
+            ),
         },
     };
     Ok(accounts.launch_account(&id)?)
@@ -880,10 +937,10 @@ async fn launch(
     offline: Option<&str>,
 ) -> Result<()> {
     let store = ctx.store();
-    let mut inst = store.load(id)?;
+    let inst = store.load(id)?;
     let account = launch_account(ctx, account, offline)?;
     let launcher = ctx.launcher().await?;
-    println!(
+    outln!(
         "Instance {:?}, version {}, source {}, data dir {}",
         inst.config.name,
         inst.config.mc_version(),
@@ -896,9 +953,9 @@ async fn launch(
         let component = v.java_requirement().component;
         let runtimes = ManagedRuntimes::new(ctx.data.runtimes());
         if runtimes.is_installed(&component) {
-            println!("Using managed Java runtime {component}");
+            outln!("Using managed Java runtime {component}");
         } else {
-            println!("Managed Java runtime {component} is not installed; downloading...");
+            outln!("Managed Java runtime {component} is not installed; downloading...");
         }
     }
 
@@ -907,24 +964,23 @@ async fn launch(
     let result = GameSession::start(&launcher, &inst, &ctx.config, &account, Some(ptx)).await;
     let _ = printer.await;
     let mut game = result?;
-    println!(
+    outln!(
         "Started in {:.1}s; {} download(s) fell back to another source",
         start.elapsed().as_secs_f64(),
         launcher.downloader.fallback_count()
     );
     for w in game.warnings() {
-        println!("Warning: {w}");
+        outln!("Warning: {w}");
     }
-    println!("Game process PID: {}", game.pid());
-    inst.config.last_played = Some(now_secs());
-    if let Err(e) = store.save(&inst) {
+    outln!("Game process PID: {}", game.pid());
+    if let Err(e) = store.touch_played(&inst.id) {
         eprintln!("Warning: failed to save last_played: {e}");
     }
 
     let mut logs = game.logs();
     let printer = tokio::spawn(async move {
         while let Some(l) = logs.recv().await {
-            println!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
+            outln!("[{}] {}", format!("{:?}", l.level).to_uppercase(), l.text);
         }
     });
     let killer = game.killer();
@@ -935,7 +991,7 @@ async fn launch(
         // Ctrl-C stops the game (not just this tool); the session is still
         // waited on afterwards so the exit is reported and the record cleared.
         _ = tokio::signal::ctrl_c() => {
-            println!("Ctrl-C received, stopping the game process...");
+            outln!("Ctrl-C received, stopping the game process...");
             if let Err(e) = killer.kill().await {
                 eprintln!("Failed to stop the game: {e}");
             }
@@ -944,12 +1000,88 @@ async fn launch(
     };
     let _ = tokio::time::timeout(Duration::from_secs(3), printer).await;
     print_exit(&exit);
+    exit_status(&exit)
+}
+
+/// `launch` fails (non-zero exit) when the game crashed.
+fn exit_status(exit: &SessionExit) -> Result<()> {
+    if exit.crashed {
+        bail!("the game crashed");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mod_file_guard_rejects_paths() {
+        let dir = std::path::Path::new("/m");
+        for bad in ["../x.jar", "a/b.jar", "", ".", "..", "/abs.jar"] {
+            assert!(mod_file_path(dir, bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(mod_file_path(dir, "ok.jar").unwrap(), dir.join("ok.jar"));
+    }
+
+    #[test]
+    fn early_window_warns_unless_neoforge() {
+        use patina_core::instance::{Component, ComponentUid};
+        let mut inst = Instance {
+            id: "i".into(),
+            dir: PathBuf::from("/i"),
+            config: Default::default(),
+        };
+        assert!(early_window_warning(&inst).is_some());
+        for (uid, warn) in [(ComponentUid::Forge, true), (ComponentUid::Neoforge, false)] {
+            inst.config
+                .set_loader(Some(Component {
+                    uid,
+                    version: "1".into(),
+                    profile: None,
+                }))
+                .unwrap();
+            assert_eq!(early_window_warning(&inst).is_some(), warn, "{uid:?}");
+        }
+    }
+
+    #[test]
+    fn crashed_game_is_a_failure() {
+        let exit = |crashed| SessionExit {
+            code: Some(1),
+            crashed,
+            saved_log: None,
+        };
+        assert!(exit_status(&exit(true)).is_err());
+        assert!(exit_status(&exit(false)).is_ok());
+    }
+
+    #[test]
+    fn verbose_logs_only_patina_crates_at_debug() {
+        let (f, w) = log_filter(true, None);
+        assert!(w.is_none());
+        let s = f.to_string();
+        assert!(
+            s.contains("patina_core=debug") && s.contains("patina_dev=debug"),
+            "{s}"
+        );
+        assert!(!s.split(',').any(|d| d == "debug"), "{s}");
+        assert_eq!(log_filter(false, Some("  ")).0.to_string(), "warn");
+    }
+
+    #[test]
+    fn invalid_rust_log_warns_once_and_falls_back() {
+        let (f, w) = log_filter(false, Some("patina_core=loud"));
+        assert_eq!(f.to_string(), "warn");
+        let w = w.expect("a warning");
+        assert!(
+            w.contains("RUST_LOG") && w.contains("patina_core=loud"),
+            "{w}"
+        );
+        let (f, w) = log_filter(true, Some("reqwest=trace"));
+        assert!(w.is_none());
+        assert_eq!(f.to_string(), "reqwest=trace");
+    }
 
     #[test]
     fn newest_crash_log_orders_by_stamp_then_counter() {

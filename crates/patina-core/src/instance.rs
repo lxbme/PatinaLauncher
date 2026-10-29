@@ -23,6 +23,8 @@ pub enum InstanceError {
     InvalidConfig(String),
     #[error("{}", rust_i18n::t!("errors.instance.invalid_icon", reason = .0))]
     InvalidIcon(String),
+    #[error("{}", rust_i18n::t!("errors.instance.not_broken", id = .0))]
+    NotBroken(String),
     #[error(transparent)]
     Busy(#[from] crate::locks::Busy),
 }
@@ -496,6 +498,20 @@ impl InstanceStore {
         Ok(inst)
     }
 
+    /// Records that the instance was just played. Re-reads the config so
+    /// changes made since the caller loaded it are kept. Takes no lock: it is
+    /// called while the game session holds the instance.
+    pub fn touch_played(&self, id: &str) -> Result<(), InstanceError> {
+        let mut inst = self.load(id)?;
+        inst.config.last_played = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        self.save(&inst)
+    }
+
     pub fn set_builtin_icon(&self, id: &str, name: &str) -> Result<Instance, InstanceError> {
         let mut inst = self.load(id)?;
         inst.config.icon = Some(InstanceIcon::Builtin(name.to_string()));
@@ -523,18 +539,24 @@ impl InstanceStore {
         Ok(inst)
     }
 
-    /// Removes a directory reported in [`ListOutcome::broken`]. Refuses
-    /// anything that is not a real (non-symlink) direct child of the
-    /// instances root.
+    /// Removes a directory reported in [`ListOutcome::broken`]. The entry is
+    /// only partly trusted: anything that is not a real (non-symlink) direct
+    /// child of the instances root is refused, and so is a directory that
+    /// loads as a healthy instance again (repaired since it was listed).
     pub fn delete_broken(&self, b: &BrokenInstance) -> Result<(), InstanceError> {
         let refuse = || InstanceError::InvalidId(b.id.clone());
         let _lock = self.lock(&b.id)?;
         if !std::fs::symlink_metadata(&b.dir)?.is_dir() {
             return Err(refuse());
         }
-        match b.dir.file_name() {
-            Some(n) if n != ".." && n != "." => {}
+        let name = match b.dir.file_name() {
+            Some(n) if n != ".." && n != "." => n,
             _ => return Err(refuse()),
+        };
+        if let Some(name) = name.to_str().filter(|n| is_safe_name(n))
+            && self.read(name).is_ok()
+        {
+            return Err(InstanceError::NotBroken(b.id.clone()));
         }
         let parent = b.dir.parent().ok_or_else(refuse)?;
         if std::fs::canonicalize(parent)? != std::fs::canonicalize(&self.root)? {
@@ -760,6 +782,27 @@ mod tests {
             Err(InstanceError::InvalidConfig(_))
         ));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn touch_played_keeps_changes_made_since_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let stale = store.create("Old", "1.20.1").unwrap();
+        store.rename(&stale.id, "New").unwrap();
+        let _held = store.lock(&stale.id).unwrap(); // as a running game holds it
+        store.touch_played(&stale.id).unwrap();
+        let now = store.load(&stale.id).unwrap();
+        assert_eq!(now.config.name, "New");
+        assert!(now.config.last_played.is_some_and(|t| t > 0));
+        assert!(matches!(
+            store.touch_played("missing"),
+            Err(InstanceError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.touch_played("../x"),
+            Err(InstanceError::InvalidId(_))
+        ));
     }
 
     #[test]
@@ -1121,5 +1164,34 @@ mod tests {
             );
         }
         assert!(outside.exists() && root.join("good/minecraft").exists());
+    }
+
+    /// A stale broken entry (repaired since it was listed, or forged) never
+    /// deletes a healthy instance.
+    #[test]
+    fn delete_broken_refuses_a_healthy_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        write_raw(tmp.path(), "torn", "name = [");
+        let out = store.list().unwrap();
+        let b = out.broken.into_iter().next().unwrap();
+        // Repaired before the user confirmed the deletion.
+        let good = store.create("good", "1.20").unwrap();
+        std::fs::copy(good.dir.join(CONFIG_FILE), b.dir.join(CONFIG_FILE)).unwrap();
+        assert!(matches!(
+            store.delete_broken(&b),
+            Err(InstanceError::NotBroken(id)) if id == "torn"
+        ));
+        assert!(b.dir.join(CONFIG_FILE).is_file());
+        let forged = BrokenInstance {
+            id: good.id.clone(),
+            dir: good.dir.clone(),
+            error: InstanceError::NotFound(good.id.clone()),
+        };
+        assert!(matches!(
+            store.delete_broken(&forged),
+            Err(InstanceError::NotBroken(_))
+        ));
+        assert!(good.dir.is_dir());
     }
 }

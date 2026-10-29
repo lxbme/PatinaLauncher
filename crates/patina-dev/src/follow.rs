@@ -51,10 +51,23 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    struct Killer(u32);
+    /// Kills a test-spawned process on drop, but only while the pid still
+    /// carries that process's identity (it may be reaped and reused by then).
+    struct Killer {
+        pid: u32,
+        token: Option<u64>,
+    }
+    fn killer(pid: u32) -> Killer {
+        Killer {
+            pid,
+            token: proc_info(pid).map(|i| i.start_time),
+        }
+    }
     impl Drop for Killer {
         fn drop(&mut self) {
-            let _ = kill_pid(self.0);
+            if self.token.is_some() && proc_info(self.pid).map(|i| i.start_time) == self.token {
+                let _ = kill_pid(self.pid);
+            }
         }
     }
 
@@ -92,7 +105,7 @@ mod tests {
         // Started by "another launcher": only the record and the log file link us.
         let mut child = spawn_detached(&cmd, &log).unwrap();
         let pid = child.id();
-        let _k = Killer(pid);
+        let _k = killer(pid);
         let rec = RunningRecord {
             pid,
             start_time: proc_info(pid).unwrap().start_time,
@@ -141,7 +154,9 @@ mod tests {
             program: "sh".into(),
             args: vec![
                 "-c".into(),
-                "echo hello; sleep 60".into(),
+                // Not `…; sleep 60`: bash may exec a trailing simple command,
+                // which drops the `-Dpatina.instance=` marker `verify` needs.
+                "echo hello; sleep 60 & wait".into(),
                 "x".into(),
                 "-Dpatina.instance=i1".into(),
             ],
@@ -149,7 +164,7 @@ mod tests {
         };
         let mut child = spawn_detached(&cmd, &log).unwrap();
         let pid = child.id();
-        let k = Killer(pid);
+        let k = killer(pid);
         let rec = RunningRecord {
             pid,
             start_time: proc_info(pid).unwrap().start_time,

@@ -221,7 +221,9 @@ mod tests {
     #[test]
     fn probe_times_out() {
         let tmp = tempfile::tempdir().unwrap();
-        let java = fake_jdk(tmp.path(), "#!/bin/sh\nsleep 30\n");
+        // `exec`: the probe kills only the process it started, so a forked
+        // `sleep` would outlive the test (and hold the stderr pipe open).
+        let java = fake_jdk(tmp.path(), "#!/bin/sh\nexec sleep 30\n");
         let t = std::time::Instant::now();
         assert_eq!(probe(&java), None);
         assert!(t.elapsed() < std::time::Duration::from_secs(10));

@@ -53,6 +53,15 @@ impl DataDirs {
         crate::locks::Locks::global().version_exclusive(&self.versions(), id)
     }
 
+    /// Exclusive use of the Forge/NeoForge processor outputs shared by every
+    /// loader build of Minecraft `mc` in this data dir.
+    pub fn lock_processors(
+        &self,
+        mc: &str,
+    ) -> Result<crate::locks::VersionExclusive, crate::locks::Busy> {
+        crate::locks::Locks::global().processors(&self.versions(), mc)
+    }
+
     pub fn versions(&self) -> PathBuf {
         self.root.join("versions")
     }

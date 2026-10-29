@@ -7,10 +7,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Development-only offline accounts. Off by default so a workspace build never
+# turns it on in patina-core through feature unification; `cargo dev` (see
+# .cargo/config.toml) enables it.
+dev-offline = ["patina-core/dev-offline"]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-patina-core = { version = "0.1.0", path = "../patina-core", features = ["dev-offline"] }
+patina-core = { version = "0.1.0", path = "../patina-core" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

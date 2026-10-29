@@ -85,10 +85,23 @@ mod tests {
     use crate::platform::{kill_pid, proc_info, spawn_detached};
     use std::time::Duration;
 
-    struct Killer(u32);
+    /// Kills a test-spawned process on drop, but only while the pid still
+    /// carries that process's identity (it may be reaped and reused by then).
+    struct Killer {
+        pid: u32,
+        token: Option<u64>,
+    }
+    fn killer(pid: u32) -> Killer {
+        Killer {
+            pid,
+            token: proc_info(pid).map(|i| i.start_time),
+        }
+    }
     impl Drop for Killer {
         fn drop(&mut self) {
-            let _ = kill_pid(self.0);
+            if self.token.is_some() && proc_info(self.pid).map(|i| i.start_time) == self.token {
+                let _ = kill_pid(self.pid);
+            }
         }
     }
 
@@ -115,7 +128,7 @@ mod tests {
         let child =
             spawn_detached(&sh("exec sleep 30"), &dir.path().join("l/current.log")).unwrap();
         let pid = child.id();
-        let _g = Killer(pid);
+        let _g = killer(pid);
         drop(child);
         assert!(proc_info(pid).is_some());
         assert_eq!(crate::platform::process_group_of(pid), Some(pid));
@@ -128,7 +141,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut child = spawn_detached(&sh("sleep 30 & wait"), &dir.path().join("l.log")).unwrap();
         let pid = child.id();
-        let _g = Killer(pid);
+        let _g = killer(pid);
         // Find the sleep child by process group.
         let find = || {
             std::fs::read_dir("/proc")
@@ -222,7 +235,7 @@ mod tests {
         )
         .unwrap();
         let pid = child.id();
-        let _g = Killer(pid);
+        let _g = killer(pid);
         std::thread::sleep(Duration::from_millis(200));
         let info = proc_info(pid).unwrap();
         let mut rec = RunningRecord {

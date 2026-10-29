@@ -16,13 +16,47 @@ impl UserType {
     }
 }
 
+/// The identity a game is launched with. Fields and the Microsoft
+/// constructor are crate-private, so outside this crate one comes only from
+/// the account store; offline ones exist only with the `dev-offline` feature.
 #[derive(Clone)]
 pub struct LaunchAccount {
-    pub name: String,
-    pub uuid: Uuid,
-    pub access_token: String,
-    pub user_type: UserType,
-    pub xuid: Option<String>,
+    pub(crate) name: String,
+    pub(crate) uuid: Uuid,
+    pub(crate) access_token: String,
+    pub(crate) user_type: UserType,
+    pub(crate) xuid: Option<String>,
+}
+
+impl LaunchAccount {
+    /// A signed-in Microsoft account. Crate-private: outside the crate a
+    /// launch identity only comes from the account store, so a release build
+    /// cannot fabricate one with an arbitrary token.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "plan 3 builds MSA accounts from AccountStore")
+    )]
+    pub(crate) fn msa(name: &str, uuid: Uuid, access_token: &str, xuid: Option<String>) -> Self {
+        LaunchAccount {
+            name: name.to_string(),
+            uuid,
+            access_token: access_token.to_string(),
+            user_type: UserType::Msa,
+            xuid,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
+    pub fn user_type(&self) -> UserType {
+        self.user_type
+    }
 }
 
 impl std::fmt::Debug for LaunchAccount {
@@ -71,6 +105,20 @@ mod tests {
             offline_uuid("Dev").to_string(),
             "380df991-f603-344c-a090-369bad2a924a"
         );
+    }
+
+    #[test]
+    fn msa_constructor_shape() {
+        let a = LaunchAccount::msa("Player", offline_uuid("x"), "s3cret", Some("xu".into()));
+        assert_eq!(a.name(), "Player");
+        assert_eq!(a.uuid(), offline_uuid("x"));
+        assert_eq!(a.user_type(), UserType::Msa);
+        assert_eq!(
+            (a.access_token.as_str(), a.xuid.as_deref()),
+            ("s3cret", Some("xu"))
+        );
+        let dbg = format!("{a:?}");
+        assert!(!dbg.contains("s3cret") && !dbg.contains("\"xu\""), "{dbg}");
     }
 
     #[test]

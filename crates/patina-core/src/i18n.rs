@@ -28,6 +28,12 @@ impl Language {
 /// Sets the process-global locale. The library never sets one on its own;
 /// the application calls this at startup.
 pub fn set_language(l: Language) {
+    // rust-i18n builds its backend lazily on the first `t!` in the process,
+    // and that initializer reads the current locale and writes it back. A
+    // write from here landing between that read and write would be lost, so
+    // force initialization first; `LazyLock` makes this wait for an
+    // initialization already running on another thread.
+    let _ = rust_i18n::t!("source.auto");
     rust_i18n::set_locale(l.code());
 }
 
@@ -44,6 +50,105 @@ mod tests {
     use crate::download::DownloadError;
     use crate::jvm::JvmArgsError;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// Set (to a mode) only in the child processes of
+    /// `set_language_wins_against_backend_init`.
+    const RACE_CHILD_ENV: &str = "PATINA_I18N_RACE_CHILD";
+
+    /// Child half of `set_language_wins_against_backend_init`; a no-op in a
+    /// normal test run. The backend initializes once per process, so every
+    /// attempt needs a fresh process. Modes:
+    /// - `calibrate`: prints how long the first `t!` (backend init) takes, in µs;
+    /// - `<delay µs>`: eight threads do their first `t!` while a ninth calls
+    ///   `set_language(ZhCn)` after the delay; the locale must end up zh-CN.
+    #[test]
+    fn i18n_race_child() {
+        let Ok(mode) = std::env::var(RACE_CHILD_ENV) else {
+            return;
+        };
+        if mode == "calibrate" {
+            let start = std::time::Instant::now();
+            let _ = rust_i18n::t!("source.auto");
+            println!("init_us={}", start.elapsed().as_micros());
+            return;
+        }
+        let delay = std::time::Duration::from_micros(mode.parse().unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let threads: Vec<_> = (0..9)
+            .map(|i| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if i == 0 {
+                        let start = std::time::Instant::now();
+                        while start.elapsed() < delay {
+                            std::hint::spin_loop();
+                        }
+                        set_language(Language::ZhCn);
+                    } else {
+                        let _ = rust_i18n::t!("source.auto");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            &*rust_i18n::locale(),
+            "zh-CN",
+            "set_language was overwritten"
+        );
+    }
+
+    /// rust-i18n's lazy backend initializer reads the current locale and
+    /// writes it back; a `set_language` landing between that read and write
+    /// used to be lost (the flaky `source_choice_display_names_are_localized`).
+    /// The race window sits at the end of initialization, so this measures the
+    /// init time in a fresh process and then sweeps the `set_language` delay
+    /// across it, one fresh process per attempt.
+    #[test]
+    fn set_language_wins_against_backend_init() {
+        if std::env::var_os(RACE_CHILD_ENV).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let child = |mode: String| {
+            let mut c = std::process::Command::new(&exe);
+            c.args(["--exact", "i18n::tests::i18n_race_child", "--nocapture"])
+                .env(RACE_CHILD_ENV, mode)
+                .stderr(std::process::Stdio::null());
+            c
+        };
+        let out = child("calibrate".into()).output().unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        let init_us: u64 = out
+            .split("init_us=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no calibration output: {out}"));
+        let mut failures = 0;
+        for _round in 0..2 {
+            let children: Vec<_> = (0..80u64)
+                .map(|k| {
+                    child((init_us * k / 50).to_string())
+                        .stdout(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            for mut c in children {
+                if !c.wait().unwrap().success() {
+                    failures += 1;
+                }
+            }
+        }
+        assert_eq!(
+            failures, 0,
+            "set_language lost the race {failures}/160 times"
+        );
+    }
 
     /// Leaf key → its text.
     fn flatten(prefix: &str, v: &serde_json::Value, out: &mut BTreeMap<String, String>) {

@@ -1,5 +1,7 @@
 //! Offline end-to-end test of `Launcher::prepare` against a fake Mojang.
-#![cfg(unix)]
+//! Needs the `dev-offline` feature: outside the crate a launch identity can
+//! only be the development offline account.
+#![cfg(all(unix, feature = "dev-offline"))]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -7,7 +9,7 @@ use std::time::Duration;
 use patina_core::config::GlobalConfig;
 use patina_core::download::{Downloader, Mirror};
 use patina_core::instance::InstanceStore;
-use patina_core::launch::{LaunchAccount, UserType, offline_uuid};
+use patina_core::launch::{LaunchAccount, dev_offline_account};
 use patina_core::paths::DataDirs;
 use patina_core::prepare::{Launcher, PrepareError};
 use serde_json::{Value, json};
@@ -134,14 +136,10 @@ fn launcher(server: &MockServer, data: &Path) -> Launcher {
     }
 }
 
+/// A stand-in identity: the development offline account (the only one a
+/// test outside the crate can build).
 fn account() -> LaunchAccount {
-    LaunchAccount {
-        name: "Dev".into(),
-        uuid: offline_uuid("Dev"),
-        access_token: "0".into(),
-        user_type: UserType::Legacy,
-        xuid: None,
-    }
+    dev_offline_account("Dev")
 }
 
 fn fake_java(dir: &Path) -> PathBuf {

@@ -1,5 +1,9 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
+/// Whether this build has development-only offline accounts (the `dev-offline`
+/// feature). Release applications should `const`-assert that it is `false`.
+pub const DEV_OFFLINE: bool = cfg!(feature = "dev-offline");
+
 pub mod accounts;
 pub mod config;
 pub mod content;

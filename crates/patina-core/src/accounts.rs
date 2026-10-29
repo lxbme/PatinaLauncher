@@ -81,8 +81,20 @@ impl AccountStore {
                 });
             }
         };
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<Account> = file
+            .accounts
+            .into_iter()
+            .filter(|a| {
+                let first = seen.insert(a.id.clone());
+                if !first {
+                    tracing::warn!("ignoring a duplicate account entry with id {}", a.id);
+                }
+                first
+            })
+            .collect();
         let (accounts, hidden): (Vec<_>, Vec<_>) =
-            file.accounts.into_iter().partition(visible_in_this_build);
+            unique.into_iter().partition(visible_in_this_build);
         let current = file
             .current
             .as_ref()
@@ -104,7 +116,17 @@ impl AccountStore {
             current: if self.current_changed {
                 self.current.clone()
             } else {
-                self.stored_current.clone().or_else(|| self.current.clone())
+                // Keep the stored current (possibly a hidden account) unless
+                // it names no account at all.
+                self.stored_current
+                    .clone()
+                    .filter(|id| {
+                        self.accounts
+                            .iter()
+                            .chain(&self.hidden)
+                            .any(|a| &a.id == id)
+                    })
+                    .or_else(|| self.current.clone())
             },
             accounts: self
                 .accounts
@@ -347,6 +369,69 @@ mod tests {
             s2.set_current("zzz"),
             Err(AccountError::NotFound(_))
         ));
+    }
+
+    fn raw_file(d: &DataDirs) -> AccountsFile {
+        toml::from_str(&std::fs::read_to_string(d.root().join("accounts.toml")).unwrap()).unwrap()
+    }
+
+    fn msa_entry(n: u128, name: &str) -> String {
+        let u = Uuid::from_u128(n);
+        format!(
+            "[[accounts]]\nid = \"{}\"\nkind = \"msa\"\nusername = \"{name}\"\nuuid = \"{u}\"\n\n",
+            u.simple()
+        )
+    }
+
+    #[test]
+    fn duplicate_ids_keep_the_first_entry() {
+        let (_t, d) = dirs();
+        std::fs::write(
+            d.root().join("accounts.toml"),
+            format!(
+                "{}{}{}",
+                msa_entry(1, "First"),
+                msa_entry(2, "B"),
+                msa_entry(1, "Dup")
+            ),
+        )
+        .unwrap();
+        let s = AccountStore::load(&d).unwrap();
+        let names: Vec<_> = s.accounts().iter().map(|a| a.username.as_str()).collect();
+        assert_eq!(names, ["First", "B"]);
+        s.save().unwrap();
+        assert_eq!(raw_file(&d).accounts.len(), 2);
+    }
+
+    #[test]
+    fn dangling_stored_current_is_not_written_back() {
+        let (_t, d) = dirs();
+        std::fs::write(
+            d.root().join("accounts.toml"),
+            format!("current = \"ghost\"\n\n{}", msa_entry(1, "Only")),
+        )
+        .unwrap();
+        let s = AccountStore::load(&d).unwrap();
+        let id = Uuid::from_u128(1).simple().to_string();
+        assert_eq!(s.current().unwrap().id, id);
+        s.save().unwrap();
+        assert_eq!(raw_file(&d).current.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn add_msa_updates_an_existing_account() {
+        let (_t, d) = dirs();
+        let mut s = AccountStore::load(&d).unwrap();
+        let (n1, u1) = msa(1);
+        let (n2, u2) = msa(2);
+        let a = s.add_msa(&n1, u1, None).id.clone();
+        s.add_msa(&n2, u2, None);
+        let again = s.add_msa("Renamed", u1, Some("ref-1".into())).clone();
+        assert_eq!(again.id, a);
+        assert_eq!(again.username, "Renamed");
+        assert_eq!(again.token_ref.as_deref(), Some("ref-1"));
+        assert_eq!(s.accounts().len(), 2);
+        assert_eq!(s.current().unwrap().id, a, "updating keeps the current");
     }
 
     #[test]

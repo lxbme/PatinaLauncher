@@ -16,7 +16,6 @@ use crate::download::Downloader;
 use crate::fsutil::{is_safe_name, safe_join, write_atomic};
 use crate::loader::list::{InstallerProblem, LoaderError};
 use crate::loader::{InstalledProfile, LoaderKind};
-use crate::locks::processors_key;
 use crate::meta::{Library, RuleEnv, VersionJson};
 use crate::paths::DataDirs;
 use crate::progress::{Phase, ProgressSink, Unit, report};
@@ -97,6 +96,9 @@ pub async fn install_modern(
         None => Vec::new(),
     };
     let libraries = data.libraries();
+    // Cheap pre-check so a Busy comes before the long library download; the
+    // lock is really taken before the processors run (step 3).
+    drop(data.lock_processors(mc)?);
 
     // 1. Libraries.
     let env_rules = RuleEnv::current();
@@ -157,7 +159,7 @@ pub async fn install_modern(
     // 3. Processors.
     // MC_SRG / MC_EXTRA / MC_SLIM outputs are shared by every build of this
     // Minecraft version. Lock order: profile first (above), then processors.
-    let _processors_lock = data.lock_version_exclusive(&processors_key(mc))?;
+    let _processors_lock = data.lock_processors(mc)?;
     run_processors(java, &procs, &env, dl, vanilla, progress).await?;
 
     // 4. Generated-file list, then the profile JSON last.
@@ -424,6 +426,30 @@ mod tests {
         }
         assert!(ran);
         assert_eq!(last.unwrap().phase, Phase::Finalize);
+    }
+
+    /// Another install running the processors of the same Minecraft version
+    /// makes this one Busy (with its own message, not the internal lock key),
+    /// and before any library is downloaded.
+    #[tokio::test]
+    async fn held_processors_lock_makes_install_busy_before_downloads() {
+        let f = fixture(&[]).await;
+        let held = f.data.lock_processors("1.20.1").unwrap();
+        let profile = read_installer(&f.installer).unwrap();
+        let r = install(&f, profile, &None).await;
+        match &r {
+            Err(LoaderError::Busy(b)) => {
+                assert_eq!(b.what, crate::locks::BusyKind::Processors("1.20.1".into()))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(f.server.received_requests().await.unwrap().is_empty());
+        assert!(f.java.runs().is_empty());
+        // The profile lock was released again.
+        assert!(f.data.lock_version_exclusive(STORED_ID).is_ok());
+        drop(held);
+        let profile = read_installer(&f.installer).unwrap();
+        install(&f, profile, &None).await.unwrap();
     }
 
     #[tokio::test]

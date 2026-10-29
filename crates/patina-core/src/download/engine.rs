@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 
 use super::Mirror;
-use crate::fsutil::unique_part_path;
+use crate::fsutil::{path_key, unique_part_path};
 
 #[derive(Clone, Debug)]
 pub struct DownloadJob {
@@ -192,20 +192,9 @@ impl Drop for PartFile {
     }
 }
 
-/// The destination-lock key: `dest` made absolute and lexically normalized
-/// (`.` dropped, `..` pops), so spellings of one path share one lock.
+/// The destination-lock key (see [`path_key`]).
 pub(crate) fn dest_key(dest: &Path) -> io::Result<PathBuf> {
-    let mut out = PathBuf::new();
-    for c in std::path::absolute(dest)?.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c),
-        }
-    }
-    Ok(out)
+    path_key(dest)
 }
 
 /// Process-wide locks, one per destination being written, shared by every
@@ -946,9 +935,16 @@ mod tests {
         assert_eq!(std::fs::read(&j.dest).unwrap(), b"hello");
     }
 
-    /// The single "download fell back" line mentioning `server`.
-    fn fallback_line(server: &MockServer) -> String {
-        let lines = crate::test_log::test_log_buffer().lines_containing(&server.uri());
+    /// A file name no other test (or reused pooled mock server) logs: the
+    /// captured log is process-wide and wiremock may hand a later test the
+    /// same server URI.
+    fn unique_file(test: &str) -> String {
+        format!("{test}-{}", uuid::Uuid::new_v4().simple())
+    }
+
+    /// The single "download fell back" line mentioning `needle`.
+    fn fallback_line(needle: &str) -> String {
+        let lines = crate::test_log::test_log_buffer().lines_containing(needle);
         let hits: Vec<_> = lines
             .iter()
             .filter(|l| l.contains("download fell back"))
@@ -959,10 +955,11 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_is_logged_with_distinct_original_and_used() {
+        let f = unique_file("distinct");
         let server = MockServer::start().await;
-        serve(&server, "/mirror/a", 404, b"").await;
-        serve(&server, "/orig/a", 404, b"").await;
-        serve(&server, "/fb/a", 200, b"hello").await;
+        serve(&server, &format!("/mirror/{f}"), 404, b"").await;
+        serve(&server, &format!("/orig/{f}"), 404, b"").await;
+        serve(&server, &format!("/fb/{f}"), 200, b"hello").await;
         let (d, orig) = setup(&server);
         let d = d.with_fallback(Some(Mirror {
             id: "fb".into(),
@@ -970,28 +967,37 @@ mod tests {
         }));
         let dir = tempfile::tempdir().unwrap();
         crate::test_log::test_log_buffer();
-        d.run(vec![job(&orig, dir.path())], None).await.unwrap();
-        let line = fallback_line(&server);
-        assert!(line.contains(&format!("original={orig}/a")), "{line}");
+        let j = DownloadJob {
+            url: format!("{orig}/{f}"),
+            ..job(&orig, dir.path())
+        };
+        d.run(vec![j], None).await.unwrap();
+        let line = fallback_line(&f);
+        assert!(line.contains(&format!("original={orig}/{f}")), "{line}");
         assert!(
-            line.contains(&format!("used={}/fb/a", server.uri())),
+            line.contains(&format!("used={}/fb/{f}", server.uri())),
             "{line}"
         );
-        assert!(!line.contains("/mirror/a"), "{line}");
+        assert!(!line.contains("/mirror/"), "{line}");
     }
 
     #[tokio::test]
     async fn mirror_fallback_logs_the_original_url() {
+        let f = unique_file("original");
         let server = MockServer::start().await;
-        serve(&server, "/mirror/a", 404, b"").await;
-        serve(&server, "/orig/a", 200, b"hello").await;
+        serve(&server, &format!("/mirror/{f}"), 404, b"").await;
+        serve(&server, &format!("/orig/{f}"), 200, b"hello").await;
         let (d, orig) = setup(&server);
         let dir = tempfile::tempdir().unwrap();
         crate::test_log::test_log_buffer();
-        d.run(vec![job(&orig, dir.path())], None).await.unwrap();
-        let line = fallback_line(&server);
-        assert!(line.contains(&format!("original={orig}/a")), "{line}");
-        assert!(line.contains(&format!("used={orig}/a")), "{line}");
+        let j = DownloadJob {
+            url: format!("{orig}/{f}"),
+            ..job(&orig, dir.path())
+        };
+        d.run(vec![j], None).await.unwrap();
+        let line = fallback_line(&f);
+        assert!(line.contains(&format!("original={orig}/{f}")), "{line}");
+        assert!(line.contains(&format!("used={orig}/{f}")), "{line}");
     }
 
     #[tokio::test]
@@ -1349,7 +1355,7 @@ mod tests {
         assert_eq!(dest_key(Path::new("a/./b/../c")).unwrap(), cwd.join("a/c"));
         assert_eq!(
             dest_key(Path::new("/x/y/../z")).unwrap(),
-            PathBuf::from("/x/z")
+            path_key(Path::new("/x/z")).unwrap()
         );
     }
 }

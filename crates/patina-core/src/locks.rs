@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 pub enum BusyKind {
     Instance(String),
     Version(String),
+    /// Forge/NeoForge processors for this Minecraft version are running.
+    Processors(String),
 }
 
 /// A lock could not be taken because someone else holds it.
@@ -22,6 +24,7 @@ pub enum BusyKind {
 #[error("{}", match .what {
     BusyKind::Instance(id) => rust_i18n::t!("errors.locks.instance_busy", id = id),
     BusyKind::Version(id) => rust_i18n::t!("errors.locks.version_busy", id = id),
+    BusyKind::Processors(mc) => rust_i18n::t!("errors.locks.processors_busy", mc = mc),
 })]
 pub struct Busy {
     pub what: BusyKind,
@@ -46,7 +49,7 @@ struct Registry {
 /// Lock ordering (to avoid deadlock; all locks are try-locks today, but keep
 /// the order): instance, then version profile (`<profile id>`), then
 /// `processors:<mc>`.
-pub fn processors_key(mc: &str) -> String {
+fn processors_key(mc: &str) -> String {
     format!("processors:{mc}")
 }
 
@@ -55,8 +58,9 @@ pub struct Locks {
     inner: Arc<Mutex<Registry>>,
 }
 
+/// Same path normalization as the download destination locks.
 fn key(root: &Path, id: &str) -> Key {
-    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = crate::fsutil::path_key(root).unwrap_or_else(|_| root.to_path_buf());
     (root, id.to_string())
 }
 
@@ -125,6 +129,15 @@ impl Locks {
             locks: self.clone(),
             key: k,
         })
+    }
+
+    /// Exclusive use of the processor outputs shared by every Forge/NeoForge
+    /// build of Minecraft `mc`; `versions_dir` is the `versions` directory.
+    pub fn processors(&self, versions_dir: &Path, mc: &str) -> Result<VersionExclusive, Busy> {
+        self.version_exclusive(versions_dir, &processors_key(mc))
+            .map_err(|_| Busy {
+                what: BusyKind::Processors(mc.to_string()),
+            })
     }
 }
 
@@ -216,6 +229,15 @@ mod tests {
     }
 
     #[test]
+    fn spellings_of_one_root_share_a_lock() {
+        let l = Locks::new();
+        let _g = l.instance(Path::new("/r/instances"), "a").unwrap();
+        for other in ["/r/./instances", "/r/x/../instances", "/r/instances/"] {
+            assert!(l.instance(Path::new(other), "a").is_err(), "{other}");
+        }
+    }
+
+    #[test]
     fn install_of_version_in_use_is_busy() {
         let l = Locks::new();
         let s = l.version_shared(r(), "v").unwrap();
@@ -257,5 +279,30 @@ mod tests {
         set_language(Language::ZhCn);
         assert_ne!(i.to_string(), ie);
         assert_ne!(v.to_string(), ve);
+    }
+
+    #[test]
+    fn processors_busy_names_the_minecraft_version_not_the_key() {
+        let _g = locale_lock();
+        let l = Locks::new();
+        let held = l.processors(r(), "1.20.1").unwrap();
+        let e = l.processors(r(), "1.20.1").unwrap_err();
+        assert_eq!(e.what, BusyKind::Processors("1.20.1".into()));
+        assert!(l.processors(r(), "1.21").is_ok());
+        assert!(
+            l.version_exclusive(r(), "1.20.1").is_ok(),
+            "separate from the version"
+        );
+        for lang in [Language::En, Language::ZhCn] {
+            set_language(lang);
+            let msg = e.to_string();
+            assert!(msg.contains("1.20.1"), "{msg}");
+            assert!(
+                !msg.contains("processors:") && !msg.contains("errors."),
+                "{msg}"
+            );
+        }
+        drop(held);
+        assert!(l.processors(r(), "1.20.1").is_ok());
     }
 }

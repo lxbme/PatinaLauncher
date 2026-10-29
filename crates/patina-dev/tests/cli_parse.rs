@@ -218,6 +218,7 @@ fn source_set() {
     assert!(parse(&["source", "set", "mirror"]).is_err());
 }
 
+#[cfg(feature = "dev-offline")]
 #[test]
 fn launch_unchanged() {
     match parse(&["launch", "fab-new", "--offline", "Dev"])
@@ -372,10 +373,13 @@ fn account_commands() {
         other => panic!("{other:?}"),
     };
     assert!(matches!(account(&["account", "list"]), AccountCmd::List));
+    #[cfg(feature = "dev-offline")]
     assert!(matches!(
         account(&["account", "add-offline", "Dev"]),
         AccountCmd::AddOffline { name } if name == "Dev"
     ));
+    #[cfg(not(feature = "dev-offline"))]
+    assert!(parse(&["account", "add-offline", "Dev"]).is_err());
     assert!(matches!(
         account(&["account", "use", "id1"]),
         AccountCmd::Use { id } if id == "id1"
@@ -395,6 +399,26 @@ fn account_commands() {
     }
 }
 
+#[test]
+fn launch_account_selection() {
+    match cmd(&["launch", "a"]) {
+        Cmd::Launch { id, account, .. } => {
+            assert_eq!(id, "a");
+            assert_eq!(account, None);
+        }
+        other => panic!("{other:?}"),
+    }
+    match cmd(&["launch", "a", "--account", "acc1"]) {
+        Cmd::Launch { account, .. } => assert_eq!(account.as_deref(), Some("acc1")),
+        other => panic!("{other:?}"),
+    }
+    assert!(parse(&["launch"]).is_err());
+    assert!(parse(&["launch", "a", "--account"]).is_err());
+    #[cfg(not(feature = "dev-offline"))]
+    assert!(parse(&["launch", "a", "--offline", "Dev"]).is_err());
+}
+
+#[cfg(feature = "dev-offline")]
 #[test]
 fn launch_account_and_offline_conflict() {
     match cmd(&["launch", "a"]) {
@@ -422,8 +446,13 @@ fn launch_account_and_offline_conflict() {
     }
     let err = parse(&["launch", "a", "--account", "x", "--offline", "Dev"]).unwrap_err();
     assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    assert!(parse(&["launch"]).is_err());
-    assert!(parse(&["launch", "a", "--account"]).is_err());
+}
+
+#[test]
+fn help_mentions_the_cargo_dev_alias() {
+    use clap::CommandFactory;
+    let help = Cli::command().render_long_help().to_string();
+    assert!(help.contains("cargo dev"), "{help}");
 }
 
 #[test]

@@ -22,6 +22,23 @@ pub fn is_safe_name(name: &str) -> bool {
     is_safe_rel(name) && !name.contains('/')
 }
 
+/// The key under which in-process locks identify a path: `path` made
+/// absolute and lexically normalized (`.` dropped, `..` pops; symlinks are
+/// not resolved), so different spellings of one path share one lock.
+pub fn path_key(path: &Path) -> std::io::Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in std::path::absolute(path)?.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 /// `root.join(rel)` when `rel` is safe (see [`is_safe_rel`]), so the result
 /// always stays inside `root`.
 pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
@@ -123,26 +140,37 @@ pub fn sweep_stale_temps(root: &Path, older_than: Duration) -> std::io::Result<u
 }
 
 /// Sweeps only the places in a Patina data directory where Patina writes temp
-/// files: `versions/`, `libraries/`, `assets/` and `runtimes/` recursively,
-/// and the top level of each `instances/<id>/` (never `minecraft/` or any
-/// other subdirectory, which hold user game files). Missing directories are
-/// skipped.
+/// files: `versions/`, `libraries/`, `assets/`, `runtimes/` and `cache/`
+/// recursively, the files directly in the data directory (config and account
+/// files), and the top level of each `instances/<id>/` (never `minecraft/` or
+/// any other subdirectory, which hold user game files). Missing directories
+/// are skipped. A directory that cannot be read is logged and skipped so the
+/// others are still swept; only an unreadable data directory itself is
+/// returned as an error (after sweeping what could be reached).
 pub fn sweep_owned_temps(data_dir: &Path, min_age: Duration) -> std::io::Result<usize> {
     let mut sw = Sweeper::new(min_age);
-    for name in ["versions", "libraries", "assets", "runtimes"] {
-        sw.dir(&data_dir.join(name), true, true)?;
-    }
-    let instances = data_dir.join("instances");
-    let entries = match std::fs::read_dir(&instances) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(sw.removed),
-        Err(e) => return Err(e),
+    let skip = |dir: &Path, e: std::io::Error| {
+        tracing::warn!("temp sweep skipped {}: {e}", dir.display());
     };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            sw.dir(&entry.path(), false, false)?;
+    for name in ["versions", "libraries", "assets", "runtimes", "cache"] {
+        let dir = data_dir.join(name);
+        if let Err(e) = sw.dir(&dir, true, true) {
+            skip(&dir, e);
         }
     }
+    let instances = data_dir.join("instances");
+    match std::fs::read_dir(&instances) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    sw.dir(&entry.path(), false, false)?;
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => skip(&instances, e),
+    }
+    sw.dir(data_dir, false, true)?;
     Ok(sw.removed)
 }
 
@@ -422,6 +450,17 @@ mod tests {
     }
 
     #[test]
+    fn path_keys_are_absolute_and_normalized() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(path_key(Path::new("a/./b/../c")).unwrap(), cwd.join("a/c"));
+        assert_eq!(
+            path_key(Path::new("/x/y/../z")).unwrap(),
+            PathBuf::from("/x/z")
+        );
+        assert_eq!(path_key(Path::new("/x/..")).unwrap(), PathBuf::from("/"));
+    }
+
+    #[test]
     fn sweep_removes_only_old_temps() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
@@ -520,7 +559,7 @@ mod tests {
             std::fs::write(&f, b"x").unwrap();
             age(&f, 3600);
         }
-        // assets/ and runtimes/ are absent: skipped.
+        // assets/, runtimes/ and cache/ are absent: skipped.
         let n = sweep_owned_temps(d, Duration::from_secs(60)).unwrap();
         assert_eq!(n, removed.len());
         for dir in removed {
@@ -533,5 +572,56 @@ mod tests {
             sweep_owned_temps(&d.join("nope"), Duration::ZERO).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn owned_sweep_covers_cache_and_data_root_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let name = format!("t.{}.1.tmp", dead_pid());
+        // cache/ recursively; the data root itself only at its top level.
+        let removed = ["", "cache", "cache/mod-icons"];
+        let kept = ["other", "other/deep"];
+        for dir in removed.iter().chain(kept.iter()) {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+            let f = d.join(dir).join(&name);
+            std::fs::write(&f, b"x").unwrap();
+            age(&f, 3600);
+        }
+        let n = sweep_owned_temps(d, Duration::from_secs(60)).unwrap();
+        assert_eq!(n, removed.len());
+        for dir in removed {
+            assert!(!d.join(dir).join(&name).exists(), "{dir:?}");
+        }
+        for dir in kept {
+            assert!(d.join(dir).join(&name).exists(), "{dir}");
+        }
+    }
+
+    #[test]
+    fn owned_sweep_continues_past_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let name = format!("t.{}.1.tmp", dead_pid());
+        std::fs::create_dir_all(d.join("versions")).unwrap();
+        for dir in ["libraries", "cache"] {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+            let f = d.join(dir).join(&name);
+            std::fs::write(&f, b"x").unwrap();
+            age(&f, 3600);
+        }
+        let versions = d.join("versions");
+        std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&versions).is_ok() {
+            // Running as root: permissions do not apply.
+            std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let n = sweep_owned_temps(d, Duration::from_secs(60));
+        std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(n.unwrap(), 2);
+        assert!(!d.join("libraries").join(&name).exists());
+        assert!(!d.join("cache").join(&name).exists());
     }
 }

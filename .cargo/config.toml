@@ -1,0 +1,4 @@
+[alias]
+# The development CLI with offline accounts (the `dev-offline` feature), e.g.
+# `cargo dev launch my-instance --offline Dev`.
+dev = "run -p patina-dev --features dev-offline --"
