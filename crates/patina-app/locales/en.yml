@@ -91,3 +91,12 @@ instances:
     delete_confirm: "Delete"
     cancel: "Cancel"
     delete_failed: "Couldn’t delete “%{id}”: %{error}"
+busy:
+  instance: "“%{name}” is busy with another operation"
+  version: "Version %{id} is in use by another operation"
+  processors: "Another installation for Minecraft %{mc} is running"
+ops:
+  amount_mb: "%{done}/%{total} MB"
+  amount_kb: "%{done}/%{total} KB"
+  retry: "Retry"
+  dismiss: "Dismiss"

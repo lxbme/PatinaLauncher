@@ -5,11 +5,13 @@
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{Tab as TabElement, Tabs};
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyElement, App, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    Rems, Render, Styled, Subscription, Task, TestSupportExt, Window, div, px, rems,
+    Rems, Render, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window,
+    div, px, rems,
 };
 use patina_core::instance::Instance;
 use rust_i18n::t;
@@ -22,6 +24,7 @@ use super::{
 };
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
+use crate::launch::OpState;
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
 use crate::shell::placeholder;
 use crate::theme::ProductColors;
@@ -303,9 +306,11 @@ impl DetailView {
                             .child(played),
                     ),
             )
+            .when_some(self.model.read(cx).op(&instance.id).cloned(), |d, op| {
+                d.child(self.render_op(&instance.id, &op, cx))
+            })
             .child(
-                // Launching arrives with plan 4b task 10; the operation
-                // progress (task 8) goes beside it.
+                // Launching arrives with plan 4b task 10.
                 Button::new("launch")
                     .custom(launch)
                     // A custom variant's resting fill is drawn at 20 %
@@ -320,6 +325,75 @@ impl DetailView {
                     .text_size(rems(0.875))
                     .strong(FontWeight::SEMIBOLD, cx),
             )
+    }
+
+    /// The running operation's bar with "step · amount" below it, or the
+    /// failed one's message with retry and dismiss.
+    fn render_op(&self, id: &str, op: &OpState, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let area = v_flex()
+            .id("instance-op")
+            // Gives way to the title column when the window is narrow.
+            .min_w_0()
+            .w(rems(16.))
+            .gap(rems(0.375))
+            .text_size(TEXT_SECONDARY);
+        match op {
+            OpState::Running { progress, .. } => {
+                let fraction = progress.as_ref().and_then(|p| p.fraction);
+                let step = progress.as_ref().map(|p| p.step.clone());
+                let amount = progress.as_ref().and_then(|p| p.amount.clone());
+                let text = [step, amount].into_iter().flatten().collect::<Vec<_>>();
+                area.child(
+                    Progress::new("instance-op-bar")
+                        .value(fraction.unwrap_or(0.) * 100.)
+                        .loading(fraction.is_none()),
+                )
+                .child(
+                    div()
+                        .id("instance-op-text")
+                        .aria_label(text.join(" · "))
+                        .test_support()
+                        .text_color(theme.muted_foreground)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(text.join(" · ")),
+                )
+            }
+            OpState::Failed { message, retry, .. } => {
+                let (model, key) = (self.model.clone(), id.to_string());
+                let dismiss = {
+                    let (model, key) = (model.clone(), key.clone());
+                    Button::new("instance-op-dismiss")
+                        .ghost()
+                        .small()
+                        .label(t!("ops.dismiss").to_string())
+                        .on_click(move |_, _, cx| {
+                            model.update(cx, |m, cx| m.dismiss_op(&key, cx));
+                        })
+                };
+                let retry = retry.is_some().then(|| {
+                    Button::new("instance-op-retry")
+                        .small()
+                        .label(t!("ops.retry").to_string())
+                        .on_click(move |_, _, cx| {
+                            model.update(cx, |m, cx| m.retry_op(&key, cx));
+                        })
+                });
+                area.w(rems(22.))
+                    .child(
+                        div()
+                            .id("instance-op-error")
+                            .aria_label(message.clone())
+                            .test_support()
+                            .text_color(theme.danger)
+                            .line_clamp(2)
+                            .child(message.clone()),
+                    )
+                    .child(h_flex().gap_1().children(retry).child(dismiss))
+            }
+        }
     }
 
     fn render_tabs(&self, instance: &Instance, cx: &mut Context<Self>) -> impl IntoElement {

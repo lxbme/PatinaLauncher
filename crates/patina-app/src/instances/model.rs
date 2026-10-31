@@ -3,10 +3,32 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::future::BoxFuture;
 use gpui_kit::{Context, EventEmitter, SharedString, Subscription, Task, Window};
 use patina_core::instance::{BrokenInstance, Instance, ListOutcome};
+use patina_core::progress::{ProgressSink, TaskProgress};
 
-use crate::core_bridge::{Core, Revision, run_blocking};
+use crate::core_bridge::{Core, Revision, forward_progress, run, run_blocking};
+use crate::launch::{OpError, OpKind, OpState, ProgressTracker, RetryAction};
+
+/// Identifies one operation when it finishes.
+struct OpMeta {
+    id: String,
+    token: u64,
+    kind: OpKind,
+    retry: Option<RetryAction>,
+}
+
+/// An operation of one instance: what the header shows, plus the tasks that
+/// keep it going (dropping the entry cancels them).
+struct OpEntry {
+    state: OpState,
+    /// Tells this operation from an earlier one of the same instance.
+    token: u64,
+    tracker: ProgressTracker,
+    _forward: Task<()>,
+    _job: Task<()>,
+}
 
 /// What a running instance is doing. Plan 4b task 10 (launch) adds the
 /// states between "prepared" and "exited"; until then nothing sets it
@@ -62,6 +84,9 @@ pub struct InstancesModel {
     generation: u64,
     selected: Option<String>,
     running: HashMap<String, RunState>,
+    /// Operations by instance id; see [`InstancesModel::start_op`].
+    ops: HashMap<String, OpEntry>,
+    next_op: u64,
     /// Broken entries being deleted, so a second request is ignored.
     deleting: HashSet<String>,
     revision: Revision,
@@ -88,6 +113,8 @@ impl InstancesModel {
             generation: 0,
             selected: None,
             running: HashMap::new(),
+            ops: HashMap::new(),
+            next_op: 0,
             deleting: HashSet::new(),
             revision: Revision::default(),
             task: Task::ready(()),
@@ -174,6 +201,195 @@ impl InstancesModel {
         }
     }
 
+    /// The display name of healthy instance `id`.
+    pub fn display_name(&self, id: &str) -> Option<String> {
+        match self.entry(id)? {
+            Entry::Healthy(i) => Some(i.config.name.clone()),
+            Entry::Broken(_) => None,
+        }
+    }
+
+    /// The operation of instance `id`: running, or failed and not dismissed.
+    pub fn op(&self, id: &str) -> Option<&OpState> {
+        self.ops.get(id).map(|e| &e.state)
+    }
+
+    /// Whether an operation of instance `id` is running.
+    pub fn is_op_running(&self, id: &str) -> bool {
+        self.op(id).is_some_and(OpState::is_running)
+    }
+
+    /// Runs `f` as operation `kind` of instance `id` in the background and
+    /// returns whether it started; an instance with an operation running
+    /// rejects a second one (returns `false`, `f` is not called). A failed
+    /// operation left on the header is replaced.
+    ///
+    /// `f` gets the progress sink to hand to the core and returns the core
+    /// work, which runs on the app's runtime; `T` is its result (the loader
+    /// operations produce an `OpOutcome`, launching something else). The
+    /// progress reaches only the `ops` entry of `id`, with the bar held from
+    /// going back within a phase.
+    ///
+    /// When the work succeeds `on_done` runs on the model with `T`, then the
+    /// list is refreshed and [`InstancesChanged`] is emitted. When it fails
+    /// the entry becomes [`OpState::Failed`] with the localized message
+    /// ([`OpError::message`]) and `retry`, and the list is refreshed. A result
+    /// is dropped, `on_done` not called, if the instance has left the list in
+    /// the meantime or a newer operation replaced this one. "Left the list"
+    /// is judged against the list as loaded when the work ends, so a caller
+    /// that has just created `id` on disk must refresh (and wait for it)
+    /// before starting an operation on it.
+    pub fn start_op<T: Send + 'static>(
+        &mut self,
+        id: &str,
+        kind: OpKind,
+        f: impl FnOnce(ProgressSink) -> BoxFuture<'static, Result<T, OpError>>,
+        on_done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+        retry: Option<RetryAction>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.is_op_running(id) {
+            return false;
+        }
+        self.next_op += 1;
+        let token = self.next_op;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TaskProgress>();
+        let work = run(cx, f(Some(tx)));
+        let key = id.to_string();
+        let this = cx.weak_entity();
+        let _forward = forward_progress(cx, this, rx, {
+            let key = key.clone();
+            move |this, tick, cx| this.apply_progress(&key, token, &tick, cx)
+        });
+        let _job = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                let result = match work.await {
+                    Ok(result) => result,
+                    Err(error) => Err(OpError::Message(error.to_string())),
+                };
+                let meta = OpMeta {
+                    id: key,
+                    token,
+                    kind,
+                    retry,
+                };
+                this.update(cx, |this, cx| this.finish_op(meta, result, on_done, cx))
+                    .ok();
+            }
+        });
+        self.ops.insert(
+            key,
+            OpEntry {
+                state: OpState::Running {
+                    kind,
+                    progress: None,
+                },
+                token,
+                tracker: ProgressTracker::default(),
+                _forward,
+                _job,
+            },
+        );
+        cx.notify();
+        true
+    }
+
+    fn apply_progress(
+        &mut self,
+        id: &str,
+        token: u64,
+        tick: &TaskProgress,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.ops.get_mut(id).filter(|e| e.token == token) else {
+            return;
+        };
+        let view = entry.tracker.update(tick);
+        if let OpState::Running { progress, .. } = &mut entry.state
+            && progress.as_ref() != Some(&view)
+        {
+            *progress = Some(view);
+            cx.notify();
+        }
+    }
+
+    fn finish_op<T>(
+        &mut self,
+        meta: OpMeta,
+        result: Result<T, OpError>,
+        on_done: impl FnOnce(&mut Self, T, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) {
+        let OpMeta {
+            id,
+            token,
+            kind,
+            retry,
+        } = meta;
+        let id = id.as_str();
+        if self.ops.get(id).is_none_or(|e| e.token != token) {
+            return;
+        }
+        // Stop the progress forwarding; the finished entry goes with it.
+        self.ops.remove(id);
+        // The instance was deleted while the operation ran: nothing to show.
+        let gone = self.loaded && self.entry(id).is_none();
+        if gone {
+            tracing::debug!(
+                id,
+                "dropping the result of an operation on a deleted instance"
+            );
+        } else {
+            match result {
+                Ok(value) => {
+                    on_done(self, value, cx);
+                    cx.emit(InstancesChanged);
+                }
+                Err(error) => {
+                    let message = error.message(self);
+                    tracing::warn!(id, ?kind, %message, "instance operation failed");
+                    let (forward, job) = (Task::ready(()), Task::ready(()));
+                    self.ops.insert(
+                        id.to_string(),
+                        OpEntry {
+                            state: OpState::Failed {
+                                kind,
+                                message,
+                                retry,
+                            },
+                            token,
+                            tracker: ProgressTracker::default(),
+                            _forward: forward,
+                            _job: job,
+                        },
+                    );
+                }
+            }
+        }
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    /// Starts the failed operation of `id` again through its retry action.
+    pub fn retry_op(&mut self, id: &str, cx: &mut Context<Self>) {
+        let retry = match self.ops.get(id).map(|e| &e.state) {
+            Some(OpState::Failed { retry, .. }) => retry.clone(),
+            _ => None,
+        };
+        if let Some(retry) = retry {
+            retry(self, cx);
+        }
+    }
+
+    /// Removes the failed operation of `id` from the header.
+    pub fn dismiss_op(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.ops.get(id).is_some_and(|e| !e.state.is_running()) {
+            self.ops.remove(id);
+            cx.notify();
+        }
+    }
+
     /// Whether broken entry `id` is being deleted.
     pub fn is_deleting(&self, id: &str) -> bool {
         self.deleting.contains(id)
@@ -211,6 +427,10 @@ impl InstancesModel {
 
     fn apply(&mut self, outcome: ListOutcome) {
         self.selected = reselect(self.selected.as_deref(), &outcome);
+        // A failure left on the header of an instance that is gone has
+        // nothing to hang on to. (Running ones end by themselves.)
+        self.ops
+            .retain(|id, e| e.state.is_running() || find_entry(&outcome, id).is_some());
         self.outcome = outcome;
         self.error = None;
         self.generation += 1;

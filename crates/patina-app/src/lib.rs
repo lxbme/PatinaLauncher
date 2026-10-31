@@ -9,6 +9,7 @@ pub mod disk_usage;
 pub mod fonts;
 pub mod i18n;
 pub mod instances;
+pub mod launch;
 pub mod layout;
 pub mod logging;
 pub mod notice;

@@ -16,6 +16,7 @@ use patina_app::instances::{
     InstancesChanged, InstancesModel, RunState, forget_cached_image, icon_for, instance_icon,
     pick_id, row_id, save_icon,
 };
+use patina_app::launch::{OpError, OpKind, OpState};
 use patina_app::settings::{self, AppSettings, SettingsStore};
 use patina_app::shell::{AccountLabel, Nav, RootView, StatusBar};
 use patina_app::single_instance;
@@ -31,11 +32,27 @@ struct Booted {
     handle: AnyWindowHandle,
     root: Entity<RootView>,
     _rt: tokio::runtime::Runtime,
+    /// Holds the process-global interface language for this test; declared
+    /// last so it is released after everything else is gone.
+    _language: std::sync::MutexGuard<'static, ()>,
 }
+
+impl Booted {
+    /// Switches the interface language within the lock this test holds.
+    fn language(&self, language: Language) {
+        patina_app::i18n::set_language(language);
+    }
+}
+
+/// Serializes the tests that boot the app, because the interface language is
+/// process-global; every test starts in English.
+static LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Boots the app as `main` does, with its data dir and settings in `dir`
 /// and an offline core, and opens the main window.
 fn boot(cx: &mut TestAppContext, dir: &Path, start: AppSettings) -> Booted {
+    let language = LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
+    patina_app::i18n::set_language(Language::En);
     let rt = patina_app::runtime::start();
     let core = testing::core(
         rt.handle().clone(),
@@ -54,6 +71,7 @@ fn boot(cx: &mut TestAppContext, dir: &Path, start: AppSettings) -> Booted {
         handle,
         root,
         _rt: rt,
+        _language: language,
     }
 }
 
@@ -458,16 +476,6 @@ async fn title_bar_follows_accounts_changes(cx: &mut TestAppContext) {
 
 // ---- Instances page ----
 
-/// Serializes the tests that depend on the interface language, which is
-/// process-global; each sets the one it needs.
-static LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn use_language(language: Language) -> std::sync::MutexGuard<'static, ()> {
-    let guard = LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
-    patina_app::i18n::set_language(language);
-    guard
-}
-
 fn instances_model(app: &Booted, cx: &mut TestAppContext) -> Entity<InstancesModel> {
     cx.update(|cx| app.root.read(cx).instances().read(cx).model().clone())
 }
@@ -720,7 +728,6 @@ fn empty_state_and_plus_dispatch_add_instance(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn broken_delete_requires_confirmation(cx: &mut TestAppContext) {
-    let _language = use_language(Language::ZhCn);
     let tmp = tempfile::tempdir().unwrap();
     let data = DataDirs::new(tmp.path());
     let store = InstanceStore::new(data.instances());
@@ -731,6 +738,7 @@ fn broken_delete_requires_confirmation(cx: &mut TestAppContext) {
     std::fs::write(broken.join("data.bin"), [0u8; 100]).unwrap();
 
     let app = boot(cx, tmp.path(), AppSettings::default());
+    app.language(Language::ZhCn);
     let model = instances_model(&app, cx);
     list_settled(&model, cx);
     let changed = Rc::new(std::cell::Cell::new(0));
@@ -855,7 +863,6 @@ fn arrow_keys_move_the_selection_through_the_list(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn english_filter_chips_fit(cx: &mut TestAppContext) {
-    let _language = use_language(Language::En);
     let tmp = tempfile::tempdir().unwrap();
     let mut start = AppSettings::default();
     start.language = Language::En;
@@ -1175,4 +1182,351 @@ fn reupload_and_replacing_evict_the_cached_image(cx: &mut TestAppContext) {
     draw(cx);
     cx.update(|cx| forget_cached_image(&path, cx));
     assert!(!cached(cx));
+}
+
+// ---- Operation runner ----
+
+use futures::FutureExt as _;
+use patina_core::loader::LoaderError;
+use patina_core::locks::{Busy, BusyKind};
+use patina_core::progress::{Phase, ProgressSink, TaskProgress, Unit};
+use tokio::sync::oneshot;
+
+/// A model over a data dir with the named instances; returns the model, the
+/// instance ids (the directory names) and the booted app.
+fn op_model(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    names: &[&str],
+) -> (Booted, Entity<InstancesModel>, Vec<String>) {
+    let store = InstanceStore::new(DataDirs::new(dir).instances());
+    let ids = names
+        .iter()
+        .map(|name| store.create(name, "1.21.1").unwrap().id)
+        .collect();
+    let app = boot(cx, dir, AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    (app, model, ids)
+}
+
+/// Starts a gated operation: it reports `progress` when told to and ends
+/// with `end` once the returned sender fires.
+fn start_gated(
+    model: &Entity<InstancesModel>,
+    cx: &mut TestAppContext,
+    id: &str,
+    end: impl FnOnce() -> Result<(), OpError> + Send + 'static,
+    done: Rc<std::cell::Cell<u32>>,
+) -> (bool, oneshot::Sender<()>, oneshot::Sender<TaskProgress>) {
+    let (gate, wait) = oneshot::channel::<()>();
+    let (tick, ticked) = oneshot::channel::<TaskProgress>();
+    let started = model.update(cx, |m, cx| {
+        m.start_op(
+            id,
+            OpKind::Reinstall,
+            move |sink: ProgressSink| {
+                async move {
+                    if let Ok(p) = ticked.await {
+                        sink.unwrap().send(p).ok();
+                    }
+                    wait.await.ok();
+                    end()
+                }
+                .boxed()
+            },
+            move |_, (), _| done.set(done.get() + 1),
+            None,
+            cx,
+        )
+    });
+    (started, gate, tick)
+}
+
+fn items(phase: Phase, done: u64, total: u64) -> TaskProgress {
+    TaskProgress {
+        phase,
+        done,
+        total,
+        unit: Unit::Items,
+    }
+}
+
+fn op_of(model: &Entity<InstancesModel>, cx: &mut TestAppContext, id: &str) -> Option<OpState> {
+    model.read_with(cx, |m, _| m.op(id).cloned())
+}
+
+#[gpui_kit::test]
+fn progress_follows_its_instance(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ids) = op_model(cx, tmp.path(), &["Alpha", "Beta"]);
+    let done = Rc::new(std::cell::Cell::new(0));
+    let (a_ok, a_gate, a_tick) = start_gated(&model, cx, &ids[0], || Ok(()), done.clone());
+    let (b_ok, b_gate, b_tick) = start_gated(&model, cx, &ids[1], || Ok(()), done.clone());
+    assert!(a_ok && b_ok, "different instances run side by side");
+
+    const MIB: u64 = 1024 * 1024;
+    a_tick
+        .send(TaskProgress {
+            phase: Phase::DownloadGameFiles,
+            done: 3 * MIB,
+            total: 10 * MIB,
+            unit: Unit::Bytes,
+        })
+        .unwrap();
+    settle(cx, |cx| {
+        matches!(
+            op_of(&model, cx, &ids[0]),
+            Some(OpState::Running {
+                progress: Some(_),
+                ..
+            })
+        )
+    });
+    // The header draws the running bar and "step · amount".
+    model.update(cx, |m, cx| m.select(&ids[0], cx));
+    let text = cx
+        .update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("instance-op-text").label().map(str::to_owned)
+        })
+        .unwrap();
+    let text = text.expect("a label");
+    assert!(text.ends_with("3/10 MB"), "{text}");
+    assert!(text.contains(" · "), "{text}");
+    let Some(OpState::Running { progress, .. }) = op_of(&model, cx, &ids[1]) else {
+        panic!("the other instance is still running");
+    };
+    assert!(
+        progress.is_none(),
+        "no progress leaks to the other instance"
+    );
+
+    b_tick.send(items(Phase::RunProcessor, 1, 2)).unwrap();
+    settle(cx, |cx| {
+        matches!(
+            op_of(&model, cx, &ids[1]),
+            Some(OpState::Running {
+                progress: Some(_),
+                ..
+            })
+        )
+    });
+    let Some(OpState::Running {
+        progress: Some(a), ..
+    }) = op_of(&model, cx, &ids[0])
+    else {
+        panic!("running");
+    };
+    assert_eq!(a.fraction, Some(0.3), "a keeps its own value");
+
+    // Finishing one leaves the other running.
+    a_gate.send(()).unwrap();
+    settle(cx, |cx| op_of(&model, cx, &ids[0]).is_none());
+    assert_eq!(done.get(), 1);
+    assert!(matches!(
+        op_of(&model, cx, &ids[1]),
+        Some(OpState::Running { .. })
+    ));
+    b_gate.send(()).unwrap();
+    settle(cx, |cx| op_of(&model, cx, &ids[1]).is_none());
+    assert_eq!(done.get(), 2);
+}
+
+#[gpui_kit::test]
+fn second_op_on_same_instance_is_rejected(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_app, model, ids) = op_model(cx, tmp.path(), &["Alpha"]);
+    let done = Rc::new(std::cell::Cell::new(0));
+    let (first, gate, tick) = start_gated(&model, cx, &ids[0], || Ok(()), done.clone());
+    assert!(first);
+    drop(tick);
+    let (second, _gate2, _tick2) = start_gated(&model, cx, &ids[0], || Ok(()), done.clone());
+    assert!(!second, "one operation per instance");
+    gate.send(()).unwrap();
+    settle(cx, |cx| op_of(&model, cx, &ids[0]).is_none());
+    assert_eq!(done.get(), 1, "only the first ran");
+}
+
+#[gpui_kit::test]
+fn busy_message_uses_display_name(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    // Rename after creating, so the id (directory) and the name differ.
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let id = store.create("Alpha", "1.21.1").unwrap().id;
+    store.rename(&id, "My Pack").unwrap();
+    let (_app, model, _) = op_model(cx, tmp.path(), &[]);
+    assert_ne!(id, "My Pack", "the id differs from the display name");
+    let busy = {
+        let id = id.clone();
+        move || {
+            Err(OpError::Loader(LoaderError::Busy(Busy {
+                what: BusyKind::Instance(id),
+            })))
+        }
+    };
+    let done = Rc::new(std::cell::Cell::new(0));
+    let (_, gate, tick) = start_gated(&model, cx, &id, busy, done.clone());
+    drop(tick);
+    gate.send(()).unwrap();
+    settle(cx, |cx| {
+        matches!(op_of(&model, cx, &id), Some(OpState::Failed { .. }))
+    });
+    let Some(OpState::Failed { message, .. }) = op_of(&model, cx, &id) else {
+        panic!("failed");
+    };
+    assert_eq!(message, "“My Pack” is busy with another operation");
+    assert!(!message.contains(&id), "{message}");
+    assert_eq!(done.get(), 0);
+    // Dismissing clears it, and a new operation may start.
+    model.update(cx, |m, cx| m.dismiss_op(&id, cx));
+    assert!(op_of(&model, cx, &id).is_none());
+}
+
+#[gpui_kit::test]
+fn result_for_a_deleted_instance_is_dropped(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_app, model, ids) = op_model(cx, tmp.path(), &["Alpha", "Beta"]);
+    let done = Rc::new(std::cell::Cell::new(0));
+    let (_, gate, tick) = start_gated(&model, cx, &ids[0], || Ok(()), done.clone());
+    drop(tick);
+    let (_, gate_failing, tick2) = start_gated(
+        &model,
+        cx,
+        &ids[1],
+        || Err(OpError::Message("boom".into())),
+        done.clone(),
+    );
+    drop(tick2);
+    for id in &ids {
+        std::fs::remove_dir_all(DataDirs::new(tmp.path()).instances().join(id)).unwrap();
+    }
+    refresh(&model, cx);
+    gate.send(()).unwrap();
+    gate_failing.send(()).unwrap();
+    settle(cx, |cx| {
+        op_of(&model, cx, &ids[0]).is_none() && op_of(&model, cx, &ids[1]).is_none()
+    });
+    cx.run_until_parked();
+    assert_eq!(done.get(), 0, "no completion for an instance that is gone");
+    assert!(
+        op_of(&model, cx, &ids[1]).is_none(),
+        "no failure left behind"
+    );
+}
+
+#[gpui_kit::test]
+fn failed_op_offers_retry_then_dismiss(cx: &mut TestAppContext) {
+    use patina_app::launch::RetryAction;
+    use std::cell::{Cell, RefCell};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ids) = op_model(cx, tmp.path(), &["Alpha"]);
+    let id = ids[0].clone();
+    model.update(cx, |m, cx| m.select(&id, cx));
+
+    let retries = Rc::new(Cell::new(0u32));
+    let gate: Rc<RefCell<Option<oneshot::Sender<()>>>> = Rc::default();
+    let retry: RetryAction = {
+        let (retries, gate, id) = (retries.clone(), gate.clone(), id.clone());
+        Rc::new(move |m, cx| {
+            retries.set(retries.get() + 1);
+            let (tx, rx) = oneshot::channel::<()>();
+            *gate.borrow_mut() = Some(tx);
+            m.start_op(
+                &id,
+                OpKind::Reinstall,
+                move |_| {
+                    async move {
+                        rx.await.ok();
+                        Err::<(), _>(OpError::Message("again".into()))
+                    }
+                    .boxed()
+                },
+                |_, (), _| {},
+                None,
+                cx,
+            );
+        })
+    };
+    model.update(cx, |m, cx| {
+        m.start_op(
+            &id,
+            OpKind::Reinstall,
+            |_| async { Err::<(), _>(OpError::Message("boom".into())) }.boxed(),
+            |_, (), _| {},
+            Some(retry),
+            cx,
+        );
+    });
+    settle(cx, |cx| {
+        matches!(op_of(&model, cx, &id), Some(OpState::Failed { .. }))
+    });
+
+    // The header shows the message and both buttons.
+    let label = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("instance-op-error")
+                .and_then(|e| e.label().map(str::to_owned))
+        })
+        .unwrap()
+    };
+    assert_eq!(label(cx).as_deref(), Some("boom"));
+    assert!(shows(&app, cx, "instance-op-retry"));
+    assert!(shows(&app, cx, "instance-op-dismiss"));
+
+    click(&app, cx, "instance-op-retry");
+    assert_eq!(retries.get(), 1);
+    assert!(matches!(
+        op_of(&model, cx, &id),
+        Some(OpState::Running { .. })
+    ));
+    // Retry only applies to a failed op: no second run while it is going.
+    model.update(cx, |m, cx| m.retry_op(&id, cx));
+    assert_eq!(retries.get(), 1);
+
+    // It fails again, this time without a retry; dismiss clears the area.
+    gate.borrow_mut().take().unwrap().send(()).unwrap();
+    settle(cx, |cx| {
+        matches!(op_of(&model, cx, &id), Some(OpState::Failed { .. }))
+    });
+    assert_eq!(label(cx).as_deref(), Some("again"));
+    assert!(!shows(&app, cx, "instance-op-retry"));
+    click(&app, cx, "instance-op-dismiss");
+    assert!(op_of(&model, cx, &id).is_none());
+    assert!(!shows(&app, cx, "instance-op-error"));
+    assert!(!shows(&app, cx, "instance-op-dismiss"));
+}
+
+#[gpui_kit::test]
+fn panicking_op_fails_with_a_message(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_app, model, ids) = op_model(cx, tmp.path(), &["Alpha"]);
+    model.update(cx, |m, cx| {
+        m.start_op(
+            &ids[0],
+            OpKind::Reinstall,
+            |_| {
+                async {
+                    if true {
+                        panic!("test panic in an operation");
+                    }
+                    Ok::<(), OpError>(())
+                }
+                .boxed()
+            },
+            |_, (), _| {},
+            None,
+            cx,
+        );
+    });
+    settle(cx, |cx| {
+        matches!(op_of(&model, cx, &ids[0]), Some(OpState::Failed { .. }))
+    });
+    let Some(OpState::Failed { message, .. }) = op_of(&model, cx, &ids[0]) else {
+        panic!("failed");
+    };
+    assert!(!message.trim().is_empty());
 }

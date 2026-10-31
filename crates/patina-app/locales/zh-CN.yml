@@ -91,3 +91,12 @@ instances:
     delete_confirm: "删除"
     cancel: "取消"
     delete_failed: '无法删除"%{id}"：%{error}'
+busy:
+  instance: '"%{name}"正在执行其他操作'
+  version: "版本 %{id} 正被其他操作使用"
+  processors: "Minecraft %{mc} 的另一个安装正在进行"
+ops:
+  amount_mb: "%{done}/%{total} MB"
+  amount_kb: "%{done}/%{total} KB"
+  retry: "重试"
+  dismiss: "关闭"
