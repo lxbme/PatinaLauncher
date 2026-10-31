@@ -248,3 +248,14 @@ instance_settings:
   gc_unknown: "无法确定 Java 版本，这些选项暂不可用"
   gc_reset: "%{preset}需要 Java %{major} 或更高版本，已改为不使用预设"
   mem_too_big: "不能超过 %{max} MiB"
+content:
+  filter:
+    placeholder: "按名称筛选"
+  refresh: "刷新"
+  no_match: "没有匹配“%{query}”的内容。"
+  failed: "无法读取这个文件夹：%{error}"
+  empty:
+    mods: "还没有 Mod。把 jar 放进文件夹，或去下载页获取。"
+    resourcepacks: "还没有资源包。把 zip 放进文件夹，或去下载页获取。"
+    shaders: "还没有光影包。把 zip 放进文件夹，或去下载页获取。"
+    saves: "还没有存档。在游戏里创建的世界会出现在这里。"
