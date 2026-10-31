@@ -3689,10 +3689,46 @@ fn versions_loader_action_is_keyboard_reachable(cx: &mut TestAppContext) {
         element(&app, cx, "versions-row-loader").unwrap().selected(),
         Some(true)
     );
+    for key in ["home", "end", "up", "down"] {
+        press(&app, cx, key);
+        let id = if matches!(key, "home" | "up") {
+            "versions-row-minecraft"
+        } else {
+            "versions-row-loader"
+        };
+        assert_eq!(
+            element(&app, cx, id).unwrap().selected(),
+            Some(true),
+            "{key}"
+        );
+    }
     tab_to(&app, cx, "versions-repair");
     press(&app, cx, "enter");
     wait_calls(&ops, cx, 1);
     assert_eq!(ops.calls(), [OpCall::Reinstall { id: "Pack".into() }]);
+}
+
+#[gpui_kit::test]
+fn versions_vanilla_keyboard_selection_stays_on_minecraft(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Vanilla", "1.21.1").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "tab-versions");
+    tab_to(&app, cx, "versions-components");
+    for key in ["down", "end", "up", "home"] {
+        press(&app, cx, key);
+        assert_eq!(
+            element(&app, cx, "versions-row-minecraft")
+                .unwrap()
+                .selected(),
+            Some(true),
+            "{key}"
+        );
+        assert!(!shows(&app, cx, "versions-row-loader"));
+    }
 }
 
 #[gpui_kit::test]
@@ -4902,6 +4938,121 @@ async fn instance_global_mode_revert_supersedes_a_held_seed_read(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+async fn override_edits_wait_for_pending_global_restoration(cx: &mut TestAppContext) {
+    override_edits_during_restoration(cx, 0, false).await;
+}
+
+#[gpui_kit::test]
+async fn override_edits_survive_superseded_global_restoration(cx: &mut TestAppContext) {
+    override_edits_during_restoration(cx, 1, false).await;
+}
+
+#[gpui_kit::test]
+async fn override_edits_survive_repeated_global_restoration_supersession(cx: &mut TestAppContext) {
+    override_edits_during_restoration(cx, 3, false).await;
+}
+
+#[gpui_kit::test]
+async fn override_edits_survive_canceled_global_restoration(cx: &mut TestAppContext) {
+    override_edits_during_restoration(cx, 0, true).await;
+}
+
+async fn override_edits_during_restoration(
+    cx: &mut TestAppContext,
+    superseding_pairs: usize,
+    finish_global: bool,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            store
+                .load("Alpha")
+                .unwrap()
+                .dir
+                .join(patina_core::instance::CONFIG_LOCK_FILE),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let held = cx.update(|cx| {
+        Core::update_config(cx, move |_| {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+        })
+    });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // On is held at the instance lock; off is held at the global seed read.
+    sclick(&app, cx, "settings-use-global");
+    sclick(&app, cx, "settings-use-global");
+    replace_text(&app, cx, "settings-min-mem", "768");
+    blur(&app, cx);
+    replace_text(&app, cx, "settings-args", "-Drestored=latest");
+    blur(&app, cx);
+    // Every replacement must preserve the earlier restoration dependency of
+    // accepted edits. All toggles happen before releasing either lock.
+    for _ in 0..superseding_pairs {
+        sclick(&app, cx, "settings-use-global");
+        sclick(&app, cx, "settings-use-global");
+    }
+    if finish_global {
+        sclick(&app, cx, "settings-use-global");
+    }
+    let form = settings_form(&app, cx);
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    futures::pin_mut!(drained);
+    drop(lock);
+    // Force the dangerous order: global-on completes before the seed read.
+    settle(cx, |_| saved_java(&store, "Alpha").is_none());
+    cx.run_until_parked();
+    assert!(
+        futures::poll!(&mut drained).is_pending(),
+        "flush must wait for the seed and protected edits"
+    );
+    release.send(()).unwrap();
+    held.await.unwrap().unwrap();
+    drained.await;
+    model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+    cx.run_until_parked();
+    if finish_global {
+        assert!(saved_java(&store, "Alpha").is_none());
+        assert_eq!(
+            element(&app, cx, "settings-use-global").unwrap().checked(),
+            Some(true)
+        );
+        // Cancellation must not discard the edits from the retained override.
+        override_on(&app, cx, &store, "Alpha");
+        cx.update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap()
+        .await;
+        model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+        cx.run_until_parked();
+    }
+    let java = saved_java(&store, "Alpha").unwrap();
+    assert_eq!(java.min_mem_mib, 768);
+    assert_eq!(java.extra_jvm_args, "-Drestored=latest");
+    assert_eq!(
+        element(&app, cx, "settings-min-mem").unwrap().value(),
+        Some("768")
+    );
+    assert_eq!(
+        form.read_with(cx, |f, cx| f.args_input().read(cx).value())
+            .as_ref(),
+        "-Drestored=latest"
+    );
+}
+
+#[gpui_kit::test]
 async fn instance_revert_while_save_is_held_preserves_latest_intent(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
@@ -5151,6 +5302,70 @@ fn gc_options_wait_for_a_known_java(cx: &mut TestAppContext) {
     });
     settle(cx, |cx| !sshows(&app, cx, "settings-gc-unknown"));
     assert!(!radio_disabled(&app, cx, "settings-gc", 2));
+}
+
+#[gpui_kit::test]
+async fn java_gc_reset_while_save_is_held_matches_disk_and_selected_radio(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, store) = settings_app(
+        cx,
+        tmp.path(),
+        &["Alpha"],
+        vec![
+            java_install("/opt/j21/bin/java", 21),
+            java_install("/opt/j8/bin/java", 8),
+        ],
+    );
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(1100.), px(1600.)));
+    cx.run_until_parked();
+    override_on(&app, cx, &store, "Alpha");
+    click_radio(&app, cx, "settings-java", 1);
+    let form = settings_form(&app, cx);
+    cx.update_window(app.handle, |_, window, cx| {
+        form.update(cx, |f, cx| f.flush(window, cx))
+    })
+    .unwrap()
+    .await;
+    model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+    cx.run_until_parked();
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            store
+                .load("Alpha")
+                .unwrap()
+                .dir
+                .join(patina_core::instance::CONFIG_LOCK_FILE),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    click_radio(&app, cx, "settings-gc", 2);
+    assert_eq!(
+        radio(&app, cx, "settings-gc", 2).unwrap().checked(),
+        Some(true)
+    );
+    click_radio(&app, cx, "settings-java", 2);
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drop(lock);
+    drained.await;
+    model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+    cx.run_until_parked();
+    let java = saved_java(&store, "Alpha").unwrap();
+    assert_eq!(java.java_path, Some("/opt/j8/bin/java".into()));
+    assert_eq!(java.gc_preset, GcPreset::None);
+    assert_eq!(
+        radio(&app, cx, "settings-gc", 0).unwrap().checked(),
+        Some(true)
+    );
+    assert_ne!(
+        radio(&app, cx, "settings-gc", 2).unwrap().checked(),
+        Some(true)
+    );
+    assert!(radio_disabled(&app, cx, "settings-gc", 2));
 }
 
 #[gpui_kit::test]

@@ -289,6 +289,9 @@ pub struct SettingsForm {
     mode_revision: Revision,
     /// An override awaiting global defaults must also be drained on close.
     mode_seed_pending: bool,
+    /// Queued restorations keep their position across mode revisions. Only the
+    /// latest seed read resolves these dependencies and releases the pump.
+    pending_restore_seeds: Vec<Arc<Mutex<JavaSettings>>>,
     /// Resolved once no save is queued or in flight.
     idle_waiters: Vec<oneshot::Sender<()>>,
     /// The override "使用全局设置" turned off, kept for turning it on again.
@@ -408,6 +411,7 @@ impl SettingsForm {
             requested_global: None,
             mode_revision: Revision::default(),
             mode_seed_pending: false,
+            pending_restore_seeds: Vec::new(),
             idle_waiters: Vec::new(),
             discarded: Arc::new(Mutex::new(None)),
             gc_reset_for: None,
@@ -786,13 +790,10 @@ impl SettingsForm {
     /// at a time, so two quick commits cannot interleave their
     /// load-change-save.
     fn pump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving || self.mode_seed_pending {
             return;
         }
         let Some((field, job)) = self.queue.pop_front() else {
-            if self.mode_seed_pending {
-                return;
-            }
             for waiter in self.idle_waiters.drain(..) {
                 waiter.send(()).ok();
             }
@@ -998,6 +999,14 @@ impl SettingsForm {
         self.java_choice_revision += 1;
         self.java_file_pending = None;
         self.requested_java = Some(path.clone());
+        // The newer Java job supersedes an older incompatible GC request.
+        // Clear at acceptance, not completion, so a later explicit GC survives.
+        if self
+            .requested_gc
+            .is_some_and(|preset| major.is_some_and(|major| !preset.is_compatible(major)))
+        {
+            self.requested_gc = None;
+        }
         self.errors.java = None;
         self.update_config(Field::Java, window, cx, move |config| {
             if let Some(java) = &mut config.java_override {
@@ -1085,7 +1094,6 @@ impl SettingsForm {
         self.java_choice_revision += 1;
         self.java_file_pending = None;
         let revision = self.mode_revision.start();
-        self.mode_seed_pending = false;
         // What was typed belongs to the override that is going away.
         if global {
             drop(self.flush(window, cx));
@@ -1096,26 +1104,42 @@ impl SettingsForm {
                     *kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(old);
                 }
             });
+        } else {
+            self.requested_global = Some(false);
+            self.mode_seed_pending = true;
+            let seed = Arc::new(Mutex::new(JavaSettings::default()));
+            self.pending_restore_seeds.push(seed.clone());
+            let kept = self.discarded.clone();
+            // Enqueue the dependency now, before accepting any edits against it.
+            // Later mode choices may supersede its seed, never its queue position.
+            self.update_config(Field::Global, window, cx, move |config| {
+                if config.java_override.is_none() {
+                    let old = kept.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    config.java_override =
+                        Some(old.unwrap_or_else(|| {
+                            seed.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                        }));
+                }
+            });
+            cx.notify();
+        }
+        if !self.mode_seed_pending {
             return;
         }
-        self.requested_global = Some(false);
-        self.mode_seed_pending = true;
-        cx.notify();
+        // Even a final global-on choice must resolve earlier restorations: their
+        // accepted edits must run before that choice retains/removes the override.
         let config = Core::read_config(cx);
-        let kept = self.discarded.clone();
         cx.spawn_in(window, async move |this, cx| {
             let seed = config.await.map(|c| c.java).unwrap_or_default();
             this.update_in(cx, |this, window, cx| {
                 if !this.mode_revision.is_current(revision) {
                     return;
                 }
+                for pending in this.pending_restore_seeds.drain(..) {
+                    *pending.lock().unwrap_or_else(|e| e.into_inner()) = seed.clone();
+                }
                 this.mode_seed_pending = false;
-                this.update_config(Field::Global, window, cx, move |config| {
-                    if config.java_override.is_none() {
-                        let old = kept.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        config.java_override = Some(old.unwrap_or(seed));
-                    }
-                });
+                this.pump(window, cx);
             })
             .ok();
         })
@@ -2002,6 +2026,131 @@ mod tests {
         let saved = store.load(&inst.id).unwrap().config.java_override.unwrap();
         assert_eq!(saved.min_mem_mib, 512);
         assert!(saved.extra_jvm_args.is_empty());
+    }
+
+    #[gpui_kit::test]
+    async fn java_gc_reset_supersedes_older_intent_without_intermediate_readback(
+        cx: &mut TestAppContext,
+    ) {
+        gc_reset_with_held_saves(cx, false).await;
+    }
+
+    #[gpui_kit::test]
+    async fn java_gc_reset_preserves_a_newer_explicit_preset(cx: &mut TestAppContext) {
+        gc_reset_with_held_saves(cx, true).await;
+    }
+
+    async fn gc_reset_with_held_saves(cx: &mut TestAppContext, newer_choice: bool) {
+        use gpui_kit::test::TestWindowExt;
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        let core = testing::core(
+            rt.handle().clone(),
+            DataDirs::new(dir.path()),
+            Arc::new(FakeCatalog::new().with_manifest_error("offline")),
+        );
+        let store = core.store.clone();
+        let inst = store.create("Alpha", "1.21.1").unwrap();
+        store
+            .update(&inst.id, |c| {
+                c.java_override = Some(JavaSettings {
+                    java_path: Some("/opt/j21/bin/java".into()),
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(core);
+            seed_java_list(
+                vec![
+                    JavaInstall {
+                        path: "/opt/j21/bin/java".into(),
+                        major: 21,
+                        version: "21.0.1".into(),
+                        is_64bit: true,
+                    },
+                    JavaInstall {
+                        path: "/opt/j8/bin/java".into(),
+                        major: 8,
+                        version: "8.0.1".into(),
+                        is_64bit: true,
+                    },
+                ],
+                cx,
+            );
+        });
+        cx.executor().allow_parking();
+        let host = cx.add_window(|window, cx| Host {
+            model: cx.new(|cx| InstancesModel::new(window, cx)),
+        });
+        let model = host.read_with(cx, |h, _| h.model.clone()).unwrap();
+        model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+        let window = cx.add_window(|window, cx| {
+            crate::theme::apply(window, cx);
+            SettingsForm::new(model.clone(), inst.id.clone(), window, cx)
+        });
+        let form = window.root(cx).unwrap();
+        cx.simulate_window_resize(
+            window.into(),
+            gpui_kit::size(gpui_kit::px(1100.), gpui_kit::px(1600.)),
+        );
+        // Capture actual production save jobs at the pump boundary. No intermediate
+        // listing is delivered, just as a replaced model refresh may be omitted.
+        form.update(cx, |f, _| f.saving = true);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.within("settings-gc").click(2usize, cx);
+            assert_eq!(
+                window.within("settings-gc").find(2usize).checked(),
+                Some(true)
+            );
+            window.within("settings-java").click(2usize, cx);
+            if newer_choice {
+                window.within("settings-gc").click(1usize, cx);
+            }
+        })
+        .unwrap();
+        let jobs = form.update(cx, |f, _| f.queue.drain(..).collect::<Vec<_>>());
+        assert_eq!(jobs.len(), if newer_choice { 3 } else { 2 });
+        for (_, job) in jobs {
+            let store = store.clone();
+            let id = inst.id.clone();
+            cx.update(|cx| run_blocking(cx, move || job(&store, &id)))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        form.update(cx, |f, _| f.saving = false);
+        model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+        let java = store.load(&inst.id).unwrap().config.java_override.unwrap();
+        assert_eq!(java.java_path, Some("/opt/j8/bin/java".into()));
+        assert_eq!(
+            java.gc_preset,
+            if newer_choice {
+                GcPreset::G1Aikar
+            } else {
+                GcPreset::None
+            }
+        );
+        cx.update_window(window.into(), |_, window, cx| {
+            form.update(cx, |f, cx| f.apply_config(window, cx, false));
+            window.render_frame(cx);
+            let expected = if newer_choice { 1usize } else { 0usize };
+            assert_eq!(
+                window.within("settings-gc").find(expected).checked(),
+                Some(true)
+            );
+            assert_ne!(
+                window.within("settings-gc").find(2usize).checked(),
+                Some(true)
+            );
+            assert_eq!(
+                window.within("settings-java").find(2usize).checked(),
+                Some(true)
+            );
+        })
+        .unwrap();
     }
 
     fn set_inputs_for_test(

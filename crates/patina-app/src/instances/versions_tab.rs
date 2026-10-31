@@ -170,6 +170,15 @@ impl VersionsTab {
 
     /// Selects `row` (the loader row only while there is a loader).
     pub fn select(&mut self, row: Row, cx: &mut Context<Self>) {
+        let row = if row == Row::Loader
+            && self
+                .config(cx)
+                .is_none_or(|config| config.loader().is_none())
+        {
+            Row::Minecraft
+        } else {
+            row
+        };
         if self.row != row {
             self.row = row;
             cx.notify();
