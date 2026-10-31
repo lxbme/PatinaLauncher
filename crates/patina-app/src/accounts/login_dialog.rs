@@ -128,10 +128,8 @@ impl LoginDialog {
             // Plan 3 stores the account here.
             (LoginEvent::Done { username, .. }, _) => LoginState::Done { username },
             (LoginEvent::Failed(error), _) => LoginState::Failed(error),
-            (event, _) => {
-                tracing::debug!(?event, "ignoring a sign-in event this dialog does not know");
-                return;
-            }
+            // Future events may carry secrets; never log unknown payloads.
+            _ => return,
         };
         if next.is_finished() {
             self.cancel = None;
@@ -383,6 +381,54 @@ pub fn open(window: &mut Window, cx: &mut gpui_kit::App) -> Entity<LoginDialog> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn unknown_event_does_not_log_payload(cx: &mut gpui_kit::TestAppContext) {
+        use patina_core::accounts::login::StorageKind;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+
+        // No login service or window: only exercise the real event handler.
+        let dialog = cx.new(|_| LoginDialog {
+            state: LoginState::Preparing,
+            cancel: None,
+            copied: false,
+            copied_reset: Task::ready(()),
+            events: Task::ready(()),
+        });
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("capture active");
+            dialog.update(cx, |dialog, cx| {
+                dialog.apply(LoginEvent::Storage(StorageKind::LocalFile), cx);
+                assert_eq!(dialog.state(), &LoginState::Preparing);
+            });
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("capture active"));
+        assert!(!output.contains("Storage") && !output.contains("LocalFile"));
+    }
 
     #[test]
     fn site_drops_the_scheme() {

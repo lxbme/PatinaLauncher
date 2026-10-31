@@ -7,11 +7,28 @@ use std::time::Duration;
 use tokio::sync::{mpsc::UnboundedSender, watch};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceCode {
     pub user_code: String,
     pub verification_uri: String,
     pub expires_in: Duration,
+}
+
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field("user_code", &"<redacted>")
+            .field("verification_uri", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// Where credentials were durably saved (reported by Task 4's service).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKind {
+    Keyring,
+    LocalFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -24,6 +41,8 @@ pub enum LoginError {
     Cancelled,
     #[error("{}", rust_i18n::t!("errors.login.other", error = .0))]
     Other(String),
+    #[error("{0}")]
+    Auth(super::error::AuthError),
 }
 
 /// Progress of one login attempt. Non-exhaustive: later versions may carry
@@ -41,6 +60,8 @@ pub enum LoginEvent {
         uuid: Uuid,
     },
     Failed(LoginError),
+    /// Nonterminal information; does not imply the account transaction is done.
+    Storage(StorageKind),
 }
 
 /// Signals cancellation: the login flow stops when the value becomes `true`
@@ -129,6 +150,7 @@ mod tests {
                 LoginError::Expired.to_string(),
                 LoginError::Cancelled.to_string(),
                 LoginError::Other("boom".into()).to_string(),
+                LoginError::Auth(super::super::error::AuthError::Denied).to_string(),
             ]
         };
         let zh = msgs(Language::ZhCn);
@@ -143,5 +165,76 @@ mod tests {
             assert!(!z.starts_with("errors."), "{z}");
         }
         assert!(zh[3].contains("boom") && en[3].contains("boom"));
+    }
+    #[test]
+    fn auth_errors_i18n() {
+        use super::super::error::{AuthError, AuthStage, XboxRestriction};
+        use crate::i18n::{Language, set_language};
+        let _locale = crate::i18n::locale_lock();
+        let errors = [
+            AuthError::Cancelled,
+            AuthError::Expired,
+            AuthError::Denied,
+            AuthError::Network {
+                stage: AuthStage::DeviceCode,
+            },
+            AuthError::Http {
+                stage: AuthStage::MicrosoftToken,
+                status: 503,
+            },
+            AuthError::InvalidResponse {
+                stage: AuthStage::Profile,
+            },
+            AuthError::XboxRestriction(XboxRestriction::AccountRequired),
+            AuthError::XboxRestriction(XboxRestriction::Region),
+            AuthError::XboxRestriction(XboxRestriction::AdultVerification),
+            AuthError::XboxRestriction(XboxRestriction::Family),
+            AuthError::XboxRestriction(XboxRestriction::Unknown),
+            AuthError::NoEntitlement,
+            AuthError::ProfileMissing,
+            AuthError::IdentityMismatch,
+            AuthError::ReauthenticationRequired,
+            AuthError::StorageUnavailable,
+            AuthError::CredentialMissing,
+            AuthError::CredentialCorrupt,
+            AuthError::CredentialWrite,
+            AuthError::UnsafeCredentialPath,
+            AuthError::Account(super::super::AccountError::Parse("SECRET_SENTINEL".into())),
+            AuthError::OfflineNotAllowed,
+            AuthError::OfflineConflict,
+            AuthError::Busy,
+            AuthError::SessionExpired,
+        ];
+        for language in [Language::En, Language::ZhCn] {
+            set_language(language);
+            let mut messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            messages.extend(
+                [
+                    AuthStage::DeviceCode,
+                    AuthStage::MicrosoftToken,
+                    AuthStage::XboxLive,
+                    AuthStage::Xsts,
+                    AuthStage::MinecraftToken,
+                    AuthStage::Entitlement,
+                    AuthStage::Profile,
+                    AuthStage::Skin,
+                ]
+                .map(|stage| stage.display_name().to_string()),
+            );
+            for text in messages {
+                assert!(
+                    !text.is_empty() && !text.contains("errors.") && !text.contains("auth.stage.")
+                );
+                assert!(!text.contains("SECRET_SENTINEL"));
+                match language {
+                    Language::En => assert!(text.is_ascii(), "{text}"),
+                    Language::ZhCn => assert!(
+                        text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                        "{text}"
+                    ),
+                }
+            }
+        }
+        set_language(Language::ZhCn);
     }
 }

@@ -1,4 +1,31 @@
 errors:
+  auth:
+    cancelled: "登录已取消。"
+    expired: "登录代码已过期，请重试。"
+    denied: "登录被拒绝。"
+    no_entitlement: "此账号未拥有 Minecraft Java 版。"
+    profile_missing: "此账号没有 Minecraft 档案。"
+    identity_mismatch: "登录过程中账号身份发生变化，请重试。"
+    reauthentication_required: "请重新登录此账号。"
+    storage_unavailable: "凭据存储不可用，请重试。"
+    credential_missing: "保存的凭据缺失，请重新登录。"
+    credential_corrupt: "无法读取保存的凭据，请重新登录。"
+    credential_write: "无法保存凭据，请重试。"
+    unsafe_credential_path: "凭据存储路径不安全。"
+    offline_not_allowed: "请先添加已验证的微软账号，再使用离线账号。"
+    offline_conflict: "已存在同名离线账号。"
+    busy: "另一个账号操作正在进行，请稍后重试。"
+    session_expired: "游戏会话已过期，请重新启动游戏。"
+    network: "%{stage}时无法连接，请重试。"
+    http: "服务拒绝了%{stage}（HTTP %{status}）。"
+    invalid_response: "%{stage}时服务返回了无效响应。"
+    account: "无法读取或保存账号。"
+    xbox:
+      account_required: "请先创建 Xbox 账号再登录。"
+      region: "此地区无法使用 Xbox 登录。"
+      adult_verification: "请先完成 Xbox 成人验证再登录。"
+      family: "Xbox 家庭设置阻止了登录。"
+      unknown: "Xbox 账号限制阻止了登录。"
   content:
     invalid_pack_path: "此内容包路径不是该文件夹下的安全直接子项。"
   config:
@@ -154,3 +181,14 @@ progress:
     run_processor: "正在运行安装步骤"
     finalize: "正在完成"
     launching: "正在启动游戏"
+
+auth:
+  stage:
+    device_code: "登录代码"
+    microsoft_token: "微软登录"
+    xbox_live: "Xbox Live 登录"
+    xsts: "Xbox 授权"
+    minecraft_token: "Minecraft 登录"
+    entitlement: "游戏所有权验证"
+    profile: "Minecraft 档案"
+    skin: "皮肤下载"

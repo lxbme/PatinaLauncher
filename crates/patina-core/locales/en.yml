@@ -1,4 +1,31 @@
 errors:
+  auth:
+    cancelled: "Sign-in was cancelled."
+    expired: "The sign-in code expired. Try again."
+    denied: "Sign-in was declined."
+    no_entitlement: "This account does not own Minecraft: Java Edition."
+    profile_missing: "This account has no Minecraft profile."
+    identity_mismatch: "The account identity changed during sign-in. Try again."
+    reauthentication_required: "Sign in to this account again."
+    storage_unavailable: "Credential storage is unavailable. Try again."
+    credential_missing: "Saved credentials are missing. Sign in again."
+    credential_corrupt: "Saved credentials could not be read. Sign in again."
+    credential_write: "Credentials could not be saved. Try again."
+    unsafe_credential_path: "The credential storage path is not secure."
+    offline_not_allowed: "Add a verified Microsoft account before using offline accounts."
+    offline_conflict: "An offline account with this name already exists."
+    busy: "Another account operation is in progress. Try again when it finishes."
+    session_expired: "The game session expired. Try launching again."
+    network: "Could not connect during %{stage}. Try again."
+    http: "The service rejected %{stage} (HTTP %{status})."
+    invalid_response: "The service returned an invalid response during %{stage}."
+    account: "The account could not be read or saved."
+    xbox:
+      account_required: "Create an Xbox account before signing in."
+      region: "Xbox sign-in is not available in this region."
+      adult_verification: "Complete Xbox adult verification before signing in."
+      family: "Xbox family settings prevent sign-in."
+      unknown: "Xbox account restrictions prevent sign-in."
   content:
     invalid_pack_path: "This pack path is not a safe direct child of this folder."
   config:
@@ -154,3 +181,14 @@ progress:
     run_processor: "Running install steps"
     finalize: "Finishing"
     launching: "Launching game"
+
+auth:
+  stage:
+    device_code: "sign-in code"
+    microsoft_token: "Microsoft sign-in"
+    xbox_live: "Xbox Live sign-in"
+    xsts: "Xbox authorization"
+    minecraft_token: "Minecraft sign-in"
+    entitlement: "game ownership check"
+    profile: "Minecraft profile"
+    skin: "skin download"

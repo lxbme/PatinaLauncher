@@ -45,22 +45,9 @@ pub struct LaunchCommand {
 
 impl std::fmt::Debug for LaunchCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut redacted = Vec::with_capacity(self.args.len());
-        let mut prev_token_flag = false;
-        for a in &self.args {
-            let r = if prev_token_flag {
-                "<redacted>".to_string()
-            } else if a.starts_with("token:") {
-                "token:<redacted>".to_string()
-            } else {
-                a.clone()
-            };
-            prev_token_flag = a == "--accessToken";
-            redacted.push(r);
-        }
         f.debug_struct("LaunchCommand")
             .field("program", &self.program)
-            .field("args", &redacted)
+            .field("arg_count", &self.args.len())
             .field("cwd", &self.cwd)
             .finish()
     }
@@ -484,9 +471,16 @@ mod tests {
             assert!(!format!("{c:?}").contains("secret-token"));
         }
         let mut c = build(LEGACY, "/d", &["/x.jar"], None, &AssetLayout::Modern);
-        c.args.push("token:secret-token:abc".into());
+        c.args.extend([
+            "token:secret-token:abc".into(),
+            "--accessToken=SECRET_SENTINEL".into(),
+            "--custom-credential".into(),
+            "SECRET_SENTINEL".into(),
+            "-Dcustom.secret=SECRET_SENTINEL".into(),
+        ]);
         let d = format!("{c:?}");
-        assert!(!d.contains("secret-token") && d.contains("token:<redacted>"));
+        assert!(!d.contains("secret-token") && !d.contains("SECRET_SENTINEL"));
+        assert!(d.contains(&format!("arg_count: {}", c.args.len())));
         assert!(!format!("{:?}", account()).contains("secret-token"));
     }
 

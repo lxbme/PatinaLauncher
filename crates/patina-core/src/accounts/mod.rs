@@ -10,7 +10,21 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub mod error;
+mod http;
 pub mod login;
+mod secret;
+
+pub use http::{DEFAULT_MSA_CLIENT_ID, msa_client_id};
+
+/// Isolated collaborators for downstream tests; absent from production builds.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing {
+    pub use super::http::AuthHttp;
+}
+
+#[cfg(test)]
+mod http_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,7 +44,7 @@ pub struct Account {
     pub token_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AccountError {
     #[error("{}", rust_i18n::t!("errors.accounts.not_found", id = .0))]
     NotFound(String),

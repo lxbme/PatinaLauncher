@@ -9,7 +9,7 @@ workspace = true
 
 [features]
 dev-offline = []
-# Exposes launch entry points that skip prepare, for other crates' tests.
+# Exposes isolated fixtures for other crates' tests.
 test-support = []
 
 [dependencies]
@@ -22,7 +22,7 @@ lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std", 
 md-5 = "0.11.0"
 quick-xml = "0.42.0"
 regex = "1.13.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "form", "json"] }
 rust-i18n = "4"
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -35,6 +35,7 @@ toml = "1.1.8"
 toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 tracing = "0.1"
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
+zeroize = "1.9.1"
 zip = "9.1.3"
 
 [dev-dependencies]
