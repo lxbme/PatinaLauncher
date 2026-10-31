@@ -647,6 +647,10 @@ pub struct LoaderChanged;
 pub struct LoaderPicker {
     mc: Option<String>,
     kind: Option<LoaderKind>,
+    /// The kind cannot be changed: the segmented control is not shown.
+    kind_locked: bool,
+    /// Segments left out of the control (`None`: "无").
+    hidden: Vec<Option<LoaderKind>>,
     version: Option<String>,
     lists: HashMap<LoaderKind, LoaderList>,
     revisions: HashMap<LoaderKind, Revision>,
@@ -663,6 +667,8 @@ impl LoaderPicker {
         Self {
             mc: None,
             kind: None,
+            kind_locked: false,
+            hidden: Vec::new(),
             version: None,
             lists: HashMap::new(),
             revisions: HashMap::new(),
@@ -719,6 +725,19 @@ impl LoaderPicker {
             self.load(kind, cx);
         }
         cx.notify();
+    }
+
+    /// Fixes the kind to `kind`: only its versions are shown, with no
+    /// segmented control. For changing the version of an installed loader.
+    pub fn lock_kind(&mut self, kind: LoaderKind, cx: &mut Context<Self>) {
+        self.kind_locked = true;
+        self.choose_kind(Some(kind), cx);
+        cx.notify();
+    }
+
+    /// Leaves the segment of `kind` (`None`: "无") out of the control.
+    pub fn hide_kind(&mut self, kind: Option<LoaderKind>) {
+        self.hidden.push(kind);
     }
 
     /// Chooses loader `kind` (`None`: "无") and its default version.
@@ -852,30 +871,30 @@ impl LoaderPicker {
     fn render_segments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (active, primary) = (theme.list_active, theme.primary);
-        let segments =
-            std::iter::once(None)
-                .chain(LOADER_KINDS.map(Some))
-                .map(|kind: Option<LoaderKind>| {
-                    let label = kind.map_or_else(
-                        || t!("add_instance.loader_none").to_string(),
-                        |k| k.display_name(),
-                    );
-                    // Unknown support (loading, failed) leaves the segment usable.
-                    let unsupported = kind.is_some_and(|k| self.is_supported(k) == Some(false));
-                    let selected = self.kind == kind;
-                    // Each segment handles its own click, so the keyboard's
-                    // Enter / Space on a focused segment chooses it too.
-                    Button::new(loader_segment_id(kind))
-                        .label(label)
-                        .selected(selected)
-                        .disabled(self.mc.is_none() && kind.is_some() || unsupported)
-                        .when(selected, |b| {
-                            b.bg(active)
-                                .text_color(primary)
-                                .strong(FontWeight::MEDIUM, cx)
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| this.choose_kind(kind, cx)))
-                });
+        let segments = std::iter::once(None)
+            .chain(LOADER_KINDS.map(Some))
+            .filter(|kind| !self.hidden.contains(kind))
+            .map(|kind: Option<LoaderKind>| {
+                let label = kind.map_or_else(
+                    || t!("add_instance.loader_none").to_string(),
+                    |k| k.display_name(),
+                );
+                // Unknown support (loading, failed) leaves the segment usable.
+                let unsupported = kind.is_some_and(|k| self.is_supported(k) == Some(false));
+                let selected = self.kind == kind;
+                // Each segment handles its own click, so the keyboard's
+                // Enter / Space on a focused segment chooses it too.
+                Button::new(loader_segment_id(kind))
+                    .label(label)
+                    .selected(selected)
+                    .disabled(self.mc.is_none() && kind.is_some() || unsupported)
+                    .when(selected, |b| {
+                        b.bg(active)
+                            .text_color(primary)
+                            .strong(FontWeight::MEDIUM, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_kind(kind, cx)))
+            });
         ButtonGroup::new("loader-kinds")
             .outline()
             .small()
@@ -976,8 +995,9 @@ impl Render for LoaderPicker {
         v_flex()
             .w_full()
             .gap_2()
-            .child(self.render_segments(cx))
-            .children(hint)
+            .when(!self.kind_locked, |this| {
+                this.child(self.render_segments(cx)).children(hint)
+            })
             .when(self.kind.is_some(), |this| {
                 this.child(
                     div()

@@ -17,6 +17,7 @@ mod list;
 mod model;
 mod overview;
 mod version_picker;
+mod versions_tab;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +47,7 @@ pub use icon::{
 pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
 pub use model::{Entry, InstancesChanged, InstancesModel};
+pub use versions_tab::{Row as VersionsRow, VersionsTab};
 // The run state lives with the launch flow; listed here for the views.
 pub use crate::launch::RunState;
 pub use overview::OverviewStats;

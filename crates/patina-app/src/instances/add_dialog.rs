@@ -27,7 +27,7 @@ use gpui_kit::{
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, TestSupportExt, Window, div, rems,
 };
-use patina_core::loader::ops::{OpOutcome, install_loader};
+use patina_core::loader::ops::OpOutcome;
 use patina_core::loader::{LoaderKind, VersionPick};
 use rust_i18n::t;
 
@@ -419,8 +419,7 @@ fn install(
     version: String,
     cx: &mut Context<InstancesModel>,
 ) {
-    let core = Core::global(cx);
-    let (launcher, store) = (core.launcher(), core.store.clone());
+    let ops = Core::global(cx).version_ops.clone();
     let retry: RetryAction = {
         let (id, version) = (id.to_string(), version.clone());
         Rc::new(move |model, cx| install(model, &id, kind, version.clone(), cx))
@@ -432,7 +431,7 @@ fn install(
         move |progress| {
             async move {
                 let pick = VersionPick::Exact(version);
-                install_loader(&launcher, &store, &target, kind, pick, false, progress)
+                (ops.install_loader(target, kind, pick, false, progress))
                     .await
                     .map_err(OpError::from)
             }

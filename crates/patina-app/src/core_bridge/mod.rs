@@ -15,6 +15,8 @@
 //!   about 30 times a second;
 //! - launches are prepared through `Core.launch_backend` ([`LaunchBackend`]),
 //!   which UI tests replace with fake games;
+//! - loader and version changes go through `Core.version_ops`
+//!   ([`VersionOps`]), likewise injectable;
 //! - every result is checked against the request that is current when it
 //!   arrives ([`Revision`], or the id of the instance it is for) and dropped
 //!   if it is stale.
@@ -25,6 +27,7 @@ mod service;
 mod task;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
+mod version_ops;
 
 pub use accounts_changed::{AccountsChanged, AccountsEpoch};
 pub use launch::LaunchBackend;
@@ -32,3 +35,4 @@ pub use service::{Catalog, Core, InitError, LoadError, LoadedAccounts, LoadedCon
 pub use task::{
     BridgeError, PROGRESS_MIN_GAP, Revision, RevisionId, forward_progress, run, run_blocking,
 };
+pub use version_ops::VersionOps;

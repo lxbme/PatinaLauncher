@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock};
 
 use super::launch::{CoreLaunchBackend, LaunchBackend};
 use super::task::{BridgeError, run, run_blocking};
+use super::version_ops::{CoreVersionOps, VersionOps};
 
 /// Why a file the core reads at startup is not in memory.
 #[derive(Debug)]
@@ -99,6 +100,8 @@ pub struct Core {
     pub catalog: Arc<dyn Catalog>,
     /// Prepares launches, injectable for UI tests (fake games).
     pub launch_backend: Arc<dyn LaunchBackend>,
+    /// Loader and version changes, injectable for UI tests.
+    pub version_ops: Arc<dyn VersionOps>,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
@@ -128,6 +131,14 @@ pub(super) enum Startup {
     Offline,
 }
 
+/// The injectable services; `None` takes the real one.
+#[derive(Default)]
+pub(super) struct Fakes {
+    pub(super) catalog: Option<Arc<dyn Catalog>>,
+    pub(super) launch_backend: Option<Arc<dyn LaunchBackend>>,
+    pub(super) version_ops: Option<Arc<dyn VersionOps>>,
+}
+
 impl Core {
     /// Creates the core services without blocking: the config and the
     /// accounts load on the runtime's blocking pool, and the launcher starts
@@ -136,16 +147,20 @@ impl Core {
     /// and no stored pick, a speed test runs in the background, swaps the
     /// launcher and stores the pick. Network failures are only logged.
     pub fn init(rt: Handle, data: DataDirs) -> Result<Core, InitError> {
-        Core::start(rt, data, None, None, Startup::SpeedTest)
+        Core::start(rt, data, Fakes::default(), Startup::SpeedTest)
     }
 
     pub(super) fn start(
         rt: Handle,
         data: DataDirs,
-        catalog: Option<Arc<dyn Catalog>>,
-        launch_backend: Option<Arc<dyn LaunchBackend>>,
+        fakes: Fakes,
         startup: Startup,
     ) -> Result<Core, InitError> {
+        let Fakes {
+            catalog,
+            launch_backend,
+            version_ops,
+        } = fakes;
         let client = {
             let _rt = rt.enter();
             let client = match startup {
@@ -178,12 +193,20 @@ impl Core {
                 config: config.clone(),
             })
         });
+        let store = InstanceStore::new(data.instances());
+        let version_ops = version_ops.unwrap_or_else(|| {
+            Arc::new(CoreVersionOps {
+                launcher: launcher.clone(),
+                store: store.clone(),
+            })
+        });
         let core = Core {
             rt,
-            store: InstanceStore::new(data.instances()),
+            store,
             data,
             catalog,
             launch_backend,
+            version_ops,
             config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),

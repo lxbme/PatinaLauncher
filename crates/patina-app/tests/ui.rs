@@ -2960,3 +2960,546 @@ fn loader_needing_reinstall_offers_reinstall(cx: &mut TestAppContext) {
         )
     });
 }
+
+// --- versions tab ---------------------------------------------------------
+
+use patina_app::core_bridge::testing::{FakeVersionOps, OpCall};
+use patina_core::loader::VersionPick;
+use patina_core::loader::ops::LoaderAction;
+
+/// Instance `Pack` on Minecraft `mc` with Fabric `version`, a booted app
+/// whose loader changes go to the returned fake, the versions tab open.
+fn versions_app(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    mc: &str,
+    version: &str,
+) -> (Booted, Entity<InstancesModel>, Arc<FakeVersionOps>) {
+    versions_app_with(cx, dir, mc, Some(version))
+}
+
+/// [`versions_app`] with Fabric `loader` or, with `None`, no loader.
+fn versions_app_with(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    mc: &str,
+    loader: Option<&str>,
+) -> (Booted, Entity<InstancesModel>, Arc<FakeVersionOps>) {
+    let store = InstanceStore::new(DataDirs::new(dir).instances());
+    store.create("Pack", mc).unwrap();
+    if let Some(version) = loader {
+        let mut inst = store.load("Pack").unwrap();
+        inst.config
+            .set_loader(Some(Component {
+                uid: ComponentUid::Fabric,
+                version: version.into(),
+                profile: None,
+            }))
+            .unwrap();
+        store.save(&inst).unwrap();
+    }
+    let ops = Arc::new(FakeVersionOps::new(store));
+    let app = {
+        let ops = ops.clone();
+        boot_core(cx, dir, AppSettings::default(), move |rt, data| {
+            testing::core_with_ops(rt, data, catalog(), ops)
+        })
+    };
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "tab-versions");
+    assert!(shows(&app, cx, "versions-row-minecraft"));
+    (app, model, ops)
+}
+
+fn label_of(
+    app: &Booted,
+    cx: &mut TestAppContext,
+    id: impl Into<gpui_kit::ElementId>,
+) -> Option<String> {
+    element(app, cx, id).and_then(|e| e.label().map(str::to_owned))
+}
+
+fn wait_calls(ops: &FakeVersionOps, cx: &mut TestAppContext, n: usize) {
+    settle(cx, |_| ops.calls().len() >= n);
+    // The operation ends and the list refreshes.
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn repair_calls_reinstall(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+
+    // The Minecraft row has no repair; the loader row does.
+    assert!(!shows(&app, cx, "versions-repair"));
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-repair");
+    wait_calls(&ops, cx, 1);
+    assert_eq!(ops.calls(), [OpCall::Reinstall { id: "Pack".into() }]);
+    settle(cx, |cx| op_of(&model, cx, "Pack").is_none());
+}
+
+#[gpui_kit::test]
+fn actions_disabled_while_running(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    click(&app, cx, "versions-row-loader");
+    for id in [
+        "versions-change-loader-version",
+        "versions-switch-loader",
+        "versions-repair",
+        "versions-remove-loader",
+    ] {
+        assert!(!disabled(&app, cx, id), "{id} is enabled when idle");
+    }
+    assert!(!shows(&app, cx, "versions-reason"));
+
+    model.update(cx, |m, cx| m.set_run_state("Pack", Some(elsewhere()), cx));
+    for id in [
+        "versions-change-loader-version",
+        "versions-switch-loader",
+        "versions-repair",
+        "versions-remove-loader",
+    ] {
+        assert!(disabled(&app, cx, id), "{id} is disabled while running");
+    }
+    assert_eq!(
+        label_of(&app, cx, "versions-reason").as_deref(),
+        Some("The game is running")
+    );
+    click(&app, cx, "versions-repair");
+    assert!(ops.calls().is_empty(), "a disabled button does nothing");
+
+    // Also while an operation runs.
+    model.update(cx, |m, cx| m.set_run_state("Pack", None, cx));
+    let (gate, wait) = oneshot::channel::<()>();
+    let started = model.update(cx, |m, cx| {
+        m.start_op(
+            "Pack",
+            OpKind::Reinstall,
+            move |_| {
+                async move {
+                    wait.await.ok();
+                    Ok(())
+                }
+                .boxed()
+            },
+            |_, (), _| {},
+            None,
+            cx,
+        )
+    });
+    assert!(started);
+    cx.run_until_parked();
+    assert!(disabled(&app, cx, "versions-repair"));
+    assert_eq!(
+        label_of(&app, cx, "versions-reason").as_deref(),
+        Some("An operation is in progress")
+    );
+    click(&app, cx, "versions-row-minecraft");
+    assert!(disabled(&app, cx, "versions-change-mc"));
+    gate.send(()).unwrap();
+    settle(cx, |cx| !disabled(&app, cx, "versions-change-mc"));
+    assert!(ops.calls().is_empty());
+}
+
+#[gpui_kit::test]
+fn switch_loader_requires_confirmation(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.20.1", "0.14.0");
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-switch-loader");
+    assert!(shows(&app, cx, "dialog"));
+    assert!(
+        disabled(&app, cx, "versions-dialog-confirm"),
+        "nothing chosen yet"
+    );
+
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("47.3.0")));
+    assert!(!disabled(&app, cx, "versions-dialog-confirm"));
+    click(&app, cx, "versions-dialog-confirm");
+    // The pick is not the answer: a confirmation comes first.
+    assert!(shows(&app, cx, "dialog"));
+    assert_eq!(
+        label_of(&app, cx, "versions-confirm-title").as_deref(),
+        Some("Switch loader to Forge?")
+    );
+    cx.run_until_parked();
+    assert!(ops.calls().is_empty(), "nothing runs before the answer");
+
+    // Cancel changes nothing.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("cancel", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!shows(&app, cx, "dialog"));
+    assert!(ops.calls().is_empty());
+
+    // Confirm installs with `replace_existing`.
+    click(&app, cx, "versions-switch-loader");
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("47.3.0")));
+    click(&app, cx, "versions-dialog-confirm");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    wait_calls(&ops, cx, 1);
+    assert_eq!(
+        ops.calls(),
+        [OpCall::InstallLoader {
+            id: "Pack".into(),
+            kind: LoaderKind::Forge,
+            pick: VersionPick::Exact("47.3.0".into()),
+            replace_existing: true,
+        }]
+    );
+}
+
+/// Changes the Minecraft version of the open instance to 1.21 in the
+/// dialog.
+fn change_game_version_to_1_21(app: &Booted, cx: &mut TestAppContext) {
+    click(app, cx, "versions-row-minecraft");
+    click(app, cx, "versions-change-mc");
+    assert!(shows(app, cx, "dialog"));
+    assert!(
+        disabled(app, cx, "versions-dialog-confirm"),
+        "the current version is not a change"
+    );
+    settle(cx, |cx| shows(app, cx, version_row_id("1.21")));
+    click(app, cx, version_row_id("1.21"));
+    assert!(!disabled(app, cx, "versions-dialog-confirm"));
+    click(app, cx, "versions-dialog-confirm");
+}
+
+#[gpui_kit::test]
+fn incompatible_offers_replace_only_when_possible(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+
+    // A loader some version of which supports 1.21: "换成推荐版" is offered.
+    ops.then(Err(LoaderError::Incompatible {
+        kind: LoaderKind::Fabric,
+        version: "0.16.5".into(),
+        can_replace: true,
+    }));
+    change_game_version_to_1_21(&app, cx);
+    wait_calls(&ops, cx, 1);
+    settle(cx, |cx| shows(&app, cx, "incompatible-title"));
+    assert_eq!(
+        label_of(&app, cx, "incompatible-title").as_deref(),
+        Some("Fabric 0.16.5 doesn’t support Minecraft 1.21")
+    );
+    assert!(shows(&app, cx, "incompatible-replace"));
+    assert!(shows(&app, cx, "incompatible-remove"));
+    assert!(shows(&app, cx, "incompatible-cancel"));
+    click(&app, cx, "incompatible-replace");
+    wait_calls(&ops, cx, 2);
+
+    // None does: only "移除加载器" and "取消".
+    ops.then(Err(LoaderError::Incompatible {
+        kind: LoaderKind::Fabric,
+        version: "0.16.5".into(),
+        can_replace: false,
+    }));
+    settle(cx, |cx| !disabled(&app, cx, "versions-change-mc"));
+    change_game_version_to_1_21(&app, cx);
+    wait_calls(&ops, cx, 3);
+    settle(cx, |cx| shows(&app, cx, "incompatible-title"));
+    assert!(!shows(&app, cx, "incompatible-replace"));
+    click(&app, cx, "incompatible-remove");
+    wait_calls(&ops, cx, 4);
+
+    // "取消" runs nothing.
+    ops.then(Err(LoaderError::Incompatible {
+        kind: LoaderKind::Fabric,
+        version: "0.16.5".into(),
+        can_replace: true,
+    }));
+    settle(cx, |cx| !disabled(&app, cx, "versions-change-mc"));
+    change_game_version_to_1_21(&app, cx);
+    wait_calls(&ops, cx, 5);
+    settle(cx, |cx| shows(&app, cx, "incompatible-cancel"));
+    click(&app, cx, "incompatible-cancel");
+    cx.run_until_parked();
+    assert!(!shows(&app, cx, "dialog"));
+
+    let set = |action| OpCall::SetMcVersion {
+        id: "Pack".into(),
+        mc: "1.21".into(),
+        action,
+    };
+    assert_eq!(
+        ops.calls(),
+        [
+            set(None),
+            set(Some(LoaderAction::Replace)),
+            set(None),
+            set(Some(LoaderAction::Remove)),
+            set(None),
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn removing_the_loader_asks_first(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-remove-loader");
+    assert_eq!(
+        label_of(&app, cx, "versions-confirm-title").as_deref(),
+        Some("Remove Fabric 0.16.5 from “Pack”?")
+    );
+    cx.run_until_parked();
+    assert!(ops.calls().is_empty());
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    wait_calls(&ops, cx, 1);
+    assert_eq!(ops.calls(), [OpCall::RemoveLoader { id: "Pack".into() }]);
+}
+
+fn notification_count(app: &Booted, cx: &mut TestAppContext) -> usize {
+    cx.update_window(app.handle, |_, window, cx| window.notifications(cx).len())
+        .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_java_line_is_visible_on_the_minecraft_row(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = DataDirs::new(tmp.path()).versions().join("1.21.1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("1.21.1.json"),
+        r#"{"javaVersion":{"majorVersion":21}}"#,
+    )
+    .unwrap();
+    let (app, _model, _ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    settle(cx, |cx| shows(&app, cx, "versions-java"));
+    assert_eq!(
+        label_of(&app, cx, "versions-java").as_deref(),
+        Some("Needs Java 21")
+    );
+}
+
+#[gpui_kit::test]
+fn the_loader_row_is_tagged_recommended_or_latest(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, _ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    settle(cx, |cx| shows(&app, cx, "versions-tag-recommended"));
+    assert!(!shows(&app, cx, "versions-tag-latest"));
+}
+
+#[gpui_kit::test]
+fn the_latest_loader_row_is_tagged_latest(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, _ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.9");
+    settle(cx, |cx| shows(&app, cx, "versions-tag-latest"));
+    assert!(!shows(&app, cx, "versions-tag-recommended"));
+}
+
+#[gpui_kit::test]
+fn the_loader_version_dialog_shows_only_that_loader(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-change-loader-version");
+    settle(cx, |cx| shows(&app, cx, loader_row_id("0.16.9")));
+    assert!(chosen(&app, cx, loader_row_id("0.16.5")), "the current one");
+    assert!(!shows(
+        &app,
+        cx,
+        loader_segment_id(Some(LoaderKind::Fabric))
+    ));
+    assert!(!shows(&app, cx, loader_segment_id(None)));
+    assert!(disabled(&app, cx, "versions-dialog-confirm"));
+    click(&app, cx, loader_row_id("0.16.9"));
+    click(&app, cx, "versions-dialog-confirm");
+    wait_calls(&ops, cx, 1);
+    assert_eq!(
+        ops.calls(),
+        [OpCall::InstallLoader {
+            id: "Pack".into(),
+            kind: LoaderKind::Fabric,
+            pick: VersionPick::Exact("0.16.9".into()),
+            replace_existing: false,
+        }]
+    );
+}
+
+#[gpui_kit::test]
+fn a_vanilla_instance_installs_a_loader(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ops) = versions_app_with(cx, tmp.path(), "1.21.1", None);
+    assert!(!shows(&app, cx, "versions-row-loader"));
+    assert!(shows(&app, cx, "versions-hint"));
+    click(&app, cx, "versions-install");
+    assert!(disabled(&app, cx, "versions-dialog-confirm"));
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("0.16.5")));
+    click(&app, cx, "versions-dialog-confirm");
+    wait_calls(&ops, cx, 1);
+    assert_eq!(
+        ops.calls(),
+        [OpCall::InstallLoader {
+            id: "Pack".into(),
+            kind: LoaderKind::Fabric,
+            pick: VersionPick::Exact("0.16.5".into()),
+            replace_existing: false,
+        }]
+    );
+
+    // Busy: the button is disabled and says why.
+    model.update(cx, |m, cx| m.set_run_state("Pack", Some(elsewhere()), cx));
+    assert!(disabled(&app, cx, "versions-install"));
+    assert_eq!(
+        label_of(&app, cx, "versions-install-reason").as_deref(),
+        Some("The game is running")
+    );
+}
+
+#[gpui_kit::test]
+fn a_busy_instance_takes_no_picked_change(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    click(&app, cx, "versions-row-minecraft");
+    click(&app, cx, "versions-change-mc");
+    settle(cx, |cx| shows(&app, cx, version_row_id("1.21")));
+    click(&app, cx, version_row_id("1.21"));
+    assert!(!disabled(&app, cx, "versions-dialog-confirm"));
+
+    // The game starts while the dialog is open.
+    model.update(cx, |m, cx| m.set_run_state("Pack", Some(elsewhere()), cx));
+    cx.run_until_parked();
+    assert!(disabled(&app, cx, "versions-dialog-confirm"));
+    press(&app, cx, "enter");
+    click(&app, cx, "versions-dialog-confirm");
+    cx.run_until_parked();
+    assert!(ops.calls().is_empty(), "{:?}", ops.calls());
+}
+
+#[gpui_kit::test]
+fn a_refused_rerun_says_why(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    ops.then(Err(LoaderError::Incompatible {
+        kind: LoaderKind::Fabric,
+        version: "0.16.5".into(),
+        can_replace: true,
+    }));
+    change_game_version_to_1_21(&app, cx);
+    settle(cx, |cx| shows(&app, cx, "incompatible-replace"));
+    assert_eq!(notification_count(&app, cx), 0);
+
+    model.update(cx, |m, cx| m.set_run_state("Pack", Some(elsewhere()), cx));
+    click(&app, cx, "incompatible-replace");
+    settle(cx, |cx| notification_count(&app, cx) == 1);
+    assert_eq!(ops.calls().len(), 1, "the rerun did not start");
+}
+
+#[gpui_kit::test]
+fn enter_in_the_switch_list_opens_the_confirmation(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.20.1", "0.14.0");
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-switch-loader");
+    assert!(!shows(
+        &app,
+        cx,
+        loader_segment_id(Some(LoaderKind::Fabric))
+    ));
+    assert!(!shows(&app, cx, loader_segment_id(None)));
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("47.3.0")));
+
+    // Enter on a control that is not the list is that control's own key.
+    tab_to(&app, cx, "versions-dialog-cancel");
+    press(&app, cx, "shift-tab");
+    assert!(shows(&app, cx, "versions-dialog-confirm"));
+    assert!(!shows(&app, cx, "versions-confirm-title"));
+
+    // Enter in the list closes the picker, then asks.
+    click(&app, cx, loader_row_id("47.4.0"));
+    press(&app, cx, "enter");
+    assert!(shows(&app, cx, "versions-confirm-title"));
+    assert!(!shows(&app, cx, "versions-dialog-confirm"), "picker gone");
+    cx.run_until_parked();
+    assert!(ops.calls().is_empty());
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    wait_calls(&ops, cx, 1);
+    assert_eq!(
+        ops.calls(),
+        [OpCall::InstallLoader {
+            id: "Pack".into(),
+            kind: LoaderKind::Forge,
+            pick: VersionPick::Exact("47.4.0".into()),
+            replace_existing: true,
+        }]
+    );
+}
+
+#[gpui_kit::test]
+fn switching_loader_warns_about_mods(cx: &mut TestAppContext) {
+    use patina_core::loader::ops::{LoaderNotice, OpOutcome};
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.20.1", "0.14.0");
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    ops.then(Ok(OpOutcome {
+        instance: store.load("Pack").unwrap(),
+        notices: vec![LoaderNotice::ModsMayBeIncompatible],
+    }));
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-switch-loader");
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("47.3.0")));
+    click(&app, cx, "versions-dialog-confirm");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    settle(cx, |cx| notification_count(&app, cx) == 1);
+}
+
+#[gpui_kit::test]
+fn creating_with_a_loader_installs_through_version_ops(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let ops = Arc::new(FakeVersionOps::new(store));
+    let app = {
+        let ops = ops.clone();
+        boot_core(cx, tmp.path(), AppSettings::default(), move |rt, data| {
+            testing::core_with_ops(rt, data, catalog(), ops)
+        })
+    };
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "add-instance-empty");
+    wait_name(&app, cx, "1.21.1");
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    wait_name(&app, cx, "Fabric 1.21.1");
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("0.16.5")));
+    click(&app, cx, "add-instance-create");
+    wait_calls(&ops, cx, 1);
+    assert_eq!(
+        ops.calls(),
+        [OpCall::InstallLoader {
+            id: "Fabric 1.21.1".into(),
+            kind: LoaderKind::Fabric,
+            pick: VersionPick::Exact("0.16.5".into()),
+            replace_existing: false,
+        }]
+    );
+}

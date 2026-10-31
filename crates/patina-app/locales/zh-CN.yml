@@ -120,6 +120,43 @@ add_instance:
   icon_failed: '"%{name}"已创建，但图标未能保存：%{error}'
   refresh_failed: '已创建"%{name}"，但无法读取实例列表：%{error}'
   refresh_failed_loader: '已创建"%{name}"，但未安装加载器：无法读取实例列表：%{error}'
+versions:
+  minecraft: "Minecraft"
+  needs_java: "需要 Java %{version}"
+  recommended: "推荐"
+  latest: "最新"
+  install_loader: "＋ 安装加载器…"
+  change_game_version: "更改游戏版本…"
+  change_loader_version: "更换版本…"
+  switch_loader: "更换为其他加载器…"
+  repair: "修复"
+  remove_loader: "移除加载器…"
+  busy_running: "游戏运行中"
+  busy_operation: "有操作正在进行"
+  refused: '无法更改"%{name}"：%{reason}'
+  actions_for: "%{component}的操作"
+  vanilla_hint: "尚未安装加载器。安装后才能使用 mod。"
+  cancel: "取消"
+  change: "更改"
+  install: "安装"
+  switch: "更换…"
+  game_version_title: '更改"%{name}"的游戏版本'
+  loader_version_title: '更换"%{name}"的 %{loader} 版本'
+  switch_title: '更换"%{name}"的加载器'
+  install_title: '为"%{name}"安装加载器'
+  switch_confirm_title: "把加载器换成 %{loader}？"
+  switch_confirm_body: "为 %{old} 制作的 mod 可能无法在 %{loader} 上运行。mod 文件会保留在文件夹中。"
+  switch_confirm: "更换"
+  remove_title: '移除"%{name}"的 %{loader}？'
+  remove_body: "实例将不带加载器运行。mod 文件保留在文件夹中，但不会加载。"
+  remove_confirm: "移除"
+  incompatible:
+    title: "%{loader} 不支持 Minecraft %{mc}"
+    body_replace: "换成适用于 Minecraft %{mc} 的推荐 %{kind} 版本，或移除加载器。"
+    body_remove: "没有 %{kind} 版本支持 Minecraft %{mc}。移除加载器后才能更改游戏版本。"
+    replace: "换成推荐版"
+    remove: "移除加载器"
+    cancel: "取消"
 busy:
   instance: '"%{name}"正在执行其他操作'
   version: "版本 %{id} 正被其他操作使用"

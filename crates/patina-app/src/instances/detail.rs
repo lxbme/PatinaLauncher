@@ -18,6 +18,7 @@ use rust_i18n::t;
 
 use super::model::{Entry, InstancesModel};
 use super::overview::{self, OverviewStats};
+use super::versions_tab::VersionsTab;
 use super::{
     HEADER_ICON, HEADER_TITLE, icon_for, instance_icon, loader_color, loader_full, now_secs,
     time_ago,
@@ -127,6 +128,8 @@ pub struct DetailView {
     stats_task: Task<()>,
     /// The log tab of the selected instance, made when it is first shown.
     log: Option<Entity<LogView>>,
+    /// The versions tab of the selected instance, made with the selection.
+    versions: Option<Entity<VersionsTab>>,
     _observe: Subscription,
 }
 
@@ -139,6 +142,7 @@ impl DetailView {
             stats: StatsState::default(),
             stats_task: Task::ready(()),
             log: None,
+            versions: None,
             _observe,
         };
         this.sync_stats(cx);
@@ -147,6 +151,11 @@ impl DetailView {
 
     pub fn tab(&self) -> DetailTab {
         self.tab
+    }
+
+    /// The versions tab's view of the selected instance.
+    pub fn versions_view(&self) -> Option<&Entity<VersionsTab>> {
+        self.versions.as_ref()
     }
 
     /// The log tab's view, once the tab has been shown for the selection.
@@ -189,11 +198,28 @@ impl DetailView {
         }
     }
 
+    /// Makes the versions tab follow the selection.
+    fn sync_versions(&mut self, cx: &mut Context<Self>) {
+        let id = match self.model.read(cx).selected_entry() {
+            Some(Entry::Healthy(instance)) => instance.id.clone(),
+            _ => return,
+        };
+        let current = self
+            .versions
+            .as_ref()
+            .is_some_and(|v| v.read(cx).instance_id() == id);
+        if !current {
+            let model = self.model.clone();
+            self.versions = Some(cx.new(|cx| VersionsTab::new(model, id, cx)));
+        }
+    }
+
     /// Starts reading the stats when the selected instance or the list
     /// changed. One read at a time per instance; a newer one for another
     /// instance makes the older result stale.
     fn sync_stats(&mut self, cx: &mut Context<Self>) {
         self.sync_log(cx);
+        self.sync_versions(cx);
         let model = self.model.read(cx);
         let Some(Entry::Healthy(instance)) = model.selected_entry() else {
             cx.notify();
@@ -626,6 +652,10 @@ impl DetailView {
                     .child(div().flex_1().min_h_0().children(self.log.clone()))
                     .into_any_element()
             }
+            DetailTab::Versions => div()
+                .size_full()
+                .children(self.versions.clone())
+                .into_any_element(),
             DetailTab::Overview => overview::render(instance, self.stats(&instance.id), cx),
             tab => placeholder::page(tab.icon(), tab.label()).into_any_element(),
         }

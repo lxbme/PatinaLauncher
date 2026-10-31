@@ -335,8 +335,9 @@ impl InstancesModel {
     }
 
     /// Runs `f` as operation `kind` of instance `id` in the background and
-    /// returns whether it started; an instance with an operation running
-    /// rejects a second one (returns `false`, `f` is not called). A failed
+    /// returns whether it started; an instance that is busy (an operation
+    /// runs, or its game starts or runs, here or elsewhere) rejects it
+    /// (returns `false`, `f` is not called). A failed
     /// operation left on the header is replaced.
     ///
     /// `f` gets the progress sink to hand to the core and returns the core
@@ -363,6 +364,9 @@ impl InstancesModel {
         retry: Option<RetryAction>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.is_busy(id) {
+            return false;
+        }
         self.start_op_with(id, kind, f, on_done, retry, Box::new(|_, _, _| {}), cx)
     }
 
