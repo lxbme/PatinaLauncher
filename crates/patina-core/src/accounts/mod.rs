@@ -4,7 +4,6 @@
 //! ownership. Legacy developer identities stay hidden without `dev-offline`,
 //! but their metadata and stored selection survive round trips.
 
-use crate::launch::LaunchAccount;
 use crate::paths::DataDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -117,8 +116,6 @@ pub enum AccountError {
     NotFound(String),
     #[error("{}", rust_i18n::t!("errors.accounts.invalid_name", name = .0))]
     InvalidName(String),
-    #[error("{}", rust_i18n::t!("errors.accounts.msa_unavailable"))]
-    MsaUnavailable,
     #[error("{}", rust_i18n::t!("errors.accounts.io", path = .path.display(), error = .error))]
     Io { path: PathBuf, error: String },
     #[error("{}", rust_i18n::t!("errors.accounts.parse", error = .0))]
@@ -133,8 +130,44 @@ struct AccountsFile {
     accounts: Vec<Account>,
 }
 
+/// Read-only metadata inspection. Stored-account mutations require AccountService.
+/// This is a normal-client policy boundary, not protection against the local
+/// owner editing metadata or invoking arbitrary process APIs.
+///
+/// ```compile_fail
+/// # fn forbidden(store: &mut patina_core::accounts::AccountStore) {
+/// store.add_offline("Player").unwrap();
+/// # }
+/// ```
+/// ```compile_fail
+/// # fn forbidden(store: &mut patina_core::accounts::AccountStore) {
+/// store.add_msa("Player", "0123456789abcdef0123456789abcdef".parse().unwrap(), None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(store: &mut patina_core::accounts::AccountStore) {
+/// store.set_current("id").unwrap();
+/// # }
+/// ```
+/// ```compile_fail
+/// # fn forbidden(store: &mut patina_core::accounts::AccountStore) {
+/// store.remove("id").unwrap();
+/// # }
+/// ```
+/// ```compile_fail
+/// # fn forbidden(store: &patina_core::accounts::AccountStore) {
+/// store.save().unwrap();
+/// # }
+/// ```
+/// ```compile_fail
+/// # fn forbidden(store: &patina_core::accounts::AccountStore) {
+/// store.launch_account("id").unwrap();
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct AccountStore {
+    #[cfg(test)]
     path: PathBuf,
     /// Accounts visible in this build.
     accounts: Vec<Account>,
@@ -169,7 +202,7 @@ impl AccountStore {
         Ok(Self::from_file(path, file))
     }
 
-    fn from_file(path: PathBuf, file: AccountsFile) -> Self {
+    fn from_file(_path: PathBuf, file: AccountsFile) -> Self {
         let mut seen = std::collections::HashSet::new();
         let unique: Vec<Account> = file
             .accounts
@@ -191,7 +224,8 @@ impl AccountStore {
             .cloned()
             .or_else(|| accounts.first().map(|a| a.id.clone()));
         AccountStore {
-            path,
+            #[cfg(test)]
+            path: _path,
             accounts,
             hidden,
             current,
@@ -200,7 +234,8 @@ impl AccountStore {
         }
     }
 
-    pub fn save(&self) -> Result<(), AccountError> {
+    #[cfg(test)]
+    fn save(&self) -> Result<(), AccountError> {
         let file = self.as_file();
         let text = toml::to_string(&file).map_err(|e| AccountError::Parse(e.to_string()))?;
         let io = |e: std::io::Error| AccountError::Io {
@@ -248,7 +283,7 @@ impl AccountStore {
         self.accounts.iter().find(|a| &a.id == id)
     }
 
-    pub fn set_current(&mut self, id: &str) -> Result<(), AccountError> {
+    pub(crate) fn set_current(&mut self, id: &str) -> Result<(), AccountError> {
         if !self.accounts.iter().any(|a| a.id == id) {
             return Err(AccountError::NotFound(id.to_string()));
         }
@@ -257,7 +292,7 @@ impl AccountStore {
         Ok(())
     }
 
-    pub fn remove(&mut self, id: &str) -> Result<(), AccountError> {
+    pub(crate) fn remove(&mut self, id: &str) -> Result<(), AccountError> {
         let pos = self
             .accounts
             .iter()
@@ -281,8 +316,8 @@ impl AccountStore {
         }
     }
 
-    #[cfg(feature = "dev-offline")]
-    pub fn add_offline(&mut self, username: &str) -> Result<&Account, AccountError> {
+    #[cfg(all(test, feature = "dev-offline"))]
+    fn add_offline(&mut self, username: &str) -> Result<&Account, AccountError> {
         let valid = (3..=16).contains(&username.len())
             && username
                 .bytes()
@@ -344,21 +379,6 @@ impl AccountStore {
         self.adopt_current(idx);
         &self.accounts[idx]
     }
-
-    pub fn launch_account(&self, id: &str) -> Result<LaunchAccount, AccountError> {
-        let acct = self
-            .accounts
-            .iter()
-            .find(|a| a.id == id)
-            .ok_or_else(|| AccountError::NotFound(id.to_string()))?;
-        match acct.kind {
-            AccountKind::Msa => Err(AccountError::MsaUnavailable),
-            #[cfg(feature = "dev-offline")]
-            AccountKind::Offline => Ok(crate::launch::account::dev_offline_account(&acct.username)),
-            #[cfg(not(feature = "dev-offline"))]
-            AccountKind::Offline => Err(AccountError::NotFound(id.to_string())),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -411,13 +431,6 @@ mod tests {
         let s2 = AccountStore::load(&d).unwrap();
         assert_eq!(s2.accounts().len(), 2);
         assert_eq!(s2.current().unwrap().id, b.id);
-        let la = s2.launch_account(&a.id).unwrap();
-        assert_eq!(la.name, "Dev_One");
-        assert_eq!(la.uuid, a.uuid);
-        assert!(matches!(
-            s2.launch_account("nope"),
-            Err(AccountError::NotFound(_))
-        ));
     }
 
     #[cfg(feature = "dev-offline")]
@@ -533,19 +546,6 @@ mod tests {
         assert_eq!(s.current().unwrap().id, a, "updating keeps the current");
     }
 
-    #[test]
-    fn msa_launch_unavailable() {
-        let (_t, d) = dirs();
-        let mut s = AccountStore::load(&d).unwrap();
-        let (n, u) = msa(7);
-        let id = s.add_msa(&n, u, None).id.clone();
-        assert!(matches!(
-            s.launch_account(&id),
-            Err(AccountError::MsaUnavailable)
-        ));
-        assert!(!AccountError::MsaUnavailable.to_string().is_empty());
-    }
-
     #[cfg(not(feature = "dev-offline"))]
     #[test]
     fn release_build_hides_but_preserves_offline_accounts() {
@@ -568,10 +568,6 @@ mod tests {
         // Hidden current falls back to the first visible account.
         assert_eq!(s.current().unwrap().id, msa_id);
         // Offline accounts are hidden from every operation.
-        assert!(matches!(
-            s.launch_account(&off_id),
-            Err(AccountError::NotFound(_))
-        ));
         assert!(matches!(
             s.set_current(&off_id),
             Err(AccountError::NotFound(_))

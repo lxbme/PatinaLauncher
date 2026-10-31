@@ -3068,7 +3068,7 @@ async fn content_mutation_checks_live_record_despite_idle_model(cx: &mut TestApp
             vec![],
         )
         .unwrap()
-        .launch(None)
+        .launch_for_test(None)
         .await
         .unwrap()
     });
@@ -3141,7 +3141,7 @@ fn second_launch_is_busy_with_display_name(cx: &mut TestAppContext) {
             vec![],
         )
         .unwrap();
-        pending.launch(None).await.unwrap()
+        pending.launch_for_test(None).await.unwrap()
     });
     games.add(held.killer());
     click(&app, cx, "launch");
@@ -3357,7 +3357,7 @@ fn reattach_on_startup_restores_running_state(cx: &mut TestAppContext) {
             vec![],
         )
         .unwrap();
-        let session = pending.launch(None).await.unwrap();
+        let session = pending.launch_for_test(None).await.unwrap();
         let killer = session.killer();
         drop(session);
         killer
@@ -3453,7 +3453,7 @@ fn external_game_is_found_on_refresh(cx: &mut TestAppContext) {
             vec![],
         )
         .unwrap();
-        pending.launch(None).await.unwrap()
+        pending.launch_for_test(None).await.unwrap()
     });
     games.add(held.killer());
     // The next refresh (the window becoming active) finds it.

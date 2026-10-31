@@ -108,7 +108,6 @@ errors:
   accounts:
     not_found: "Account not found: %{id}"
     invalid_name: "Invalid player name \"%{name}\": use 3 to 16 letters, digits or underscores"
-    msa_unavailable: "Microsoft sign-in is not available yet"
     io: "File operation failed (%{path}): %{error}"
     parse: "Invalid accounts file format: %{error}"
   online:

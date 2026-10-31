@@ -18,8 +18,13 @@ impl UserType {
 
 /// The identity a game is launched with. Fields and the Microsoft
 /// constructor are crate-private, so outside this crate one comes only from
-/// AccountService (or temporary legacy seams). Production offline grants require
+/// AccountService. Production offline grants require
 /// historical ownership; developer and test bypasses remain feature-gated.
+///
+/// ```compile_fail
+/// patina_core::launch::LaunchAccount::msa(
+///     "Player", "0123456789abcdef0123456789abcdef".parse().unwrap(), "token", None);
+/// ```
 #[derive(Clone)]
 pub struct LaunchAccount {
     pub(crate) name: String,

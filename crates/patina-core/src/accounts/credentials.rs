@@ -214,6 +214,13 @@ pub mod testing {
         write_error: Mutex<Option<CredentialError>>,
     }
     impl MemoryCredentials {
+        /// Inspect fixture deletion without exposing stored secret bytes.
+        pub fn contains_reference(&self, reference: &str) -> bool {
+            self.records
+                .lock()
+                .expect("fixture mutex")
+                .contains_key(reference)
+        }
         pub fn set_write_error(&self, error: Option<CredentialError>) {
             *self.write_error.lock().expect("fixture mutex") = error;
         }

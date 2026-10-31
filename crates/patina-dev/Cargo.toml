@@ -22,4 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+patina-core = { version = "0.1.0", path = "../patina-core", features = ["test-support"] }
+serde_json = "1.0.154"
+wiremock = "0.6.5"
 tempfile = "3.27.0"

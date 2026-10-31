@@ -1,4 +1,4 @@
-//! Durable account metadata, distinct from the legacy rename-only public save.
+//! Durable account metadata for AccountService transactions.
 use super::{AccountStore, AccountsFile, credentials::validate_reference, error::AuthError};
 use crate::{paths::DataDirs, platform::credentials};
 use std::collections::HashSet;

@@ -190,7 +190,6 @@ log:
   crash_saved: "日志已保存到 %{name}"
 launch:
   no_account: "还没有可用的账号"
-  msa_unavailable: "微软登录暂未开放"
   add_account: "去添加"
   reinstall: "重新安装"
   crashed_saved: "游戏异常退出，日志已保存。"

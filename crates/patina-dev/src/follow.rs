@@ -154,6 +154,25 @@ mod tests {
         }
     }
 
+    // A spawned shell can have a live start token before proc_info can observe
+    // its argv. Reattach rightly rejects a missing instance marker; wait for
+    // the synthetic process to be ready, rather than racing that setup step.
+    async fn wait_for_fixture_marker(pid: u32, id: &str) -> patina_core::platform::ProcInfo {
+        let marker = format!("-Dpatina.instance={id}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(info) = proc_info(pid)
+                    && info.cmdline.contains(&marker)
+                {
+                    return info;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic process must publish its instance marker")
+    }
+
     /// Regression: `logs --follow` on a reattached game used to drain the
     /// channel before waiting, but the channel only closes once `wait` saw the
     /// exit, so it never returned after the game ended.
@@ -189,9 +208,10 @@ mod tests {
         let mut child = spawn_detached(&cmd, &log).unwrap();
         let pid = child.id();
         let _k = killer(pid);
+        let ready = wait_for_fixture_marker(pid, &inst.id).await;
         let rec = RunningRecord {
             pid,
-            start_time: proc_info(pid).unwrap().start_time,
+            start_time: ready.start_time,
             instance_id: "i1".into(),
             started_at: 0,
             log: CURRENT_LOG.into(),
@@ -372,9 +392,10 @@ mod tests {
         let mut child = spawn_detached(&cmd, &log).unwrap();
         let pid = child.id();
         let k = killer(pid);
+        let ready = wait_for_fixture_marker(pid, &inst.id).await;
         let rec = RunningRecord {
             pid,
-            start_time: proc_info(pid).unwrap().start_time,
+            start_time: ready.start_time,
             instance_id: "i1".into(),
             started_at: 0,
             log: CURRENT_LOG.into(),

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use patina_core::accounts::AccountStore;
+use patina_core::accounts::AccountService;
 use patina_core::config::{GlobalConfig, SourceChoice};
 use patina_core::content::index::ModIndex;
 use patina_core::content::mods::{ModFormat, delete_mod, scan_mods, set_mod_enabled};
@@ -17,8 +17,6 @@ use patina_core::instance::Instance;
 use patina_core::instance::{InstanceStore, effective_java};
 use patina_core::instance_files::{early_window_disabled, set_early_window_disabled};
 use patina_core::java::{ManagedRuntimes, detect_all};
-#[cfg(feature = "dev-offline")]
-use patina_core::launch::dev_offline_account;
 use patina_core::launch::running::CURRENT_LOG;
 use patina_core::launch::{GameSession, KillHandle, LogLine, Reattach, SessionExit, running_game};
 use patina_core::loader::LoaderKind;
@@ -35,6 +33,7 @@ use patina_dev::cli::{
 };
 use patina_dev::follow::{follow_file, follow_logs};
 use patina_dev::{out, outln};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 struct Ctx {
@@ -114,7 +113,7 @@ async fn main() -> Result<()> {
         Cmd::Kill { id } => kill(&ctx, &id).await,
         Cmd::Logs { id, follow } => logs(&ctx, &id, follow).await,
         Cmd::Search { query } => search(&ctx, &query).await,
-        Cmd::Account { cmd } => account(&ctx, cmd),
+        Cmd::Account { cmd } => account(&ctx, cmd).await,
         Cmd::Sweep => {
             let n = sweep(&ctx.data)?;
             outln!("Removed {n} stale temp file(s)");
@@ -348,39 +347,28 @@ async fn search(ctx: &Ctx, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn account(ctx: &Ctx, cmd: AccountCmd) -> Result<()> {
-    let mut store = AccountStore::load(&ctx.data)?;
-    match cmd {
-        AccountCmd::List => {
-            if store.accounts().is_empty() {
-                outln!("(no accounts)");
+async fn account(ctx: &Ctx, cmd: AccountCmd) -> Result<()> {
+    let service = Arc::new(AccountService::production(ctx.data.clone())?);
+    let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    let command = patina_dev::accounts::run_account_command(
+        service,
+        cmd,
+        |event| {
+            if let Some(line) = patina_dev::accounts::login_event_message(&event) {
+                outln!("{line}");
             }
-            let current = store.current().map(|a| a.id.clone());
-            for a in store.accounts() {
-                let mark = if current.as_deref() == Some(a.id.as_str()) {
-                    '*'
-                } else {
-                    ' '
-                };
-                outln!("{mark} {}  {:?}  {}", a.id, a.kind, a.username);
-            }
-            return Ok(());
-        }
-        #[cfg(feature = "dev-offline")]
-        AccountCmd::AddOffline { name } => {
-            let a = store.add_offline(&name)?;
-            outln!("Account {} ({})", a.id, a.username);
-        }
-        AccountCmd::Use { id } => {
-            store.set_current(&id)?;
-            outln!("Current account: {id}");
-        }
-        AccountCmd::Remove { id } => {
-            store.remove(&id)?;
-            outln!("Removed account {id}");
+        },
+        cancel,
+    );
+    tokio::pin!(command);
+    tokio::select! {
+        result = &mut command => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            let _ = cancel_tx.send(true);
+            command.await?;
         }
     }
-    store.save()?;
     Ok(())
 }
 
@@ -949,38 +937,6 @@ async fn source(ctx: &mut Ctx, cmd: SourceCmd) -> Result<()> {
     Ok(())
 }
 
-/// The account to play as: `--offline` (not stored; only with the
-/// `dev-offline` feature, otherwise always `None`), `--account`, or the
-/// current account. A Microsoft account fails with the localized
-/// `MsaUnavailable` message until sign-in exists.
-fn launch_account(
-    ctx: &Ctx,
-    account: Option<&str>,
-    offline: Option<&str>,
-) -> Result<patina_core::launch::LaunchAccount> {
-    if let Some(name) = offline {
-        #[cfg(feature = "dev-offline")]
-        return Ok(dev_offline_account(name));
-        #[cfg(not(feature = "dev-offline"))]
-        bail!("offline account {name:?} needs the dev-offline feature (use `cargo dev`)");
-    }
-    let accounts = AccountStore::load(&ctx.data)?;
-    let id = match account {
-        Some(id) => id.to_string(),
-        None => match accounts.current() {
-            Some(a) => a.id.clone(),
-            None if patina_core::DEV_OFFLINE => {
-                bail!("no account yet; add one with `account add-offline <NAME>`")
-            }
-            None => bail!(
-                "no account yet; Microsoft sign-in is not available yet, and offline \
-                 accounts need the dev-offline feature (use `cargo dev`)"
-            ),
-        },
-    };
-    Ok(accounts.launch_account(&id)?)
-}
-
 async fn launch(
     ctx: &mut Ctx,
     id: &str,
@@ -989,7 +945,17 @@ async fn launch(
 ) -> Result<()> {
     let store = ctx.store();
     let inst = store.load(id)?;
-    let account = launch_account(ctx, account, offline)?;
+    let accounts = Arc::new(AccountService::production(ctx.data.clone())?);
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    let grant = if offline.is_none() {
+        Some(
+            patina_dev::accounts::resolve_stored_account(&accounts, account, cancel)
+                .await
+                .context("Resolving launch account (use `account login` or `account use <ID>`)")?,
+        )
+    } else {
+        None
+    };
     let launcher = ctx.launcher().await?;
     outln!(
         "Instance {:?}, version {}, source {}, data dir {}",
@@ -1012,7 +978,39 @@ async fn launch(
 
     let start = Instant::now();
     let (ptx, printer) = install_printer(start);
-    let result = GameSession::start(&launcher, &inst, &ctx.config, &account, Some(ptx)).await;
+    let result = if let Some(name) = offline {
+        #[cfg(feature = "dev-offline")]
+        {
+            GameSession::start_dev_offline(&launcher, &inst, &ctx.config, name, Some(ptx))
+                .await
+                .map_err(patina_core::accounts::AuthenticatedLaunchError::Session)
+        }
+        #[cfg(not(feature = "dev-offline"))]
+        bail!("offline account {name:?} needs the dev-offline feature (use `cargo dev`)");
+    } else {
+        let progress = Some(ptx);
+        let prepare_progress = progress.clone();
+        let launcher = &launcher;
+        let inst = &inst;
+        let config = &ctx.config;
+        patina_dev::accounts::launch_stored_account(
+            accounts,
+            grant.expect("stored launch resolved before preparation"),
+            |identity| async move {
+                let pending = GameSession::prepare_launch(
+                    launcher,
+                    inst,
+                    config,
+                    &identity,
+                    prepare_progress,
+                )
+                .await?;
+                Ok(pending)
+            },
+            progress,
+        )
+        .await
+    };
     let _ = printer.await;
     let mut game = result?;
     outln!(

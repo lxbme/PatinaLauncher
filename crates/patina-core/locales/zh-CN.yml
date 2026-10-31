@@ -108,7 +108,6 @@ errors:
   accounts:
     not_found: "未找到账号：%{id}"
     invalid_name: "玩家名“%{name}”无效：请使用 3 到 16 位字母、数字或下划线"
-    msa_unavailable: "微软账号登录暂不可用"
     io: "文件操作失败（%{path}）：%{error}"
     parse: "账号文件格式无效：%{error}"
   online:

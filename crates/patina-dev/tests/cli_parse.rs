@@ -373,13 +373,12 @@ fn account_commands() {
         other => panic!("{other:?}"),
     };
     assert!(matches!(account(&["account", "list"]), AccountCmd::List));
-    #[cfg(feature = "dev-offline")]
-    assert!(matches!(
-        account(&["account", "add-offline", "Dev"]),
-        AccountCmd::AddOffline { name } if name == "Dev"
-    ));
+    assert!(parse(&["account", "add-offline", "Dev"]).is_ok());
+    assert!(parse(&["account", "login"]).is_ok());
     #[cfg(not(feature = "dev-offline"))]
-    assert!(parse(&["account", "add-offline", "Dev"]).is_err());
+    assert!(parse(&["account", "add-dev-offline", "Dev"]).is_err());
+    #[cfg(feature = "dev-offline")]
+    assert!(parse(&["account", "add-dev-offline", "Dev"]).is_ok());
     assert!(matches!(
         account(&["account", "use", "id1"]),
         AccountCmd::Use { id } if id == "id1"
@@ -393,7 +392,10 @@ fn account_commands() {
         &["account", "add-offline"],
         &["account", "use"],
         &["account", "remove"],
-        &["account", "login"],
+        &["account", "login", "--password", "secret"],
+        &["account", "login", "--token", "secret"],
+        &["account", "login", "--client-secret", "secret"],
+        &["account", "login", "password"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }

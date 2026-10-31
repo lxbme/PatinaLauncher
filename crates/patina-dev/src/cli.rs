@@ -11,7 +11,7 @@ use patina_core::loader::ops::LoaderAction;
 
 /// Patina development CLI.
 ///
-/// Offline accounts (`account add-offline`, `launch --offline`) exist only
+/// Developer bypasses (`account add-dev-offline`, `launch --offline`) exist only
 /// with the `dev-offline` feature; `cargo dev <ARGS>` (a cargo alias in
 /// `.cargo/config.toml`) runs this tool with it enabled.
 #[derive(Parser, Debug)]
@@ -19,7 +19,7 @@ use patina_core::loader::ops::LoaderAction;
     name = "patina-dev",
     version,
     about = "Patina development CLI",
-    long_about = "Patina development CLI.\n\nOffline accounts (`account add-offline`, `launch --offline`) \
+    long_about = "Patina development CLI.\n\nUse `account login` to sign in. Normal offline accounts require verified ownership.\n\nDeveloper bypasses (`account add-dev-offline`, `launch --offline`) \
                   need the `dev-offline` feature; run `cargo dev <ARGS>` (a cargo alias for \
                   `cargo run -p patina-dev --features dev-offline --`) to get them."
 )]
@@ -93,9 +93,13 @@ pub enum Cmd {
 pub enum AccountCmd {
     /// List accounts; the current one is marked
     List,
-    /// Add an offline account (development only)
-    #[cfg(feature = "dev-offline")]
+    /// Sign in with Microsoft using a browser device code (Ctrl-C cancels)
+    Login,
+    /// Add an offline account (requires a stored, verified Java owner)
     AddOffline { name: String },
+    /// Add a development offline account without ownership verification
+    #[cfg(feature = "dev-offline")]
+    AddDevOffline { name: String },
     /// Make an account the current one
     Use { id: String },
     /// Remove an account

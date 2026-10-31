@@ -250,6 +250,14 @@ impl Reattach {
     }
 }
 
+/// Sessions for stored accounts are started by AccountService, not a raw identity.
+///
+/// ```compile_fail
+/// # async fn forbidden(launcher: &patina_core::prepare::Launcher, inst: &patina_core::instance::Instance,
+/// # config: &patina_core::config::GlobalConfig, account: &patina_core::launch::LaunchAccount) {
+/// patina_core::launch::GameSession::start(launcher, inst, config, account, None).await.unwrap();
+/// # }
+/// ```
 pub struct GameSession {
     inst: Instance,
     pid: u32,
@@ -312,6 +320,13 @@ fn version_id(inst: &Instance) -> &str {
 /// A game that is prepared but not yet started. Holds the instance lock and
 /// a shared lock on the version; dropping it cancels the launch, releases
 /// both and spawns nothing.
+/// Stored identities must pass AccountService's actual-spawn validation.
+///
+/// ```compile_fail
+/// # async fn forbidden(pending: patina_core::launch::PendingLaunch) {
+/// pending.launch(None).await.unwrap();
+/// # }
+/// ```
 pub struct PendingLaunch {
     prepared_account: Option<LaunchAccount>,
     inst: Instance,
@@ -350,10 +365,19 @@ impl PendingLaunch {
 
     /// Starts the game. Must be called within a Tokio runtime (it spawns the
     /// tailer).
-    pub async fn launch(self, progress: ProgressSink) -> Result<GameSession, SessionError> {
+    pub(crate) async fn launch(self, progress: ProgressSink) -> Result<GameSession, SessionError> {
         let session = self.spawn_now()?;
         report(&progress, Phase::Launching, 1, 1, Unit::Items);
         Ok(session)
+    }
+
+    /// Explicit synthetic-process fixture; absent from normal client builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn launch_for_test(
+        self,
+        progress: ProgressSink,
+    ) -> Result<GameSession, SessionError> {
+        self.launch(progress).await
     }
 
     fn spawn_now(self) -> Result<GameSession, SessionError> {
@@ -378,17 +402,18 @@ impl PendingLaunch {
 }
 
 impl GameSession {
-    /// Prepares and starts the game for `inst`. Holds the instance lock and a
-    /// shared lock on its version for as long as the session lives; both are
-    /// released again if this fails. Must be called within a Tokio runtime.
-    pub async fn start(
+    /// Explicit development-only bypass. Accepts a player name, never a stored
+    /// Microsoft identity or grant. Normal callers use AccountService.
+    #[cfg(feature = "dev-offline")]
+    pub async fn start_dev_offline(
         launcher: &Launcher,
         inst: &Instance,
         global: &GlobalConfig,
-        account: &LaunchAccount,
+        name: &str,
         progress: ProgressSink,
     ) -> Result<GameSession, SessionError> {
-        Self::prepare_launch(launcher, inst, global, account, progress.clone())
+        let account = super::dev_offline_account(name);
+        Self::prepare_launch(launcher, inst, global, &account, progress.clone())
             .await?
             .launch(progress)
             .await
@@ -481,7 +506,7 @@ impl GameSession {
         Ok(pending)
     }
 
-    /// Test entry: like `start` but with a ready-made command (no prepare).
+    /// Test entry with a ready-made command (no prepare).
     /// Must be called within a Tokio runtime (it spawns the tailer).
     #[cfg(test)]
     pub(crate) fn start_with_command(

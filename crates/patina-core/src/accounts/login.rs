@@ -1,5 +1,5 @@
 //! Microsoft device-code events. AccountService owns persistence and terminal
-//! truth; UnavailableLogin remains only for consumers not yet migrated.
+//! truth; normal GUI and CLI consumers use the same real AccountService.
 
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -84,7 +84,7 @@ pub trait DeviceCodeLogin: Send + Sync {
     ) -> BoxFuture<'static, ()>;
 }
 
-/// Stand-in used until the real flow exists: fails immediately.
+/// Explicit unavailable adapter for isolated consumers/tests; never the app/CLI default.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnavailableLogin;
 

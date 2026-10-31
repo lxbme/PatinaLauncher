@@ -5437,10 +5437,12 @@ dependencies = [
  "anyhow",
  "clap",
  "patina-core",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

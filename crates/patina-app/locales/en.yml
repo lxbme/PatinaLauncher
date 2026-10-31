@@ -190,7 +190,6 @@ log:
   crash_saved: "Log saved to %{name}"
 launch:
   no_account: "No account to play with yet"
-  msa_unavailable: "Microsoft sign-in isn’t available yet"
   add_account: "Add account"
   reinstall: "Reinstall"
   crashed_saved: "The game quit unexpectedly. Its log was saved."
