@@ -568,6 +568,7 @@ impl Render for VersionsTab {
         h_flex()
             .id("versions-tab")
             .test_support()
+            .items_stretch()
             .size_full()
             .child(
                 v_flex()

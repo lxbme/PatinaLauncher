@@ -3678,6 +3678,32 @@ fn wait_calls(ops: &FakeVersionOps, cx: &mut TestAppContext, n: usize) {
 }
 
 #[gpui_kit::test]
+fn versions_content_starts_at_panel_top_after_resize_and_zoom(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, _ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    for (width, height, scale) in [(1280., 800., 1.), (960., 600., 1.), (1440., 900., 1.25)] {
+        cx.simulate_window_resize(app.handle, gpui_kit::size(px(width), px(height)));
+        cx.update_window(app.handle, |_, window, cx| {
+            patina_app::scale::apply_scale(scale, cx);
+            window.render_frame(cx);
+            let panel = window.find("versions-tab").bounds();
+            let components = window.find("versions-components").bounds();
+            let row = window.find("versions-row-minecraft").bounds();
+            let actions = window.find("versions-actions").bounds();
+            assert_eq!(
+                components.top(),
+                panel.top(),
+                "component column starts at top"
+            );
+            assert_eq!(row.top(), panel.top(), "first row starts at top");
+            assert_eq!(actions.top(), panel.top(), "action column starts at top");
+            assert_eq!(actions.bottom(), panel.bottom(), "divider spans the panel");
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
 fn versions_loader_action_is_keyboard_reachable(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
@@ -5250,6 +5276,25 @@ fn typed_edits_are_saved_before_the_window_closes(cx: &mut TestAppContext) {
 
     let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
     assert!(!window.simulate_close(), "waits for the save");
+    settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+    assert_eq!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(2048));
+}
+
+#[gpui_kit::test]
+fn close_window_action_saves_focused_instance_edit(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    replace_text(&app, cx, "settings-max-mem", "2048");
+    assert_eq!(
+        element(&app, cx, "settings-max-mem").unwrap().focused(),
+        Some(true)
+    );
+    assert_ne!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(2048));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.dispatch_action(Box::new(patina_app::shell::CloseWindow), cx);
+    })
+    .unwrap();
     settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
     assert_eq!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(2048));
 }
@@ -9075,29 +9120,211 @@ mod settings_page {
 
     #[gpui_kit::test]
     async fn global_close_drains_queued_memory_and_focused_arguments(cx: &mut TestAppContext) {
+        close_drains_queued_memory_and_focused_arguments(cx, false).await;
+    }
+
+    #[gpui_kit::test]
+    async fn close_window_action_drains_queued_memory_and_focused_arguments(
+        cx: &mut TestAppContext,
+    ) {
+        close_drains_queued_memory_and_focused_arguments(cx, true).await;
+    }
+
+    async fn close_drains_queued_memory_and_focused_arguments(
+        cx: &mut TestAppContext,
+        action: bool,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let app = boot(cx, tmp.path(), AppSettings::default());
         open(&app, cx);
+        let closes = Rc::new(std::cell::Cell::new(0));
+        let _closed = cx.update(|cx| {
+            let closes = closes.clone();
+            cx.on_window_closed(move |_, _| closes.set(closes.get() + 1))
+        });
         let (entered, started) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel();
         let held = cx.update(|cx| {
             Core::update_config(cx, move |_| {
                 entered.send(()).unwrap();
-                gate.recv().unwrap();
+                // Dropping the sender also releases this worker on assertion failure.
+                let _ = gate.recv();
             })
         });
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         replace(&app, cx, "prefs-min-mem", "768");
         leave(&app, cx);
         replace(&app, cx, "prefs-args", "-Dclose=true");
+        if action {
+            for _ in 0..2 {
+                cx.update_window(app.handle, |_, window, cx| {
+                    window.dispatch_action(Box::new(patina_app::shell::CloseWindow), cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+        } else {
+            let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
+            assert!(!window.simulate_close());
+        }
         let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
-        assert!(!window.simulate_close());
+        assert!(
+            !window.simulate_close(),
+            "a second close must not bypass the drain"
+        );
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
         release.send(()).unwrap();
         held.await.unwrap().unwrap();
         settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
         assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
         assert_eq!(on_disk(tmp.path()).java.extra_jvm_args, "-Dclose=true");
+        cx.run_until_parked();
+        assert_eq!(
+            closes.get(),
+            1,
+            "one final programmatic removal after draining"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn client_close_drains_with_notification_focus(cx: &mut TestAppContext) {
+        client_close_drains_with_overlay_focus(cx, false).await;
+    }
+
+    #[gpui_kit::test]
+    async fn client_close_drains_with_modal_focus(cx: &mut TestAppContext) {
+        client_close_drains_with_overlay_focus(cx, true).await;
+    }
+
+    async fn client_close_drains_with_overlay_focus(cx: &mut TestAppContext, modal: bool) {
+        use gpui_kit::ParentElement as _;
+        use gpui_kit::component::notification::Notification;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open(&app, cx);
+        let closes = Rc::new(Cell::new(0));
+        let _closed = cx.update(|cx| {
+            let closes = closes.clone();
+            cx.on_window_closed(move |_, _| closes.set(closes.get() + 1))
+        });
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = cx.update(|cx| {
+            Core::update_config(cx, move |_| {
+                entered.send(()).unwrap();
+                // Sender drop releases the worker even if a UI assertion fails.
+                let _ = gate.recv();
+            })
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        replace(&app, cx, "prefs-min-mem", "768");
+        leave(&app, cx);
+        replace(&app, cx, "prefs-args", "-Doverlay-close=true");
+        cx.update_window(app.handle, |_, window, cx| {
+            if modal {
+                window.open_dialog(cx, |dialog, _, _| {
+                    dialog.title("Close routing fixture").child(
+                        gpui_kit::component::button::Button::new("close-routing-modal-focus")
+                            .label("Keep open"),
+                    )
+                });
+            } else {
+                window.push_notification(
+                    Notification::info("Close routing fixture").autohide(false),
+                    cx,
+                );
+            }
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        if !modal {
+            // The notification stack is an actual Tab stop in the sibling overlay branch.
+            for _ in 0..80 {
+                if element(&app, cx, ("notification-list", 2usize))
+                    .unwrap()
+                    .focused()
+                    == Some(true)
+                {
+                    break;
+                }
+                press(&app, cx, "tab");
+            }
+            assert_eq!(
+                element(&app, cx, ("notification-list", 2usize))
+                    .unwrap()
+                    .focused(),
+                Some(true)
+            );
+        } else {
+            tab_to(&app, cx, "close-routing-modal-focus");
+            assert_eq!(
+                element(&app, cx, "close-routing-modal-focus")
+                    .unwrap()
+                    .focused(),
+                Some(true)
+            );
+        }
+        let close = cx.update(|cx| {
+            app.root
+                .read(cx)
+                .title_bar()
+                .read(cx)
+                .close_window_handler()
+        });
+        let focused = cx
+            .update_window(app.handle, |_, window, cx| {
+                window.focused(cx).expect("the overlay owns focus")
+            })
+            .unwrap();
+        for _ in 0..2 {
+            cx.update_window(app.handle, |_, window, cx| {
+                // Exactly the callback installed by TitleBarView::render. The test
+                // platform has no client X; it cannot reproduce a native hit test.
+                close(&gpui_kit::ClickEvent::default(), window, cx);
+                assert_eq!(
+                    window.focused(cx),
+                    Some(focused.clone()),
+                    "close must not steal focus or force blur"
+                );
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(app.handle, |_, window, cx| {
+                assert_eq!(
+                    window.focused(cx),
+                    Some(focused.clone()),
+                    "overlay keeps focus after deferred work"
+                );
+            })
+            .unwrap();
+            assert_eq!(
+                cx.update(|cx| cx.windows().len()),
+                1,
+                "held write must prevent removal"
+            );
+            assert_eq!(closes.get(), 0);
+        }
+        // Do not invoke the native callback here: that could rescue a broken
+        // client route and make this regression pass for the wrong reason.
+        release.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        // Prove the worker and queued writes completed before diagnosing a
+        // missing close as a routing failure rather than a fixture hang.
+        settle(cx, |_| {
+            let saved = on_disk(tmp.path());
+            saved.java.min_mem_mib == 768 && saved.java.extra_jvm_args == "-Doverlay-close=true"
+        });
+        println!("Overlay close (modal={modal}): queued writes reached disk; waiting for removal");
+        settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
+        assert_eq!(
+            on_disk(tmp.path()).java.extra_jvm_args,
+            "-Doverlay-close=true"
+        );
+        cx.run_until_parked();
+        assert_eq!(closes.get(), 1);
     }
 
     #[gpui_kit::test]
@@ -9133,6 +9360,25 @@ mod settings_page {
         replace(&app, cx, "prefs-min-mem", "768");
         let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
         assert!(!window.simulate_close());
+        settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
+    }
+
+    #[gpui_kit::test]
+    fn close_window_action_saves_focused_global_edit(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open(&app, cx);
+        replace(&app, cx, "prefs-min-mem", "768");
+        assert_eq!(
+            element(&app, cx, "prefs-min-mem").unwrap().focused(),
+            Some(true)
+        );
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 512);
+        cx.update_window(app.handle, |_, window, cx| {
+            window.dispatch_action(Box::new(patina_app::shell::CloseWindow), cx);
+        })
+        .unwrap();
         settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
         assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
     }

@@ -25,7 +25,7 @@ use rust_i18n::t;
 use crate::launch::LaunchEvent;
 use crate::settings::{AfterLaunch, SettingsStore};
 
-actions!(patina, [FocusSearch]);
+actions!(patina, [FocusSearch, CloseWindow]);
 
 /// Key context of the root view. `/` ([`FocusSearch`]) is bound in it
 /// unless a text input has the keyboard (see `shell::init`).
@@ -42,6 +42,7 @@ pub struct RootView {
     accounts: Entity<AccountsPage>,
     settings: Entity<SettingsPage>,
     focus: FocusHandle,
+    closing: Rc<Cell<bool>>,
     _observe: Subscription,
     _focus_lost: Subscription,
     _instances_changed: Subscription,
@@ -77,8 +78,9 @@ impl RootView {
         let page = instances.downgrade();
         let settings_page = settings.downgrade();
         let closing = Rc::new(Cell::new(false));
-        window.on_window_should_close(cx, move |window, cx| {
-            close_after_saving(&page, &settings_page, &closing, window, cx)
+        window.on_window_should_close(cx, {
+            let closing = closing.clone();
+            move |window, cx| close_after_saving(&page, &settings_page, &closing, window, cx)
         });
         Self {
             title_bar: cx.new(|cx| {
@@ -107,6 +109,7 @@ impl RootView {
             _launch_events,
             shell,
             focus,
+            closing,
         }
     }
 
@@ -195,6 +198,18 @@ impl RootView {
             .update(cx, |s, cx| s.navigate(Nav::Downloads, cx));
     }
 
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        if close_after_saving(
+            &self.instances.downgrade(),
+            &self.settings.downgrade(),
+            &self.closing,
+            window,
+            cx,
+        ) {
+            window.remove_window();
+        }
+    }
+
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.title_bar
             .update(cx, |t, cx| t.focus_search(window, cx));
@@ -259,7 +274,9 @@ fn close_after_saving(
     cx: &mut App,
 ) -> bool {
     if closing.get() {
-        return true;
+        // Only the task below removes the window after its drain/budget.
+        // Repeated client or native requests must not cut that wait short.
+        return false;
     }
     let form = page
         .upgrade()
@@ -306,6 +323,7 @@ impl Render for RootView {
             .key_context(ROOT_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::focus_search))
+            .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_downloads))
             .size_full()
             .bg(bg)

@@ -728,6 +728,14 @@ impl DetailView {
                     // A custom variant's resting fill is drawn at 20 %
                     // opacity by gpui-component; set it solid.
                     .bg(teal)
+                    // Instance styles also override the component's disabled
+                    // style: replace the teal fill, not just the label color.
+                    .when(busy, |button| {
+                        button
+                            .secondary()
+                            .bg(theme.secondary)
+                            .text_color(theme.foreground)
+                    })
                     .icon(IconName::Play)
                     .label(t!("instances.launch").to_string())
                     .loading(starting)

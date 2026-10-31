@@ -20,7 +20,7 @@ use gpui_kit::{
 };
 use rust_i18n::t;
 
-use super::{Nav, ShellState};
+use super::{CloseWindow, Nav, ShellState};
 use crate::accounts::{AccountsSnapshot, account_switcher, read_accounts};
 use crate::core_bridge::{AccountsChanged, Revision};
 use crate::fonts::Strong;
@@ -44,6 +44,7 @@ pub enum AccountLabel {
 /// The title bar; owns the global search and the account label.
 pub struct TitleBarView {
     shell: Entity<ShellState>,
+    home_focus: FocusHandle,
     search: Entity<GlobalSearch>,
     account: AccountLabel,
     /// The accounts the switcher lists; `None` until read, or when they
@@ -66,12 +67,14 @@ impl TitleBarView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| GlobalSearch::new(shell.clone(), page, home_focus, window, cx));
+        let search =
+            cx.new(|cx| GlobalSearch::new(shell.clone(), page, home_focus.clone(), window, cx));
         let _accounts_changed = cx.observe(&AccountsChanged::epoch(cx), |this, _, cx| {
             this.refresh_account(cx);
         });
         let mut this = Self {
             shell,
+            home_focus,
             search,
             account: AccountLabel::default(),
             accounts: None,
@@ -81,6 +84,14 @@ impl TitleBarView {
         };
         this.refresh_account(cx);
         this
+    }
+
+    /// The callback installed on the client titlebar's X. Address the shell
+    /// directly: focused framework overlays are its siblings, not descendants.
+    /// Dispatching on the retained handle does not move focus or force blur.
+    pub fn close_window_handler(&self) -> impl Fn(&ClickEvent, &mut Window, &mut App) + use<> {
+        let home_focus = self.home_focus.clone();
+        move |_, window, cx| home_focus.dispatch_action(&CloseWindow, window, cx)
     }
 
     /// Moves the keyboard to the search box.
@@ -231,6 +242,9 @@ impl Render for TitleBarView {
         let theme = cx.theme();
         let (bg, border) = (theme.title_bar, theme.title_bar_border);
         TitleBar::new()
+            // The component's default X removes the window without asking
+            // its native should-close handler. Use the shell's save guard.
+            .on_close_window(self.close_window_handler())
             .h(STRIP_H)
             .pl(GUTTER)
             .pr(controls_gap(client))
