@@ -6,6 +6,7 @@
 //! The bar is gpui-component's `TitleBar`, as in crypto_pro and the
 //! prototype: on a client-side decorated window it drags the window and draws
 //! the window controls; under server decorations it is a plain bar.
+use patina_core::accounts::AccountSnapshot;
 
 use std::rc::Rc;
 
@@ -21,7 +22,7 @@ use gpui_kit::{
 use rust_i18n::t;
 
 use super::{CloseWindow, Nav, ShellState};
-use crate::accounts::{AccountsSnapshot, account_switcher, read_accounts};
+use crate::accounts::{account_switcher, read_accounts};
 use crate::core_bridge::{AccountsChanged, Revision};
 use crate::fonts::Strong;
 use crate::instances::InstancesPage;
@@ -49,10 +50,11 @@ pub struct TitleBarView {
     account: AccountLabel,
     /// The accounts the switcher lists; `None` until read, or when they
     /// could not be read.
-    accounts: Option<Rc<AccountsSnapshot>>,
+    accounts: Option<Rc<AccountSnapshot>>,
     account_rev: Revision,
     account_load: Task<()>,
     _accounts_changed: Subscription,
+    _avatars_changed: Subscription,
 }
 
 impl TitleBarView {
@@ -72,6 +74,8 @@ impl TitleBarView {
         let _accounts_changed = cx.observe(&AccountsChanged::epoch(cx), |this, _, cx| {
             this.refresh_account(cx);
         });
+        let images = crate::accounts::avatar::install(cx);
+        let _avatars_changed = cx.observe(&images, |_, _, cx| cx.notify());
         let mut this = Self {
             shell,
             home_focus,
@@ -81,6 +85,7 @@ impl TitleBarView {
             account_rev: Revision::default(),
             account_load: Task::ready(()),
             _accounts_changed,
+            _avatars_changed,
         };
         this.refresh_account(cx);
         this
@@ -177,7 +182,7 @@ impl TitleBarView {
             .child(self.search.clone())
     }
 
-    fn render_actions(&self, client: bool) -> impl IntoElement {
+    fn render_actions(&self, client: bool, cx: &App) -> impl IntoElement {
         let downloads = Nav::Downloads.label();
         let account = match &self.account {
             AccountLabel::SignedIn(name) => Some(name.clone()),
@@ -204,10 +209,15 @@ impl TitleBarView {
                     .on_click(go(Nav::Downloads, self.shell.clone())),
             )
             .child(Separator::vertical().h(rems(1.)).mx_1())
-            .child(account_switcher(account, self.accounts.clone(), {
-                let shell = self.shell.clone();
-                Rc::new(move |_, cx| shell.update(cx, |s, cx| s.navigate(Nav::Accounts, cx)))
-            }))
+            .child(account_switcher(
+                account,
+                self.accounts.clone(),
+                {
+                    let shell = self.shell.clone();
+                    Rc::new(move |_, cx| shell.update(cx, |s, cx| s.navigate(Nav::Accounts, cx)))
+                },
+                cx,
+            ))
             .child(
                 Button::new("title-settings")
                     .ghost()
@@ -256,7 +266,7 @@ impl Render for TitleBarView {
                     .gap_3()
                     .child(self.render_brand(cx))
                     .child(self.render_search())
-                    .child(self.render_actions(client)),
+                    .child(self.render_actions(client, cx)),
             )
     }
 }

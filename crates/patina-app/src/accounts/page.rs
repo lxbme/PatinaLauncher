@@ -1,13 +1,7 @@
-//! The accounts page: a header with the count and "添加微软账号…" (and, in
-//! development builds only, "添加离线账号…"), then one two-line row per
-//! account: its letter avatar, name and "当前" tag, its kind, and
-//! "设为当前" / "移除…" (which asks first).
-//!
-//! The page reads the accounts again whenever they change
-//! ([`AccountsChanged`]) and re-reads `accounts.toml` each time it is shown,
-//! so an edit made outside the app shows up. When the file cannot be read
-//! the page says why and changes nothing (the file is never written over)
-//! until "重新读取" succeeds.
+//! Account rows and commands driven by coherent service snapshots. Production
+//! offline creation remains visible and gated; the developer entry is separate.
+
+use patina_core::accounts::AccountSnapshot;
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -29,7 +23,7 @@ use gpui_kit::{
 use patina_core::accounts::Account;
 use rust_i18n::t;
 
-use super::{AccountsSnapshot, WindowAction, avatar, kind_label, read_accounts, switch_to};
+use super::{WindowAction, avatar, kind_label, read_accounts, switch_to};
 use crate::content::focus_first_button;
 use crate::core_bridge::{AccountsChanged, Core, Revision};
 use crate::fonts::Strong;
@@ -66,7 +60,7 @@ enum Accounts {
     Loading,
     /// They could not be read; the localized reason.
     Failed(String),
-    Loaded(AccountsSnapshot),
+    Loaded(AccountSnapshot),
 }
 
 /// The accounts page (an entity). See the module docs.
@@ -78,12 +72,15 @@ pub struct AccountsPage {
     changing: HashSet<String>,
     scroll: ScrollHandle,
     _accounts_changed: Subscription,
+    _avatars_changed: Subscription,
 }
 
 impl AccountsPage {
     pub fn new(_: &mut Window, cx: &mut Context<Self>) -> Self {
         let _accounts_changed =
             cx.observe(&AccountsChanged::epoch(cx), |this, _, cx| this.refresh(cx));
+        let images = super::avatar::install(cx);
+        let _avatars_changed = cx.observe(&images, |_, _, cx| cx.notify());
         let mut this = Self {
             accounts: Accounts::Loading,
             rev: Revision::default(),
@@ -91,6 +88,7 @@ impl AccountsPage {
             changing: HashSet::new(),
             scroll: ScrollHandle::new(),
             _accounts_changed,
+            _avatars_changed,
         };
         this.refresh(cx);
         this
@@ -103,7 +101,7 @@ impl AccountsPage {
     }
 
     /// The accounts on show, once read.
-    pub fn snapshot(&self) -> Option<&AccountsSnapshot> {
+    pub fn snapshot(&self) -> Option<&AccountSnapshot> {
         match &self.accounts {
             Accounts::Loaded(snapshot) => Some(snapshot),
             _ => None,
@@ -202,12 +200,7 @@ impl AccountsPage {
                         })
                 });
             let footer_focus = footer_focus.clone();
-            let body = if cfg!(feature = "dev-offline") {
-                t!("accounts.remove_body_dev")
-            } else {
-                t!("accounts.remove_body")
-            }
-            .to_string();
+            let body = t!("accounts.remove_body").to_string();
             alert
                 .title(
                     div()
@@ -244,11 +237,20 @@ impl AccountsPage {
         }
         let name = (self.account(id)).map_or_else(|| id.to_string(), |a| a.username.clone());
         let removing = id.to_string();
-        let change = Core::update_accounts(cx, move |store| store.remove(&removing));
+        let change = Core::remove_account(cx, removing);
         let id = id.to_string();
         cx.spawn_in(window, async move |this, cx| {
             let result = change.await;
             this.update_in(cx, |this, window, cx| {
+                if matches!(
+                    result,
+                    Ok(patina_core::accounts::RemovalOutcome::CleanupPending)
+                ) {
+                    window.push_notification(
+                        Notification::info(t!("accounts.cleanup_pending").to_string()),
+                        cx,
+                    );
+                }
                 if let Err(error) = result {
                     tracing::warn!(%error, "removing an account failed");
                     let text = t!("accounts.remove_failed", name = name, error = error);
@@ -269,13 +271,13 @@ impl AccountsPage {
     }
 
     fn account(&self, id: &str) -> Option<&Account> {
-        self.snapshot()?.accounts.iter().find(|a| a.id == id)
+        self.snapshot()?.accounts().iter().find(|a| a.id == id)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let editable = self.is_editable();
-        let count = self.snapshot().map(|s| s.accounts.len());
+        let count = self.snapshot().map(|s| s.accounts().len());
         h_flex()
             .flex_none()
             .h(STRIP_H)
@@ -307,7 +309,10 @@ impl AccountsPage {
             .child(
                 h_flex()
                     .gap_1()
-                    .children(offline_entry(editable, cx))
+                    .child(offline_entry(
+                        editable && self.snapshot().is_some_and(|s| s.is_offline_allowed()),
+                    ))
+                    .children(dev_offline_entry(editable))
                     .child(
                         Button::new("accounts-add-msa")
                             .outline()
@@ -354,34 +359,48 @@ impl AccountsPage {
                         ),
                 )
             });
-        let actions =
-            h_flex()
-                .flex_none()
-                .gap_1()
-                .when(!current, |actions| {
-                    let id = account.id.clone();
-                    actions.child(
-                        Button::new(set_current_id(&account.id))
-                            .outline()
-                            .small()
-                            .label(t!("accounts.set_current").to_string())
-                            .disabled(busy)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_current(&id, window, cx)
-                            })),
-                    )
-                })
-                .child({
-                    let id = account.id.clone();
-                    Button::new(remove_id(&account.id))
-                        .ghost()
+        let actions = h_flex()
+            .flex_none()
+            .gap_1()
+            .when(!current, |actions| {
+                let id = account.id.clone();
+                actions.child(
+                    Button::new(set_current_id(&account.id))
+                        .outline()
                         .small()
-                        .label(t!("accounts.remove").to_string())
-                        .disabled(busy)
+                        .label(
+                            if account.kind == patina_core::accounts::AccountKind::Msa
+                                && account.token_ref.is_none()
+                            {
+                                t!("accounts.sign_in_again").to_string()
+                            } else {
+                                t!("accounts.set_current").to_string()
+                            },
+                        )
+                        .disabled(
+                            busy || (account.kind == patina_core::accounts::AccountKind::Offline
+                                && !self
+                                    .snapshot()
+                                    .is_some_and(|s| s.is_launchable(&account.id))),
+                        )
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_current(&id, window, cx)
+                        })),
+                )
+            })
+            .child({
+                let id = account.id.clone();
+                Button::new(remove_id(&account.id))
+                    .ghost()
+                    .small()
+                    .label(t!("accounts.remove").to_string())
+                    .disabled(busy)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| {
                             this.confirm_remove(&id, window, cx)
-                        }))
-                });
+                        }),
+                    )
+            });
         h_flex()
             .id(row_id(&account.id))
             .test_support()
@@ -405,7 +424,17 @@ impl AccountsPage {
                         div()
                             .text_size(TEXT_SECONDARY)
                             .text_color(theme.muted_foreground)
-                            .child(kind_label(account.kind)),
+                            .child(
+                                if account.kind == patina_core::accounts::AccountKind::Offline
+                                    && !self
+                                        .snapshot()
+                                        .is_some_and(|s| s.is_launchable(&account.id))
+                                {
+                                    t!("accounts.offline.requires_entitlement").to_string()
+                                } else {
+                                    kind_label(account)
+                                },
+                            ),
                     ),
             )
             .child(actions)
@@ -416,12 +445,18 @@ impl AccountsPage {
         match &self.accounts {
             Accounts::Loading => div().into_any_element(),
             Accounts::Failed(error) => render_failed(error.clone(), cx).into_any_element(),
-            Accounts::Loaded(snapshot) if snapshot.accounts.is_empty() => {
+            Accounts::Loaded(snapshot) if snapshot.accounts().is_empty() => {
                 render_empty(cx).into_any_element()
             }
             Accounts::Loaded(snapshot) => {
-                let rows: Vec<_> = (snapshot.accounts.iter())
-                    .map(|a| self.render_row(a, snapshot.is_current(&a.id), cx))
+                let rows: Vec<_> = (snapshot.accounts().iter())
+                    .map(|a| {
+                        self.render_row(
+                            a,
+                            snapshot.current().is_some_and(|current| current.id == a.id),
+                            cx,
+                        )
+                    })
                     .collect();
                 scroll_y(
                     v_flex().id("accounts-list").test_support().children(rows),
@@ -433,23 +468,27 @@ impl AccountsPage {
     }
 }
 
-/// "添加离线账号…", in development builds only.
+fn offline_entry(allowed: bool) -> Button {
+    Button::new("accounts-add-offline")
+        .ghost()
+        .small()
+        .label(t!("accounts.add_offline").to_string())
+        .disabled(!allowed)
+        .on_click(|_, window, cx| super::open_offline_dialog(window, cx))
+}
 #[cfg(feature = "dev-offline")]
-fn offline_entry(editable: bool, _: &App) -> Option<Button> {
+fn dev_offline_entry(editable: bool) -> Option<Button> {
     Some(
-        Button::new("accounts-add-offline")
+        Button::new("accounts-add-dev-offline")
             .ghost()
             .small()
-            .label(t!("accounts.add_offline").to_string())
-            .tooltip(t!("accounts.dev_only").to_string())
+            .label(t!("accounts.add_dev_offline").to_string())
             .disabled(!editable)
-            .on_click(|_, window, cx| super::open_offline_dialog(window, cx)),
+            .on_click(|_, window, cx| super::open_dev_offline_dialog(window, cx)),
     )
 }
-
-/// Release builds have no offline accounts.
 #[cfg(not(feature = "dev-offline"))]
-fn offline_entry(_: bool, _: &App) -> Option<Button> {
+fn dev_offline_entry(_: bool) -> Option<Button> {
     None
 }
 
@@ -528,6 +567,20 @@ impl Render for AccountsPage {
             .id("accounts")
             .size_full()
             .child(self.render_header(cx))
+            .when(
+                !self.snapshot().is_some_and(|s| s.is_offline_allowed()),
+                |page| {
+                    page.child(
+                        div()
+                            .id("offline-requires-entitlement")
+                            .test_support()
+                            .px(GUTTER)
+                            .text_size(TEXT_SECONDARY)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("accounts.offline.requires_entitlement").to_string()),
+                    )
+                },
+            )
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
     }
 }

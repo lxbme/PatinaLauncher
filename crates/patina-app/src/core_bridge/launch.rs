@@ -5,7 +5,6 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use patina_core::accounts::{AccountError, AccountStore};
 use patina_core::instance::Instance;
 use patina_core::launch::{GameSession, LaunchAccount, PendingLaunch, SessionError};
 use patina_core::prepare::Launcher;
@@ -18,16 +17,6 @@ use super::service::{LoadedConfig, current};
 /// futures do file and network I/O, so poll them on the runtime
 /// ([`run`](super::run)).
 pub trait LaunchBackend: Send + Sync + 'static {
-    /// The launch identity of account `id` in `accounts`. Called on the
-    /// blocking pool (the account store does file I/O).
-    fn launch_account(
-        &self,
-        accounts: &AccountStore,
-        id: &str,
-    ) -> Result<LaunchAccount, AccountError> {
-        accounts.launch_account(id)
-    }
-
     /// Takes the instance's locks and prepares `inst` for `account` without
     /// starting it ([`GameSession::prepare_launch`]); dropping the result
     /// cancels the launch.

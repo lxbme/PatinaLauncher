@@ -1,20 +1,10 @@
-//! "添加离线账号（仅开发构建）": a player name, checked as it is typed
-//! (3–16 letters, digits or underscores, the core's rule and wording), then
-//! "添加". Development builds (`dev-offline`) only; release builds do not
-//! contain this file.
-//!
-//! "添加" (also Enter in the name) is disabled while the name is invalid.
-//! Adding closes the dialog at once; a failure is reported as a
-//! notification. A name that is already there (any case) keeps its account.
-
-#![cfg(feature = "dev-offline")]
+//! Normal entitled offline creation, with a separately labelled developer entry.
 
 use std::cell::Cell;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme, Disableable, WindowExt, v_flex};
 use gpui_kit::{
     App, AppContext, Context, Entity, EventEmitter, Focusable, FontWeight, InteractiveElement,
@@ -39,6 +29,10 @@ pub fn name_error(name: &str) -> Option<String> {
 /// The dialog's form (an entity): the name input.
 pub struct OfflineForm {
     name: Entity<InputState>,
+    development: bool,
+    saving: bool,
+    error: Option<String>,
+    open: bool,
     _changed: Subscription,
 }
 
@@ -57,7 +51,14 @@ impl OfflineForm {
                 cx.notify();
             }
         });
-        Self { name, _changed }
+        Self {
+            name,
+            development: false,
+            saving: false,
+            error: None,
+            open: true,
+            _changed,
+        }
     }
 
     pub fn name_input(&self) -> &Entity<InputState> {
@@ -66,30 +67,60 @@ impl OfflineForm {
 
     /// The name "添加" would add, or `None` while it is disabled.
     pub fn request(&self, cx: &App) -> Option<String> {
+        if self.saving || !self.open {
+            return None;
+        }
         let name = self.name.read(cx).value().trim().to_string();
         (!name.is_empty() && name_error(&name).is_none()).then_some(name)
     }
 
     /// Starts adding `form`'s account if the name is valid; returns whether
-    /// it did (the dialog then closes).
+    /// it did. The dialog closes only after successful persistence.
     pub fn add(form: &Entity<Self>, window: &mut Window, cx: &mut App) -> bool {
         let Some(name) = form.read(cx).request(cx) else {
             return false;
         };
         let added = {
             let name = name.clone();
-            Core::update_accounts(cx, move |store| store.add_offline(&name).map(|_| ()))
+            #[cfg(feature = "dev-offline")]
+            if form.read(cx).development {
+                Core::add_dev_offline_account(cx, name)
+            } else {
+                Core::add_offline_account(cx, name)
+            }
+            #[cfg(not(feature = "dev-offline"))]
+            Core::add_offline_account(cx, name)
         };
+        form.update(cx, |form, cx| {
+            form.saving = true;
+            form.error = None;
+            cx.emit(NameChanged);
+            cx.notify();
+        });
+        let form = form.downgrade();
         window
             .spawn(cx, async move |cx| {
-                if let Err(error) = added.await {
-                    tracing::warn!(%error, "adding an offline account failed");
-                    let text = t!("accounts.offline.add_failed", name = name, error = error);
-                    cx.update(|window, cx| {
-                        window.push_notification(Notification::error(text.to_string()), cx)
-                    })
-                    .ok();
-                }
+                let result = added.await;
+                form.update_in(cx, |form, window, cx| {
+                    if !form.open {
+                        return;
+                    }
+                    form.saving = false;
+                    match result {
+                        Ok(_) => {
+                            window.close_dialog(cx);
+                        }
+                        Err(error) => {
+                            form.error = Some(
+                                t!("accounts.offline.add_failed", name = name, error = error)
+                                    .to_string(),
+                            );
+                            cx.emit(NameChanged);
+                            cx.notify();
+                        }
+                    }
+                })
+                .ok();
             })
             .detach();
         true
@@ -114,7 +145,19 @@ impl Render for OfflineForm {
                     .text_color(theme.muted_foreground)
                     .child(t!("accounts.offline.name").to_string()),
             )
-            .child(Input::new(&self.name).id("offline-name"))
+            .child(
+                Input::new(&self.name)
+                    .id("offline-name")
+                    .disabled(self.saving),
+            )
+            .children(self.error.as_ref().map(|error| {
+                div()
+                    .id("offline-save-error")
+                    .aria_label(error.clone())
+                    .test_support()
+                    .text_color(theme.danger)
+                    .child(error.clone())
+            }))
             .children(error.map(|error| {
                 div()
                     .id("offline-name-error")
@@ -143,6 +186,7 @@ impl OfflineFooter {
 impl Render for OfflineFooter {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.form.read(cx).request(cx).is_some();
+        let saving = self.form.read(cx).saving;
         let form = self.form.clone();
         DialogFooter::new()
             .child(
@@ -155,10 +199,9 @@ impl Render for OfflineFooter {
                     .primary()
                     .label(t!("accounts.offline.add").to_string())
                     .disabled(!ready)
+                    .loading(saving)
                     .on_click(move |_, window, cx| {
-                        if OfflineForm::add(&form, window, cx) {
-                            window.close_dialog(cx);
-                        }
+                        OfflineForm::add(&form, window, cx);
                     }),
             )
     }
@@ -166,7 +209,15 @@ impl Render for OfflineFooter {
 
 /// Opens the dialog over `window`, with the keyboard in the name.
 pub fn open(window: &mut Window, cx: &mut App) {
+    open_form(false, window, cx);
+}
+#[cfg(feature = "dev-offline")]
+pub fn open_development(window: &mut Window, cx: &mut App) {
+    open_form(true, window, cx);
+}
+fn open_form(development: bool, window: &mut Window, cx: &mut App) {
     let form = cx.new(|cx| OfflineForm::new(window, cx));
+    form.update(cx, |form, _| form.development = development);
     let footer = cx.new(|cx| OfflineFooter::new(form.clone(), cx));
     // The builder runs again whenever the dialog layer is rebuilt; the name
     // takes the keyboard on the first run only.
@@ -176,8 +227,13 @@ pub fn open(window: &mut Window, cx: &mut App) {
             let name = form.read(cx).name_input().clone();
             name.update(cx, |input, cx| input.focus(window, cx));
         }
-        let title = SharedString::from(t!("accounts.offline.title"));
+        let title = SharedString::from(if form.read(cx).development {
+            t!("accounts.offline.development_title")
+        } else {
+            t!("accounts.offline.title")
+        });
         let form_ok = form.clone();
+        let closing = form.downgrade();
         dialog
             .title(
                 div()
@@ -188,6 +244,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
             )
             .child(form.clone())
             .footer(footer.clone())
+            .on_close(move |_, _, cx| {
+                closing.update(cx, |form, _| form.open = false).ok();
+            })
             // Enter adds only from the name; on a button it is that
             // button's own key.
             .on_ok(move |_, window, cx| {
@@ -196,7 +255,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
                     cx.propagate();
                     return false;
                 }
-                OfflineForm::add(&form_ok, window, cx)
+                OfflineForm::add(&form_ok, window, cx);
+                false
             })
     });
 }

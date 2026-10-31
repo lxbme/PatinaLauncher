@@ -7,12 +7,11 @@
 
 use std::time::Duration;
 
-use patina_core::accounts::AccountError;
+use patina_core::accounts::{AccountService, LaunchGrant, error::AuthError, login::CancelToken};
 use patina_core::instance::Instance;
-use patina_core::launch::{GameSession, KillHandle, LaunchAccount, Reattach, SessionExit};
+use patina_core::launch::{GameSession, KillHandle, Reattach, SessionExit};
 use rust_i18n::t;
-
-use crate::core_bridge::{LaunchBackend, LoadedAccounts};
+use std::sync::Arc;
 
 /// How often a game running in another Patina process is checked: whether
 /// it still runs, or its session became free to take over.
@@ -99,7 +98,7 @@ pub enum LaunchEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountIssue {
     NoAccount,
-    MsaUnavailable,
+    Auth(AuthError),
     /// Already localized.
     Failed(String),
 }
@@ -108,31 +107,39 @@ impl AccountIssue {
     pub fn message(&self) -> String {
         match self {
             AccountIssue::NoAccount => t!("launch.no_account").to_string(),
-            AccountIssue::MsaUnavailable => t!("launch.msa_unavailable").to_string(),
+            AccountIssue::Auth(e) => e.to_string(),
             AccountIssue::Failed(m) => m.clone(),
         }
     }
 
     /// Whether adding an account on the accounts page fixes it.
     pub fn wants_account(&self) -> bool {
-        matches!(self, AccountIssue::NoAccount | AccountIssue::MsaUnavailable)
+        matches!(
+            self,
+            AccountIssue::NoAccount
+                | AccountIssue::Auth(
+                    AuthError::ReauthenticationRequired | AuthError::CredentialMissing
+                )
+        )
     }
 }
 
-/// The launch identity of the current account. Blocking (the account store
-/// does file I/O): run it on the blocking pool.
-pub fn resolve_account(
-    backend: &dyn LaunchBackend,
-    accounts: &LoadedAccounts,
-) -> Result<LaunchAccount, AccountIssue> {
-    let store = (accounts.as_ref()).map_err(|e| AccountIssue::Failed(e.to_string()))?;
-    let current = store.current().ok_or(AccountIssue::NoAccount)?;
-    backend
-        .launch_account(store, &current.id)
-        .map_err(|e| match e {
-            AccountError::MsaUnavailable => AccountIssue::MsaUnavailable,
-            e => AccountIssue::Failed(e.to_string()),
-        })
+/// Capture the current stable id exactly once; later selection changes cannot
+/// silently replace the identity being prepared.
+pub async fn resolve_account(
+    service: Arc<AccountService>,
+    cancel: CancelToken,
+) -> Result<LaunchGrant, AccountIssue> {
+    let snapshot = service.snapshot().await.map_err(AccountIssue::Auth)?;
+    let id = snapshot
+        .current()
+        .ok_or(AccountIssue::NoAccount)?
+        .id
+        .clone();
+    service
+        .resolve_launch(&id, cancel)
+        .await
+        .map_err(AccountIssue::Auth)
 }
 
 /// Looks for the games of `instances` that still run ([`GameSession::reattach`]
@@ -163,57 +170,15 @@ pub async fn stop_elsewhere(inst: Instance) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use futures::future::BoxFuture;
-    use patina_core::accounts::AccountStore;
-    use patina_core::launch::{PendingLaunch, SessionError};
-    use patina_core::paths::DataDirs;
-    use patina_core::progress::ProgressSink;
-
     use super::*;
-    use crate::core_bridge::LoadError;
-
-    /// Resolves accounts as the real backend does; never prepares.
-    struct AccountsOnly;
-
-    impl LaunchBackend for AccountsOnly {
-        fn prepare(
-            &self,
-            _: Instance,
-            _: LaunchAccount,
-            _: ProgressSink,
-        ) -> BoxFuture<'static, Result<PendingLaunch, SessionError>> {
-            unreachable!("these tests only look up accounts")
-        }
-    }
-
-    fn load(data: &DataDirs) -> LoadedAccounts {
-        AccountStore::load(data).map_err(|e| LoadError::Failed(Arc::new(e)))
-    }
 
     #[test]
     fn account_issues_name_their_way_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = DataDirs::new(dir.path());
-        let none = resolve_account(&AccountsOnly, &load(&data)).unwrap_err();
-        assert_eq!(none, AccountIssue::NoAccount);
-        assert!(none.wants_account());
-
-        std::fs::write(
-            dir.path().join("accounts.toml"),
-            "current = \"msa-1\"\n\n[[accounts]]\nid = \"msa-1\"\nkind = \"msa\"\n\
-             username = \"Steve\"\nuuid = \"00000000-0000-0000-0000-000000000001\"\n",
-        )
-        .unwrap();
-        let msa = resolve_account(&AccountsOnly, &load(&data)).unwrap_err();
-        assert_eq!(msa, AccountIssue::MsaUnavailable);
-        assert!(msa.wants_account());
-
-        // An account store that is not there cannot be fixed by adding one.
-        let failed = resolve_account(&AccountsOnly, &Err(LoadError::NotLoaded)).unwrap_err();
-        assert!(matches!(failed, AccountIssue::Failed(_)));
-        assert!(!failed.wants_account());
+        assert!(AccountIssue::NoAccount.wants_account());
+        assert!(AccountIssue::Auth(AuthError::CredentialMissing).wants_account());
+        assert!(AccountIssue::Auth(AuthError::ReauthenticationRequired).wants_account());
+        assert!(!AccountIssue::Auth(AuthError::SessionExpired).wants_account());
+        assert!(!AccountIssue::Auth(AuthError::Busy).wants_account());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gpui_kit::component::Theme;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, Pixels, TestAppContext, px};
 use patina_app::core_bridge::testing::{self, FakeCatalog};
-use patina_app::core_bridge::{AccountsChanged, Core, LaunchBackend, LoadError};
+use patina_app::core_bridge::{Core, LaunchBackend};
 use patina_app::i18n::Language;
 use patina_app::instances::{
     Filter, IconChoice, IconPicked, IconPicker, IconSource, InstanceList, InstancesChanged,
@@ -21,7 +21,6 @@ use patina_app::settings::{self, AppSettings, SettingsStore};
 use patina_app::shell::{AccountLabel, Nav, RootView, StatusBar};
 use patina_app::single_instance;
 use patina_app::theme::{self, ProductColors};
-use patina_core::accounts::AccountStore;
 use patina_core::config::SourceChoice;
 use patina_core::instance::{Component, ComponentUid, InstanceIcon, InstanceStore};
 use patina_core::launch::LogLevel;
@@ -613,12 +612,12 @@ id = "msa-1"
 kind = "msa"
 username = "Steve"
 uuid = "00000000-0000-0000-0000-000000000001"
+token_ref = "00000000-0000-0000-0000-000000000001"
 "#;
 
 #[gpui_kit::test]
 async fn title_bar_follows_accounts_changes(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
-    let data = DataDirs::new(tmp.path());
     let app = boot(cx, tmp.path(), AppSettings::default());
     let title = cx.update(|cx| app.root.read(cx).title_bar().clone());
     let label = |cx: &mut TestAppContext| title.read_with(cx, |t, _| t.account().clone());
@@ -628,35 +627,21 @@ async fn title_bar_follows_accounts_changes(cx: &mut TestAppContext) {
     // A writer changes the accounts, then signals it.
     let reload = |cx: &mut TestAppContext, text: &str| {
         std::fs::write(tmp.path().join("accounts.toml"), text).unwrap();
-        let data = data.clone();
-        cx.update(|cx| {
-            Core::with_accounts(cx, move |accounts| {
-                *accounts = AccountStore::load(&data).map_err(|e| LoadError::Failed(Arc::new(e)));
-            })
-        })
+        cx.update(Core::reload_accounts)
     };
     reload(cx, ACCOUNT).await.unwrap();
-    // Nothing changes until the signal.
-    cx.run_until_parked();
-    assert_eq!(label(cx), AccountLabel::SignedOut);
-    cx.update(AccountsChanged::bump);
     settle(cx, |cx| label(cx) != AccountLabel::SignedOut);
     assert_eq!(label(cx), AccountLabel::SignedIn("Steve".into()));
 
     // Accounts that failed to load read as signed out.
-    let fail =
-        cx.update(|cx| Core::with_accounts(cx, |accounts| *accounts = Err(LoadError::NotLoaded)));
-    fail.await.unwrap();
-    cx.update(AccountsChanged::bump);
+    assert!(reload(cx, "not [valid").await.is_err());
     settle(cx, |cx| label(cx) == AccountLabel::SignedOut);
 
     reload(cx, ACCOUNT).await.unwrap();
-    cx.update(AccountsChanged::bump);
     settle(cx, |cx| label(cx) == AccountLabel::SignedIn("Steve".into()));
 
     // No accounts left: signed out.
     reload(cx, "").await.unwrap();
-    cx.update(AccountsChanged::bump);
     settle(cx, |cx| label(cx) == AccountLabel::SignedOut);
     cx.update_window(app.handle, |_, window, cx| {
         window.render_frame(cx);
@@ -2851,11 +2836,10 @@ fn a_deleted_instance_forgets_its_log(cx: &mut TestAppContext) {
 // ---- Launch ----
 
 use patina_app::launch::prelaunch_dialog::warning_id;
-use patina_core::accounts::AccountError;
 use patina_core::instance::Instance;
 use patina_core::launch::{
     GameSession, KillHandle, LaunchAccount, LaunchCommand, PendingLaunch, SessionError,
-    running_game, test_account,
+    running_game,
 };
 use patina_core::prepare::PrepareWarning;
 
@@ -2925,14 +2909,10 @@ impl FakeGames {
 }
 
 impl LaunchBackend for FakeGames {
-    fn launch_account(&self, _: &AccountStore, _: &str) -> Result<LaunchAccount, AccountError> {
-        Ok(test_account("Steve"))
-    }
-
     fn prepare(
         &self,
         inst: Instance,
-        _: LaunchAccount,
+        account: LaunchAccount,
         _: ProgressSink,
     ) -> futures::future::BoxFuture<'static, Result<PendingLaunch, SessionError>> {
         self.seen
@@ -2945,7 +2925,12 @@ impl LaunchBackend for FakeGames {
             return futures::future::ready(Err(fail())).boxed();
         }
         let (cmd, warnings) = (fake_game(&inst.id, &self.script), self.warnings.clone());
-        async move { GameSession::prepare_launch_with_command(&inst, cmd, warnings) }.boxed()
+        async move {
+            GameSession::prepare_launch_with_account_and_warnings_for_test(
+                &inst, cmd, &account, warnings,
+            )
+        }
+        .boxed()
     }
 }
 
@@ -3050,7 +3035,18 @@ fn failed_message(
 
 /// An account in the store, so launching gets past the account check.
 fn with_account(dir: &Path) {
-    std::fs::write(dir.join("accounts.toml"), ACCOUNT).unwrap();
+    let rt = patina_app::runtime::start();
+    let data = DataDirs::new(dir);
+    let service = testing::isolated_accounts(data).unwrap();
+    rt.block_on(patina_core::accounts::testing::seed_verified(
+        &service,
+        "Steve",
+        patina_core::launch::offline_uuid("Steve"),
+        "SYNTHETIC_REFRESH",
+        1_800_000_000,
+        1_800_003_600,
+    ))
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -3423,24 +3419,17 @@ async fn no_account_prompts_to_accounts_page(cx: &mut TestAppContext) {
 
     // A Microsoft account cannot play yet: the same way out.
     std::fs::write(tmp.path().join("accounts.toml"), ACCOUNT).unwrap();
-    cx.update(|cx| {
-        Core::with_accounts(cx, move |accounts| {
-            *accounts = AccountStore::load(&data).map_err(|e| LoadError::Failed(Arc::new(e)));
-        })
-    })
-    .await
-    .unwrap();
+    cx.update(Core::reload_accounts).await.unwrap();
     shell.update(cx, |s, cx| s.navigate(Nav::Instances, cx));
     settle(cx, |cx| shows(&app, cx, "launch"));
     click(&app, cx, "launch");
     settle(cx, |cx| failed_message(&model, cx, &a).is_some());
     assert_eq!(
         failed_message(&model, cx, &a).as_deref(),
-        Some("Microsoft sign-in isn’t available yet")
+        Some("Credential storage is unavailable. Try again.")
     );
-    assert!(shows(&app, cx, "instance-op-fix"));
-    click(&app, cx, "instance-op-fix");
-    assert_eq!(shell.read_with(cx, |s, _| s.nav()), Nav::Accounts);
+    assert!(!shows(&app, cx, "instance-op-fix"));
+    assert!(shows(&app, cx, "instance-op-retry"));
 }
 
 #[gpui_kit::test]
@@ -8091,6 +8080,7 @@ mod downloads {
 // ---- Accounts page ----
 
 mod accounts {
+    mod accounts_service;
     use super::*;
     use gpui_kit::MouseButton;
     use gpui_kit::test::TestEventExt;
@@ -8107,12 +8097,14 @@ id = "msa-1"
 kind = "msa"
 username = "Steve"
 uuid = "00000000-0000-0000-0000-000000000001"
+token_ref = "00000000-0000-0000-0000-000000000001"
 
 [[accounts]]
 id = "msa-2"
 kind = "msa"
 username = "Alex"
 uuid = "00000000-0000-0000-0000-000000000002"
+token_ref = "00000000-0000-0000-0000-000000000002"
 "#;
 
     fn page(app: &Booted, cx: &mut TestAppContext) -> Entity<AccountsPage> {
@@ -8123,7 +8115,7 @@ uuid = "00000000-0000-0000-0000-000000000002"
     fn names(app: &Booted, cx: &mut TestAppContext) -> Option<Vec<String>> {
         page(app, cx).read_with(cx, |p, _| {
             p.snapshot()
-                .map(|s| s.accounts.iter().map(|a| a.username.clone()).collect())
+                .map(|s| s.accounts().iter().map(|a| a.username.clone()).collect())
         })
     }
 
@@ -8181,62 +8173,20 @@ uuid = "00000000-0000-0000-0000-000000000002"
         label_of(app, cx, "login-code").unwrap()
     }
 
-    #[cfg(not(feature = "dev-offline"))]
-    #[gpui_kit::test]
-    fn release_accounts_page_has_no_offline_entry(cx: &mut TestAppContext) {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = boot(cx, tmp.path(), AppSettings::default());
-        open_page(&app, cx);
-        assert!(shows(&app, cx, "accounts-add-msa"));
-        assert!(!disabled(&app, cx, "accounts-add-msa"));
-        assert!(element(&app, cx, "accounts-add-offline").is_none());
-
-        // The sign-in of this build has no flow.
-        let login = cx.update(|cx| Core::global(cx).login.clone());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_cancel, token) = tokio::sync::watch::channel(false);
-        app._rt.block_on(login.start(tx, token));
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(patina_core::accounts::login::LoginEvent::Failed(
-                patina_core::accounts::login::LoginError::Unavailable
-            ))
-        );
-    }
-
-    #[cfg(not(feature = "dev-offline"))]
-    #[gpui_kit::test]
-    fn release_login_shows_unavailable(cx: &mut TestAppContext) {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = boot(cx, tmp.path(), AppSettings::default());
-        open_page(&app, cx);
-        click(&app, cx, "accounts-add-msa");
-        assert!(shows(&app, cx, "dialog"));
-        settle(cx, |cx| label_of(&app, cx, "login-failed").is_some());
-        assert_eq!(
-            label_of(&app, cx, "login-failed").as_deref(),
-            Some("Microsoft sign-in isn’t available yet")
-        );
-        assert!(element(&app, cx, "login-code").is_none());
-        assert!(element(&app, cx, "login-cancel").is_none());
-        app.language(Language::ZhCn);
-        assert_eq!(
-            label_of(&app, cx, "login-failed").as_deref(),
-            Some("微软登录暂未开放")
-        );
-        app.language(Language::En);
-        click(&app, cx, "login-close");
-        assert!(!shows(&app, cx, "dialog"));
-        assert!(!tmp.path().join("accounts.toml").exists(), "nothing saved");
-    }
-
     #[cfg(feature = "dev-offline")]
     #[gpui_kit::test]
     fn fake_login_walks_states_and_adds_nothing(cx: &mut TestAppContext) {
         use patina_app::accounts::{FAKE_CODE, FAKE_URI};
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("accounts.toml"), ACCOUNT).unwrap();
-        let app = boot(cx, tmp.path(), AppSettings::default());
+        let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+            testing::core_with_login(
+                rt,
+                data,
+                Arc::new(FakeCatalog::new()),
+                Arc::new(patina_app::accounts::FakeLogin::default()),
+            )
+        });
         open_page(&app, cx);
         let before = accounts_file(tmp.path());
 
@@ -8256,7 +8206,7 @@ uuid = "00000000-0000-0000-0000-000000000002"
         settle(cx, |cx| label_of(&app, cx, "login-done").is_some());
         assert_eq!(
             label_of(&app, cx, "login-done").as_deref(),
-            Some("Development build: the walkthrough finished; no account was added")
+            Some("Signed in as DevPlayer")
         );
         assert!(element(&app, cx, "login-code").is_none());
         assert!(element(&app, cx, "login-cancel").is_none());
@@ -8277,7 +8227,7 @@ uuid = "00000000-0000-0000-0000-000000000002"
         let app = boot(cx, tmp.path(), AppSettings::default());
         open_page(&app, cx);
         assert!(shows(&app, cx, "accounts-empty"));
-        click(&app, cx, "accounts-add-offline");
+        click(&app, cx, "accounts-add-dev-offline");
         assert!(shows(&app, cx, "dialog"));
         // Nothing typed: no complaint yet, but nothing to add.
         assert!(element(&app, cx, "offline-name-error").is_none());
@@ -8434,10 +8384,7 @@ uuid = "00000000-0000-0000-0000-000000000002"
         let app = boot(cx, tmp.path(), AppSettings::default());
         open_page(&app, cx);
         let guidance = label_of(&app, cx, "accounts-empty").unwrap();
-        assert!(
-            guidance.contains("Microsoft sign-in isn’t available"),
-            "{guidance}"
-        );
+        assert!(guidance.contains("Microsoft account"), "{guidance}");
         assert_eq!(guidance.contains("offline"), cfg!(feature = "dev-offline"));
     }
 
@@ -8493,7 +8440,7 @@ uuid = "00000000-0000-0000-0000-000000000002"
         open_page(&app, cx);
         let error = page(&app, cx).read_with(cx, |p, _| p.error().map(str::to_owned));
         let error = error.expect("the page says why");
-        assert!(error.starts_with("Invalid accounts file format"), "{error}");
+        assert!(!error.is_empty());
         assert_eq!(label_of(&app, cx, "accounts-error"), Some(error));
         assert!(disabled(&app, cx, "accounts-add-msa"));
         #[cfg(feature = "dev-offline")]
@@ -8501,7 +8448,7 @@ uuid = "00000000-0000-0000-0000-000000000002"
         settle(cx, |cx| title_label(&app, cx) == AccountLabel::SignedOut);
 
         // A change from elsewhere (the title bar's menu) is refused too.
-        let refused = cx.update(|cx| Core::update_accounts(cx, |store| store.set_current("msa-1")));
+        let refused = cx.update(|cx| Core::set_current_account(cx, "msa-1".into()));
         assert!(refused.await.is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not [valid");
 

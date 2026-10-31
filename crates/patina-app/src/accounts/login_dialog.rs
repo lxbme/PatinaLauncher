@@ -1,15 +1,4 @@
-//! The "添加微软账号" dialog: one device-code sign-in through `Core.login`
-//! ([`DeviceCodeLogin`](patina_core::accounts::login::DeviceCodeLogin)).
-//!
-//! It walks 准备中 → the code (large, monospaced, with "复制") and
-//! "打开 microsoft.com/link" → 等待中 → done or failed. "取消", Escape and
-//! closing the dialog cancel the attempt: "取消" sets the cancel token,
-//! closing drops it (the dialog's [`LoginDialog`] goes, and with it the
-//! token's sender), which the interface also counts as cancelling.
-//!
-//! Nothing is stored yet: a finished sign-in only says so (development
-//! builds walk a fake flow); plan 3 adds the account here. Release builds
-//! have no flow at all and say "微软登录暂未开放".
+//! One cancellable device-code attempt; the service commits before emitting Done.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogFooter;
@@ -20,7 +9,7 @@ use gpui_kit::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
     TestSupportExt, Window, div, rems,
 };
-use patina_core::accounts::login::{DeviceCode, LoginError, LoginEvent};
+use patina_core::accounts::login::{DeviceCode, LoginError, LoginEvent, StorageKind};
 use rust_i18n::t;
 use tokio::sync::{mpsc, watch};
 
@@ -40,7 +29,7 @@ pub enum LoginState {
         code: DeviceCode,
         waiting: bool,
     },
-    /// Signed in as `username`. Nothing was added (see the module docs).
+    /// The service has durably committed this identity.
     Done {
         username: String,
     },
@@ -58,6 +47,8 @@ impl LoginState {
 /// attempt runs on the app's runtime and ends when this is dropped.
 pub struct LoginDialog {
     state: LoginState,
+    attempt: u64,
+    local_storage: bool,
     /// Cancels the attempt in flight: `true`, or dropping it.
     cancel: Option<watch::Sender<bool>>,
     /// Whether "复制" just copied the code.
@@ -71,6 +62,8 @@ impl LoginDialog {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             state: LoginState::Preparing,
+            attempt: 0,
+            local_storage: false,
             cancel: None,
             copied: false,
             copied_reset: Task::ready(()),
@@ -87,6 +80,8 @@ impl LoginDialog {
     /// Starts a new attempt, cancelling the one in flight.
     pub fn start(&mut self, cx: &mut Context<Self>) {
         self.cancel();
+        let attempt = self.attempt;
+        self.local_storage = false;
         let (events, mut rx) = mpsc::unbounded_channel();
         let (cancel, token) = watch::channel(false);
         let core = Core::global(cx);
@@ -98,7 +93,10 @@ impl LoginDialog {
         self.copied = false;
         self.events = cx.spawn(async move |this, cx| {
             while let Some(event) = rx.recv().await {
-                if this.update(cx, |this, cx| this.apply(event, cx)).is_err() {
+                if this
+                    .update(cx, |this, cx| this.apply(attempt, event, cx))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -108,12 +106,21 @@ impl LoginDialog {
 
     /// Cancels the attempt in flight (if any).
     pub fn cancel(&mut self) {
+        self.attempt += 1;
         if let Some(cancel) = self.cancel.take() {
             cancel.send(true).ok();
         }
     }
 
-    fn apply(&mut self, event: LoginEvent, cx: &mut Context<Self>) {
+    fn apply(&mut self, attempt: u64, event: LoginEvent, cx: &mut Context<Self>) {
+        if attempt != self.attempt || self.state.is_finished() {
+            return;
+        }
+        if let LoginEvent::Storage(kind) = event {
+            self.local_storage = kind == StorageKind::LocalFile;
+            cx.notify();
+            return;
+        }
         let next = match (event, &self.state) {
             // A new code replaces the one on show.
             (LoginEvent::Code(code), _) => LoginState::Code {
@@ -125,7 +132,7 @@ impl LoginDialog {
                 waiting: true,
             },
             (LoginEvent::Waiting, _) => return,
-            // Plan 3 stores the account here.
+            // Never persist event fields: the service already committed.
             (LoginEvent::Done { username, .. }, _) => LoginState::Done { username },
             (LoginEvent::Failed(error), _) => LoginState::Failed(error),
             // Future events may carry secrets; never log unknown payloads.
@@ -273,10 +280,10 @@ impl Render for LoginDialog {
                     .into_any_element(),
             ],
             LoginState::Code { code, waiting } => self.render_code(code, *waiting, cx),
-            LoginState::Done { .. } => vec![
+            LoginState::Done { username } => vec![
                 status(
                     "login-done",
-                    t!("accounts.login.done_not_added").to_string(),
+                    t!("accounts.login.done", name = username).to_string(),
                     fg,
                 )
                 .into_any_element(),
@@ -300,6 +307,13 @@ impl Render for LoginDialog {
             .gap_3()
             .text_size(TEXT_PRIMARY)
             .children(body)
+            .children(self.local_storage.then(|| {
+                status(
+                    "login-storage",
+                    t!("accounts.login.local_storage").to_string(),
+                    cx.theme().muted_foreground,
+                )
+            }))
     }
 }
 
@@ -332,10 +346,21 @@ impl Render for LoginFooter {
                     }),
             );
         }
-        let retry = matches!(
-            state,
-            LoginState::Failed(LoginError::Expired | LoginError::Other(_))
-        );
+        let retry = match &state {
+            LoginState::Failed(LoginError::Expired | LoginError::Other(_)) => true,
+            LoginState::Failed(LoginError::Auth(error)) => {
+                use patina_core::accounts::error::AuthError;
+                !matches!(
+                    error,
+                    AuthError::NoEntitlement
+                        | AuthError::ProfileMissing
+                        | AuthError::XboxRestriction(_)
+                        | AuthError::IdentityMismatch
+                        | AuthError::Cancelled
+                )
+            }
+            _ => false,
+        };
         let footer = footer.child(
             Button::new("login-close")
                 .label(t!("accounts.login.close").to_string())
@@ -358,6 +383,7 @@ pub fn open(window: &mut Window, cx: &mut gpui_kit::App) -> Entity<LoginDialog> 
     let dialog = cx.new(LoginDialog::new);
     let footer = cx.new(|cx| LoginFooter::new(dialog.clone(), cx));
     let shown = dialog.clone();
+    let closing = dialog.downgrade();
     window.open_dialog(cx, move |d, _, _| {
         let title = SharedString::from(t!("accounts.login.title"));
         d.title(
@@ -369,6 +395,12 @@ pub fn open(window: &mut Window, cx: &mut gpui_kit::App) -> Entity<LoginDialog> 
         )
         .child(shown.clone())
         .footer(footer.clone())
+        .on_close({
+            let closing = closing.clone();
+            move |_, _, cx| {
+                closing.update(cx, |d, _| d.cancel()).ok();
+            }
+        })
         // Enter has nothing to commit: on a button it presses that button.
         .on_ok(|_, _, cx| {
             cx.propagate();
@@ -381,6 +413,33 @@ pub fn open(window: &mut Window, cx: &mut gpui_kit::App) -> Entity<LoginDialog> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn stale_and_post_terminal_events_cannot_replace_attempt(cx: &mut gpui_kit::TestAppContext) {
+        let dialog = cx.new(|_| LoginDialog {
+            state: LoginState::Preparing,
+            attempt: 2,
+            local_storage: false,
+            cancel: None,
+            copied: false,
+            copied_reset: Task::ready(()),
+            events: Task::ready(()),
+        });
+        dialog.update(cx, |dialog, cx| {
+            dialog.apply(1, LoginEvent::Failed(LoginError::Expired), cx);
+            assert_eq!(dialog.state(), &LoginState::Preparing);
+            dialog.apply(2, LoginEvent::Failed(LoginError::Expired), cx);
+            dialog.apply(
+                2,
+                LoginEvent::Done {
+                    username: "Stale".into(),
+                    uuid: patina_core::launch::offline_uuid("Stale"),
+                },
+                cx,
+            );
+            assert_eq!(dialog.state(), &LoginState::Failed(LoginError::Expired));
+        });
+    }
 
     #[gpui_kit::test]
     fn unknown_event_does_not_log_payload(cx: &mut gpui_kit::TestAppContext) {
@@ -408,6 +467,8 @@ mod tests {
         // No login service or window: only exercise the real event handler.
         let dialog = cx.new(|_| LoginDialog {
             state: LoginState::Preparing,
+            attempt: 0,
+            local_storage: false,
             cancel: None,
             copied: false,
             copied_reset: Task::ready(()),
@@ -421,7 +482,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!("capture active");
             dialog.update(cx, |dialog, cx| {
-                dialog.apply(LoginEvent::Storage(StorageKind::LocalFile), cx);
+                dialog.apply(0, LoginEvent::Storage(StorageKind::LocalFile), cx);
                 assert_eq!(dialog.state(), &LoginState::Preparing);
             });
         });

@@ -468,6 +468,19 @@ impl GameSession {
         Ok(pending)
     }
 
+    /// Isolated prepared identity with warnings for GUI confirmation tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prepare_launch_with_account_and_warnings_for_test(
+        inst: &Instance,
+        cmd: LaunchCommand,
+        account: &LaunchAccount,
+        warnings: Vec<PrepareWarning>,
+    ) -> Result<PendingLaunch, SessionError> {
+        let mut pending = Self::prepare_launch_with_command(inst, cmd, warnings)?;
+        pending.prepared_account = Some(account.clone());
+        Ok(pending)
+    }
+
     /// Test entry: like `start` but with a ready-made command (no prepare).
     /// Must be called within a Tokio runtime (it spawns the tailer).
     #[cfg(test)]

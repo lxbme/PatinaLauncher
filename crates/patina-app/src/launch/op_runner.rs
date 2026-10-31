@@ -3,6 +3,7 @@
 
 use std::rc::Rc;
 
+use patina_core::accounts::{AuthenticatedLaunchError, error::AuthError};
 use patina_core::instance::InstanceError;
 use patina_core::launch::SessionError;
 use patina_core::loader::LoaderError;
@@ -110,6 +111,7 @@ impl std::fmt::Debug for OpState {
 pub enum OpError {
     Loader(LoaderError),
     Session(SessionError),
+    Authenticated(AuthenticatedLaunchError),
     /// Already localized.
     Message(String),
 }
@@ -123,6 +125,12 @@ impl From<LoaderError> for OpError {
 impl From<SessionError> for OpError {
     fn from(e: SessionError) -> Self {
         OpError::Session(e)
+    }
+}
+
+impl From<AuthenticatedLaunchError> for OpError {
+    fn from(error: AuthenticatedLaunchError) -> Self {
+        Self::Authenticated(error)
     }
 }
 
@@ -183,6 +191,10 @@ impl OpError {
         match self {
             OpError::Loader(LoaderError::Busy(busy)) => busy_message(&busy.what, name_of),
             OpError::Session(SessionError::Busy(busy)) => busy_message(&busy.what, name_of),
+            OpError::Authenticated(AuthenticatedLaunchError::Session(SessionError::Busy(busy))) => {
+                busy_message(&busy.what, name_of)
+            }
+            OpError::Authenticated(e) => e.to_string(),
             OpError::Loader(e) => e.to_string(),
             OpError::Session(e) => e.to_string(),
             OpError::Message(m) => m.clone(),
@@ -192,9 +204,15 @@ impl OpError {
     /// The fix to offer for this error, if one applies.
     pub fn fix(&self) -> Option<OpFix> {
         match self {
+            OpError::Authenticated(AuthenticatedLaunchError::Auth(
+                AuthError::ReauthenticationRequired | AuthError::CredentialMissing,
+            )) => Some(OpFix::AddAccount),
             OpError::Session(SessionError::Prepare(PrepareError::LoaderNeedsReinstall {
                 ..
-            })) => Some(OpFix::ReinstallLoader),
+            }))
+            | OpError::Authenticated(AuthenticatedLaunchError::Session(SessionError::Prepare(
+                PrepareError::LoaderNeedsReinstall { .. },
+            ))) => Some(OpFix::ReinstallLoader),
             _ => None,
         }
     }
@@ -205,6 +223,9 @@ impl OpError {
         matches!(
             self,
             OpError::Session(SessionError::Busy(_) | SessionError::AlreadyRunning(_))
+                | OpError::Authenticated(AuthenticatedLaunchError::Session(
+                    SessionError::Busy(_) | SessionError::AlreadyRunning(_)
+                ))
         )
     }
 }
@@ -214,6 +235,30 @@ mod tests {
     use patina_core::locks::Busy;
 
     use super::*;
+
+    #[test]
+    fn authenticated_errors_keep_recovery_classification() {
+        use patina_core::accounts::{AuthenticatedLaunchError, error::AuthError};
+        let error = OpError::from(AuthenticatedLaunchError::Auth(AuthError::SessionExpired));
+        assert_eq!(error.fix(), None);
+        assert!(!error.may_be_running());
+        let error = OpError::from(AuthenticatedLaunchError::Auth(
+            AuthError::ReauthenticationRequired,
+        ));
+        assert_eq!(error.fix(), Some(OpFix::AddAccount));
+        let error = OpError::from(AuthenticatedLaunchError::Session(SessionError::Busy(
+            Busy {
+                what: BusyKind::Instance("test".into()),
+            },
+        )));
+        assert!(error.may_be_running());
+        let error = OpError::from(AuthenticatedLaunchError::Session(SessionError::Io {
+            path: "fixture".into(),
+            error: "SESSION_SECRET_SENTINEL".into(),
+        }));
+        assert!(!error.message(|_| None).contains("SESSION_SECRET_SENTINEL"));
+        assert!(!format!("{error:?}").contains("SESSION_SECRET_SENTINEL"));
+    }
 
     #[test]
     fn instance_errors_name_busy_instances_by_display_name() {

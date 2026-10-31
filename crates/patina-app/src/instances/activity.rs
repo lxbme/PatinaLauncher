@@ -52,6 +52,8 @@ struct LaunchFlow {
     token: u64,
     /// Prepared, waiting for the pre-launch warnings to be answered.
     pending: Option<PendingLaunch>,
+    grant: Option<patina_core::accounts::LaunchGrant>,
+    _cancel: tokio::sync::watch::Sender<bool>,
     _task: Task<()>,
 }
 

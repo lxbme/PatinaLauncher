@@ -1,5 +1,4 @@
-//! Retained, bounded heads. Task7 installs this owner and drives it from the
-//! single AccountService snapshot stream; rendering never starts IO.
+//! Retained, bounded heads driven by the single account service subscription.
 use crate::core_bridge::run;
 use gpui_kit::{App, Context, Entity, Global, RenderImage, Task};
 use image::{DynamicImage, ImageDecoder, Limits, codecs::png::PngDecoder};
@@ -72,10 +71,10 @@ struct HeadEntry {
     image: Arc<RenderImage>,
     bytes: usize,
 }
-pub(super) struct AvatarImages(pub(super) Entity<AvatarCache>);
+pub(crate) struct AvatarImages(pub(crate) Entity<AvatarCache>);
 impl Global for AvatarImages {}
 
-pub(super) struct AvatarCache {
+pub(crate) struct AvatarCache {
     revision: Option<u64>,
     allowed: HashMap<String, Account>,
     entries: HashMap<String, HeadEntry>,
@@ -85,11 +84,8 @@ pub(super) struct AvatarCache {
     // their own service-owned admission even when this pipeline is aborted.
     loads: Arc<tokio::sync::Semaphore>,
 }
-// Task7's single-owner migration calls new/reconcile/load. Do not instantiate
-// another AccountService here just to consume these lifecycle methods early.
 impl AvatarCache {
-    #[allow(dead_code)] // Task7 installs the retained owner.
-    pub(super) fn new(cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         cx.on_release(|this, cx| this.clear(cx)).detach();
         Self {
             revision: None,
@@ -102,8 +98,7 @@ impl AvatarCache {
     }
     /// Coalesced watch values are revisions, not a count of wakeups. A repeated
     /// snapshot does not reread files, decode again, or allocate new image IDs.
-    #[allow(dead_code)] // Task7 snapshot consumer.
-    pub(super) fn reconcile(
+    pub(crate) fn reconcile(
         &mut self,
         revision: u64,
         accounts: &[Account],
@@ -131,8 +126,7 @@ impl AvatarCache {
         }
         cx.notify();
     }
-    #[allow(dead_code)] // Task7 snapshot-driven loader.
-    pub(super) fn load(
+    pub(crate) fn load(
         &mut self,
         account: &Account,
         service: AccountService,
@@ -225,7 +219,7 @@ impl AvatarCache {
         self.bytes += bytes;
         cx.notify();
     }
-    pub(super) fn image(&self, account: &Account) -> Option<Arc<RenderImage>> {
+    pub(crate) fn image(&self, account: &Account) -> Option<Arc<RenderImage>> {
         self.entries
             .get(&account.id)
             .filter(|entry| entry.account == *account)
@@ -249,7 +243,17 @@ impl AvatarCache {
     }
 }
 
-pub(super) fn cached_image(account: &Account, cx: &App) -> Option<Arc<RenderImage>> {
+pub(crate) fn install(cx: &mut App) -> Entity<AvatarCache> {
+    use gpui_kit::AppContext;
+    if let Some(images) = cx.try_global::<AvatarImages>() {
+        return images.0.clone();
+    }
+    let cache = cx.new(AvatarCache::new);
+    cx.set_global(AvatarImages(cache.clone()));
+    cache
+}
+
+pub(crate) fn cached_image(account: &Account, cx: &App) -> Option<Arc<RenderImage>> {
     cx.try_global::<AvatarImages>()?.0.read(cx).image(account)
 }
 

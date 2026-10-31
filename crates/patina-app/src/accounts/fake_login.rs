@@ -1,7 +1,5 @@
-//! A stand-in Microsoft sign-in for development builds only (`dev-offline`),
-//! so the device-code dialog can be walked through before plan 3 brings the
-//! real flow. It never reaches the network and the dialog adds nothing when
-//! it finishes. Release builds do not contain this file.
+//! Explicit development fixture for dialog interaction tests. Runtime defaults
+//! always use AccountService; this fake never persists an account or proof.
 
 #![cfg(feature = "dev-offline")]
 

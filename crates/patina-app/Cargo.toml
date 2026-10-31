@@ -15,7 +15,7 @@ dev-offline = ["patina-core/dev-offline"]
 # Test doubles (`core_bridge::testing`) for this crate's integration tests,
 # with the offline core's client (hence `reqwest`). Never enabled by a
 # release build.
-test-support = ["dep:reqwest"]
+test-support = ["dep:reqwest", "patina-core/test-support"]
 # Builds the real end-to-end suite (`tests/e2e_real.rs`, network and a real
 # Minecraft), so a plain `cargo test -- --ignored` cannot run it by accident.
 e2e = ["dev-offline", "test-support"]

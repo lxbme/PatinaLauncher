@@ -6,9 +6,7 @@ use std::rc::Rc;
 use futures::FutureExt as _;
 use gpui_kit::{Context, Task};
 use patina_core::instance::Instance;
-use patina_core::launch::{
-    GameSession, LaunchAccount, PendingLaunch, Reattach, SessionExit, SessionWarning,
-};
+use patina_core::launch::{GameSession, PendingLaunch, Reattach, SessionExit, SessionWarning};
 use rust_i18n::t;
 
 use super::{ActivityEvent, Entry, InstanceActivity, LaunchFlow, OnFail, Track};
@@ -53,10 +51,9 @@ impl InstanceActivity {
         self.ops.remove(id);
         let token = self.next_token();
         let core = Core::global(cx);
-        let (backend, store) = (core.launch_backend.clone(), core.store.clone());
-        let account = Core::with_accounts(cx, move |accounts| {
-            resolve_account(backend.as_ref(), accounts)
-        });
+        let (service, store) = (core.accounts(), core.store.clone());
+        let (cancel, token_cancel) = tokio::sync::watch::channel(false);
+        let account = run(cx, resolve_account(service, token_cancel));
         // The instance as it is on disk now, not as last listed.
         let instance = {
             let id = id.to_string();
@@ -76,6 +73,8 @@ impl InstanceActivity {
             LaunchFlow {
                 token,
                 pending: None,
+                grant: None,
+                _cancel: cancel,
                 _task: task,
             },
         );
@@ -133,7 +132,7 @@ impl InstanceActivity {
         &mut self,
         id: &str,
         token: u64,
-        account: Result<Result<LaunchAccount, AccountIssue>, BridgeError>,
+        account: Result<Result<patina_core::accounts::LaunchGrant, AccountIssue>, BridgeError>,
         instance: Result<Result<Instance, patina_core::instance::InstanceError>, BridgeError>,
         cx: &mut Context<Self>,
     ) {
@@ -153,13 +152,15 @@ impl InstanceActivity {
             Ok(Err(e)) => return self.fail_launch(id, token, e.to_string(), None, cx),
             Err(e) => return self.fail_launch(id, token, e.to_string(), None, cx),
         };
+        let identity = account.account().clone();
+        self.flows.get_mut(id).expect("current launch flow").grant = Some(account);
         let backend = Core::global(cx).launch_backend.clone();
         let key = id.to_string();
         let started = self.start_op_with(
             id,
             OpKind::Launch,
             move |progress| {
-                let prepare = backend.prepare(instance, account, progress);
+                let prepare = backend.prepare(instance, identity, progress);
                 async move { prepare.await.map_err(OpError::Session) }.boxed()
             },
             {
@@ -235,12 +236,22 @@ impl InstanceActivity {
     }
 
     fn spawn_game(&mut self, id: &str, token: u64, pending: PendingLaunch, cx: &mut Context<Self>) {
+        let Some(grant) = self.flows.get_mut(id).and_then(|flow| flow.grant.take()) else {
+            return;
+        };
+        let service = Core::global(cx).accounts();
         let key = id.to_string();
         let started = self.start_op_with(
             id,
             OpKind::Launch,
             move |progress| {
-                async move { pending.launch(progress).await.map_err(OpError::Session) }.boxed()
+                async move {
+                    service
+                        .launch_pending(grant, pending, progress)
+                        .await
+                        .map_err(OpError::from)
+                }
+                .boxed()
             },
             {
                 let key = key.clone();

@@ -477,3 +477,74 @@ impl VersionOps for FakeVersionOps {
         self.answer(OpCall::RemoveLoader { id: id.clone() }, &id)
     }
 }
+
+/// An isolated real account service. Every auth/skin endpoint is loopback-only,
+/// and credentials use a fake backend plus files below the supplied fixture root.
+pub fn isolated_accounts(
+    data: DataDirs,
+) -> Result<patina_core::accounts::AccountService, patina_core::accounts::error::AuthError> {
+    use patina_core::accounts::{
+        AccountService,
+        error::AuthStage,
+        testing::{AuthClock, AuthHttp, MemoryCredentials, MsaClient, credential_store},
+    };
+    struct Clock;
+    impl AuthClock for Clock {
+        fn unix_seconds(&self) -> u64 {
+            1_800_000_000
+        }
+    }
+    let stages = [
+        AuthStage::DeviceCode,
+        AuthStage::MicrosoftToken,
+        AuthStage::XboxLive,
+        AuthStage::Xsts,
+        AuthStage::MinecraftToken,
+        AuthStage::Entitlement,
+        AuthStage::Profile,
+    ];
+    let http = AuthHttp::for_test(std::array::from_fn(|i| {
+        (stages[i], format!("http://127.0.0.1:1/{i}"))
+    }))?;
+    let clock = Arc::new(Clock);
+    let keyring = Arc::new(MemoryCredentials::default());
+    keyring.set_error(Some(
+        patina_core::accounts::testing::CredentialError::Unavailable,
+    ));
+    let mut service = AccountService::for_test(
+        data.clone(),
+        MsaClient::for_test(http, clock.clone()),
+        credential_store(data, keyring),
+        clock,
+    );
+    service.set_skin_endpoint_for_test("http://127.0.0.1:1")?;
+    Ok(service)
+}
+
+/// Injects one real account service for both GUI login and account operations.
+pub fn core_with_accounts(
+    rt: Handle,
+    data: DataDirs,
+    catalog: Arc<dyn Catalog>,
+    accounts: Arc<patina_core::accounts::AccountService>,
+) -> Core {
+    Core::start(
+        rt,
+        data,
+        Fakes {
+            catalog: Some(catalog),
+            accounts: Some(accounts),
+            ..Fakes::default()
+        },
+        Startup::Offline,
+    )
+    .expect("the test core starts")
+}
+
+/// Reads the actual retained raster for headless rendering/atlas assertions.
+pub fn cached_avatar(
+    account: &patina_core::accounts::Account,
+    cx: &gpui_kit::App,
+) -> Option<Arc<gpui_kit::RenderImage>> {
+    crate::accounts::avatar::cached_image(account, cx)
+}

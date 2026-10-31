@@ -36,8 +36,8 @@ use rust_i18n::t;
 use crate::settings::SettingsStore;
 use crate::shell::RootView;
 
-// Offline accounts exist only for development (`cargo app`); a build without
-// the feature must not get them from patina-core through feature unification.
+// The developer bypass must never leak through feature unification; entitled
+// production offline accounts are available without this feature.
 #[cfg(not(feature = "dev-offline"))]
 const _: () = assert!(!patina_core::DEV_OFFLINE);
 
@@ -64,6 +64,7 @@ pub fn init(settings: SettingsStore, cx: &mut App) {
     core_bridge::ConfigChanged::init(cx);
     if cx.has_global::<core_bridge::Core>() {
         core_bridge::ConfigChanged::follow_core(cx);
+        core_bridge::AccountsChanged::follow_core(cx);
     }
     cx.on_app_quit(|cx| {
         SettingsStore::flush(cx);

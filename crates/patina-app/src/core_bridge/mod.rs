@@ -8,11 +8,11 @@
 //!   [`Task`](gpui_kit::Task) with the result (or [`BridgeError`]), and
 //!   dropping that task cancels the work if it has not started (or, for
 //!   async work, at its next await);
-//! - the config and the accounts are reached through [`Core::read_config`],
-//!   [`Core::update_config`] and [`Core::with_accounts`]; the accounts change
-//!   only through [`Core::update_accounts`] and [`Core::reload_accounts`],
-//!   which then call [`AccountsChanged::bump`] so views re-read them;
-//!   config changes and speed tests signal [`ConfigChanged`] likewise;
+//! - config reads/writes use [`Core::read_config`] and [`Core::update_config`];
+//!   account reads use [`Core::read_accounts`] and named asynchronous service
+//!   operations, never mutable-store callbacks. [`AccountsChanged::follow_core`]
+//!   subscribes once to committed service revisions. Config changes and speed
+//!   tests signal [`ConfigChanged`];
 //! - a stream of progress reaches a view through [`forward_progress`], at most
 //!   about 30 times a second;
 //! - launches are prepared through `Core.launch_backend` ([`LaunchBackend`]),
@@ -38,8 +38,8 @@ pub use accounts_changed::{AccountsChanged, AccountsEpoch};
 pub use config_changed::{ConfigChanged, ConfigEpoch};
 pub use launch::LaunchBackend;
 pub use service::{
-    Catalog, ConfigSaveError, ConfigSaved, Core, DetectJava, InitError, LoadError, LoadedAccounts,
-    LoadedConfig, ProbeJava, SpeedTested, config_reason,
+    Catalog, ConfigSaveError, ConfigSaved, Core, DetectJava, InitError, LoadError, LoadedConfig,
+    ProbeJava, SpeedTested, config_reason,
 };
 pub use speed::{MirrorProbe, SpeedTest, SpeedTestResult, latency_text, mirror_name};
 pub use task::{
