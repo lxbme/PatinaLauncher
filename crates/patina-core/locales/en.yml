@@ -81,6 +81,14 @@ errors:
     msa_unavailable: "Microsoft sign-in is not available yet"
     io: "File operation failed (%{path}): %{error}"
     parse: "Invalid accounts file format: %{error}"
+  online:
+    unavailable: "Online content is not available yet"
+    network: "Online content request failed: %{error}"
+  login:
+    unavailable: "Microsoft sign-in is not available yet"
+    expired: "The sign-in code expired"
+    cancelled: "Sign-in cancelled"
+    other: "Sign-in failed: %{error}"
   jvm:
     memory_flag: "Extra JVM arguments must not contain the memory argument \"%{flag}\"; use the memory settings to change the heap size"
     version_flag: "Extra JVM arguments must not contain a -version: argument; choose the Java version in the Java settings"

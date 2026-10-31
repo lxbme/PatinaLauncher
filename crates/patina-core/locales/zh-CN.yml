@@ -81,6 +81,14 @@ errors:
     msa_unavailable: "微软账号登录暂不可用"
     io: "文件操作失败（%{path}）：%{error}"
     parse: "账号文件格式无效：%{error}"
+  online:
+    unavailable: "在线内容暂不可用"
+    network: "在线内容请求失败：%{error}"
+  login:
+    unavailable: "微软账号登录暂不可用"
+    expired: "登录代码已过期"
+    cancelled: "已取消登录"
+    other: "登录失败：%{error}"
   jvm:
     memory_flag: "额外 JVM 参数中不能包含内存参数“%{flag}”，请使用内存设置来调整内存大小"
     version_flag: "额外 JVM 参数中不能包含 -version: 参数，Java 版本请在 Java 设置中选择"

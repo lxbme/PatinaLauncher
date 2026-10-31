@@ -6,6 +6,7 @@
 pub mod index;
 pub mod mods;
 mod nbt;
+pub mod online;
 pub mod packs;
 pub mod saves;
 
