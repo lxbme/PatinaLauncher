@@ -15,7 +15,9 @@ use crate::config::GlobalConfig;
 use crate::instance::Instance;
 use crate::launch::log::{Log4jXmlParser, LogLine, Stream, truncate_with_ellipsis};
 use crate::launch::running::{
-    CURRENT_LOG, RUNNING_FILE, RunningRecord, clear_record, read_record, verify, write_record,
+    CURRENT_LOG, RUNNING_FILE, RunningInfo, RunningRecord, clear_record, clear_stop_request,
+    read_record, read_stop_request, stop_request_path, verified_record, verify, write_record,
+    write_stop_request,
 };
 use crate::launch::{LaunchAccount, LaunchCommand};
 use crate::locks::{Busy, InstanceGuard, Locks, VersionShared};
@@ -119,10 +121,37 @@ pub struct KillHandle {
     killed: Arc<AtomicBool>,
     /// The session's state (`RUNNING` / `EXITED` / `ABANDONED`).
     state: Arc<AtomicU8>,
+    /// Where the stop request marker goes (see
+    /// [`STOP_REQUEST`](super::running::STOP_REQUEST)).
+    stop_marker: PathBuf,
+    /// Built from the running record by a process that does not own the
+    /// game ([`KillHandle::for_running`]).
+    external: bool,
     signals: Signals,
 }
 
 impl KillHandle {
+    /// A handle for the game of `inst` that runs right now, wherever its
+    /// session is held (this process, another Patina process, or nowhere):
+    /// built from the verified running record, takes no lock. `None` when no
+    /// game of `inst` runs.
+    ///
+    /// Unlike a session's own handle, it never signals the group of a game
+    /// whose leader already exited: only the owner, which knows the leader
+    /// is not yet reaped, may do that.
+    pub fn for_running(inst: &Instance) -> Option<KillHandle> {
+        let rec = verified_record(inst)?;
+        Some(KillHandle {
+            pid: rec.pid,
+            token: Some(rec.start_time),
+            killed: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(AtomicU8::new(RUNNING)),
+            stop_marker: stop_request_path(inst),
+            external: true,
+            signals: Signals::REAL,
+        })
+    }
+
     /// SIGTERM to the game's process group, SIGKILL after a grace period.
     /// A pid that no longer carries the game's identity is left alone.
     pub async fn kill(&self) -> io::Result<()> {
@@ -135,7 +164,10 @@ impl KillHandle {
     /// Blocking form of [`KillHandle::kill`]. The session is marked as
     /// user-killed before signalling, so `wait` seeing the exit can never
     /// miss it, and unmarked again if the kill failed before SIGKILL was
-    /// delivered.
+    /// delivered. The same goes for the stop request marker (see
+    /// [`STOP_REQUEST`](super::running::STOP_REQUEST)), which tells a
+    /// launcher in another process that holds the session that this exit
+    /// was a stop, not a crash.
     ///
     /// When the game's leader already exited but is not yet reaped (a zombie
     /// with the game's start token), members it left in its process group
@@ -153,9 +185,18 @@ impl KillHandle {
         match platform::proc_info(self.pid) {
             Some(info) if info.start_time == token => {
                 self.killed.store(true, Ordering::SeqCst);
+                if let Err(e) = write_stop_request(&self.stop_marker, self.pid) {
+                    // Still stop the game; only another process's view of
+                    // the exit suffers.
+                    tracing::warn!(
+                        "cannot write stop request {}: {e}",
+                        self.stop_marker.display()
+                    );
+                }
                 if let Err(f) = (self.signals.kill_pid)(self.pid) {
                     if !f.sigkill_delivered {
                         self.killed.store(false, Ordering::SeqCst);
+                        clear_stop_request(&self.stop_marker);
                     }
                     return Err(f.error);
                 }
@@ -163,13 +204,48 @@ impl KillHandle {
             }
             // The pid now names another process.
             Some(_) => Ok(()),
-            None if platform::is_zombie_with_start(self.pid, token) => {
+            // The leader already exited on its own, so its exit status is
+            // final: no stop request, which could hide a crash. Only the
+            // owner knows the leader is still unreaped (its group id still
+            // reserved); a zombie seen from outside may be reaped any moment.
+            None if !self.external && platform::is_zombie_with_start(self.pid, token) => {
                 (self.signals.kill_group)(self.pid)
             }
             None => {
                 tracing::debug!("game {} is gone; not signalling its group", self.pid);
                 Ok(())
             }
+        }
+    }
+}
+
+/// What [`GameSession::reattach`] found.
+// A short-lived return value that is matched at once; boxing the session
+// would only add an indirection to every caller.
+#[allow(clippy::large_enum_variant)]
+pub enum Reattach {
+    Attached(GameSession),
+    /// The game runs, but its session is held by someone else.
+    HeldElsewhere(RunningInfo),
+    NotRunning,
+}
+
+impl std::fmt::Debug for Reattach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reattach::Attached(s) => f.debug_tuple("Attached").field(&s.pid).finish(),
+            Reattach::HeldElsewhere(info) => f.debug_tuple("HeldElsewhere").field(info).finish(),
+            Reattach::NotRunning => f.write_str("NotRunning"),
+        }
+    }
+}
+
+impl Reattach {
+    /// The attached session, if any (a test and CLI convenience).
+    pub fn attached(self) -> Option<GameSession> {
+        match self {
+            Reattach::Attached(s) => Some(s),
+            _ => None,
         }
     }
 }
@@ -271,6 +347,8 @@ impl PendingLaunch {
     fn spawn_now(self) -> Result<GameSession, SessionError> {
         // Someone else may have started the game while the caller waited.
         refuse_if_running(&self.inst)?;
+        // Left over from an earlier game; it must not excuse this one's exit.
+        clear_stop_request(&stop_request_path(&self.inst));
         let PendingLaunch {
             inst,
             cmd,
@@ -463,33 +541,48 @@ impl GameSession {
     }
 
     /// Picks up a game this launcher started earlier and that still runs.
-    /// Tails the log from its beginning. `None` when there is no verified
-    /// running game, or this process already holds the instance.
+    /// Tails the log from its beginning.
+    ///
+    /// - [`Reattach::Attached`]: this call now holds the game's session.
+    /// - [`Reattach::HeldElsewhere`]: the game runs, but another session
+    ///   holds the instance (in this or another Patina process), or its
+    ///   version is locked; the record is kept. Use
+    ///   [`KillHandle::for_running`] to stop it and read [`CURRENT_LOG`] for
+    ///   its output.
+    /// - [`Reattach::NotRunning`]: no verified game; a stale record is
+    ///   cleared when this call could take the instance lock.
     ///
     /// Must be called within a Tokio runtime. The data dir (for the version
     /// lock) is derived from the `<data>/instances/<id>` layout of `inst.dir`.
-    pub fn reattach(inst: &Instance) -> Option<GameSession> {
-        let rec = read_record(inst)?;
+    pub fn reattach(inst: &Instance) -> Reattach {
+        let Some(rec) = read_record(inst) else {
+            return Reattach::NotRunning;
+        };
         if rec.instance_id != inst.id {
             // A copied instance directory brings a foreign record along.
             tracing::warn!("clearing a running record that names another instance");
             clear_record(inst);
-            return None;
+            return Reattach::NotRunning;
         }
         let instance_lock = match lock_instance(inst) {
             Ok(l) => l,
-            Err(_) => return None, // already attached or busy here: keep the record
+            // Someone else holds the instance: report, never clear, the record.
+            Err(_) if verify(&rec) => return Reattach::HeldElsewhere(RunningInfo::from(&rec)),
+            Err(_) => return Reattach::NotRunning,
         };
         if !verify(&rec) {
             clear_record(inst);
-            return None;
+            return Reattach::NotRunning;
         }
-        let data = DataDirs::new(inst.dir.parent()?.parent()?.to_path_buf());
+        let Some(data_dir) = inst.dir.parent().and_then(Path::parent) else {
+            return Reattach::NotRunning;
+        };
+        let data = DataDirs::new(data_dir.to_path_buf());
         let version_lock = match data.lock_version_shared(version_id(inst)) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("cannot reattach to {}: {e}", inst.id);
-                return None;
+                return Reattach::HeldElsewhere(RunningInfo::from(&rec));
             }
         };
         let mut s = Self::assemble(
@@ -502,7 +595,7 @@ impl GameSession {
             version_lock,
         );
         s.start_tailer();
-        Some(s)
+        Reattach::Attached(s)
     }
 
     pub fn pid(&self) -> u32 {
@@ -527,6 +620,8 @@ impl GameSession {
             token: self.token,
             killed: self.killed.clone(),
             state: self.state.clone(),
+            stop_marker: stop_request_path(&self.inst),
+            external: false,
             signals: Signals::REAL,
         }
     }
@@ -572,16 +667,21 @@ impl GameSession {
         }
         self.state.store(EXITED, Ordering::SeqCst);
         let killed = self.killed.load(Ordering::SeqCst);
-        // A game the user stopped exits non-zero by design.
+        // A game the user stopped exits non-zero by design, also when the
+        // stop came from another launcher process (its stop request names
+        // this game's pid), even if that escalated to SIGKILL.
         // Death by signal (SIGABRT, SIGSEGV, OOM kill) has no exit code but is a crash.
         let bad_code = failed && !killed;
         // Directory scans, a 64 KiB read and a rename: off the async workers.
         // The locks (held by `self`) are released only after this finished.
-        let (inst, started_at) = (self.inst.clone(), self.started_at);
+        let (inst, started_at, pid) = (self.inst.clone(), self.started_at, self.pid);
         let finish = tokio::task::spawn_blocking(move || {
-            let crashed = bad_code || crash_evidence(&inst, started_at);
+            let marker = stop_request_path(&inst);
+            let stop_requested = read_stop_request(&marker) == Some(pid);
+            let crashed = (bad_code && !stop_requested) || crash_evidence(&inst, started_at);
             let saved_log = crashed.then(|| save_log(&inst)).flatten();
             clear_record(&inst);
+            clear_stop_request(&marker);
             (crashed, saved_log)
         })
         .await;
@@ -777,7 +877,7 @@ fn format_utc_compact(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::instance::InstanceStore;
-    use crate::launch::running::read_record;
+    use crate::launch::running::{STOP_REQUEST, read_record};
     use crate::locks::BusyKind;
     use std::time::{Duration, Instant};
 
@@ -842,6 +942,201 @@ mod tests {
         }
     }
 
+    fn marker(e: &Env) -> PathBuf {
+        e.inst.dir.join(STOP_REQUEST)
+    }
+
+    thread_local! {
+        /// `(marker path, its content when the signal went out)`.
+        static MARKER_AT_SIGNAL: std::cell::RefCell<Option<(PathBuf, Option<String>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Another launcher process's force stop, already escalated: SIGKILL
+    /// straight away to the game's process group. Only ever reached through
+    /// `kill_blocking`, which checks the pid still carries the identity of
+    /// the test's own game (a detached group leader, so the group is the
+    /// test's own too).
+    fn external_sigkill(pid: u32) -> Result<(), platform::KillFailure> {
+        MARKER_AT_SIGNAL.with(|m| {
+            if let Some((path, seen)) = m.borrow_mut().as_mut() {
+                *seen = std::fs::read_to_string(path).ok();
+            }
+        });
+        let st = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status()
+            .map_err(|error| platform::KillFailure {
+                error,
+                sigkill_delivered: false,
+            })?;
+        assert!(st.success());
+        Ok(())
+    }
+
+    fn no_group(_: u32) -> io::Result<()> {
+        panic!("the game's group must not be signalled here");
+    }
+
+    #[tokio::test]
+    async fn stop_request_marks_external_kill_as_stop() {
+        let e = env("i1");
+        // `sleep 60 & wait`, not `exec sleep 60`: the shell must stay the
+        // group leader carrying the `-Dpatina.instance=` marker `verify` needs.
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "sleep 60 & wait"))
+            .unwrap();
+        let _k = Killer(s.killer());
+        let pid = s.pid();
+        // Another process's handle: built from the record, it shares no
+        // flags with the session.
+        let mut other = KillHandle::for_running(&e.inst).expect("the game runs");
+        assert!(other.external);
+        assert_eq!((other.pid, other.token), (pid, s.token));
+        assert_eq!(other.stop_marker, marker(&e));
+        other.signals = Signals {
+            kill_pid: external_sigkill,
+            kill_group: no_group,
+        };
+        MARKER_AT_SIGNAL.with(|m| *m.borrow_mut() = Some((marker(&e), None)));
+        other.kill_blocking().unwrap();
+        let seen = MARKER_AT_SIGNAL.with(|m| m.borrow_mut().take()).unwrap().1;
+        assert_eq!(
+            seen,
+            Some(pid.to_string()),
+            "marker written before the signal"
+        );
+        let exit = s.wait().await;
+        assert_eq!(exit.code, None, "killed by SIGKILL");
+        assert!(!exit.crashed, "a requested stop is not a crash");
+        assert_eq!(exit.saved_log, None);
+        assert!(!marker(&e).exists(), "wait clears the marker");
+    }
+
+    #[tokio::test]
+    async fn stop_request_for_another_pid_is_ignored() {
+        let e = env("i1");
+        let go = e.inst.dir.join("go");
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; kill -KILL $$",
+            go.display()
+        );
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", &script)).unwrap();
+        let _k = Killer(s.killer());
+        let stale = s.pid().wrapping_add(1).to_string();
+        crate::fsutil::write_atomic(&marker(&e), stale.as_bytes()).unwrap();
+        std::fs::write(&go, "").unwrap();
+        let exit = s.wait().await;
+        assert_eq!(exit.code, None);
+        assert!(exit.crashed, "SIGKILL without a matching stop request");
+        assert!(!marker(&e).exists());
+    }
+
+    #[tokio::test]
+    async fn stale_stop_request_is_cleared_on_launch() {
+        let e = env("i1");
+        crate::fsutil::write_atomic(&marker(&e), b"12345").unwrap();
+        let pending =
+            GameSession::prepare_launch_with_command(&e.inst, sh("i1", "exit 0"), Vec::new())
+                .unwrap();
+        assert!(marker(&e).exists(), "preparing changes nothing yet");
+        let s = pending.launch(None).await.unwrap();
+        assert!(!marker(&e).exists());
+        s.wait().await;
+    }
+
+    #[tokio::test]
+    async fn refused_launch_keeps_the_running_games_stop_request() {
+        let e = env("i1");
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "sleep 60 & wait"))
+            .unwrap();
+        let _k = Killer(s.killer());
+        drop(s);
+        crate::fsutil::write_atomic(&marker(&e), b"1").unwrap();
+        let r = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "exit 0"));
+        assert!(matches!(r, Err(SessionError::AlreadyRunning(_))));
+        assert!(marker(&e).exists());
+    }
+
+    /// A verified game whose instance lock is held through another open file
+    /// of the lock file, as another Patina process would hold it.
+    #[tokio::test]
+    async fn reattach_reports_a_game_held_elsewhere() {
+        use std::fs::File;
+        let e = env("i1");
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "sleep 60 & wait"))
+            .unwrap();
+        let _k = Killer(s.killer());
+        let pid = s.pid();
+        drop(s);
+        let other = File::options()
+            .read(true)
+            .write(true)
+            .open(e.inst.dir.join(crate::locks::LOCK_FILE))
+            .unwrap();
+        // The session just released it; a concurrent spawn may still share it.
+        crate::locks::test_lock(&other, false).unwrap();
+        match GameSession::reattach(&e.inst) {
+            Reattach::HeldElsewhere(info) => assert_eq!(info.pid, pid),
+            r => panic!("expected HeldElsewhere, got {r:?}"),
+        }
+        assert!(read_record(&e.inst).is_some(), "the record is kept");
+        assert_eq!(
+            crate::launch::running::running_game(&e.inst).map(|i| i.pid),
+            Some(pid)
+        );
+        drop(other);
+        let s = GameSession::reattach(&e.inst)
+            .attached()
+            .expect("attached once the other holder is gone");
+        assert_eq!(s.pid(), pid);
+        s.kill().await.unwrap();
+        assert!(!s.wait().await.crashed);
+    }
+
+    #[tokio::test]
+    async fn for_running_needs_a_verified_game() {
+        let e = env("i1");
+        assert!(KillHandle::for_running(&e.inst).is_none());
+        let rec = RunningRecord {
+            pid: 1,
+            start_time: 1,
+            instance_id: "i1".into(),
+            started_at: 0,
+            log: CURRENT_LOG.into(),
+        };
+        write_record(&e.inst, &rec).unwrap();
+        assert!(KillHandle::for_running(&e.inst).is_none());
+        assert_eq!(read_record(&e.inst), Some(rec), "not cleared");
+    }
+
+    /// An external handle never signals the group of a leader that already
+    /// exited, even while it is an unreaped zombie. Signals are recorded,
+    /// not sent.
+    #[tokio::test]
+    async fn external_handle_never_signals_the_group() {
+        let e = env("i1");
+        let go = e.inst.dir.join("go");
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; sleep 60 & exit 0",
+            go.display()
+        );
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", &script)).unwrap();
+        let (pid, token) = (s.pid(), s.token.unwrap());
+        let owner = s.killer();
+        let mut other = KillHandle::for_running(&e.inst).expect("the game runs");
+        other.signals = recording(None);
+        std::fs::write(&go, "").unwrap();
+        poll_zombie(pid, token).await;
+        SENT.with(|s| s.borrow_mut().clear());
+        other.kill_blocking().unwrap();
+        assert_eq!(sent(), [], "only the owner may signal the group");
+        assert!(!marker(&e).exists());
+        // The owner cleans up the test's own leftover group member.
+        owner.kill().await.unwrap();
+        assert!(group_gone(pid).await);
+        s.wait().await;
+    }
+
     #[test]
     fn pending_launch_is_send() {
         fn assert_send<T: Send>() {}
@@ -890,8 +1185,8 @@ mod tests {
     #[tokio::test]
     async fn pending_launch_refuses_a_running_instance() {
         let e = env("i1");
-        let s =
-            GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "exec sleep 60")).unwrap();
+        let s = GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "sleep 60 & wait"))
+            .unwrap();
         let _k = Killer(s.killer());
         drop(s);
         assert!(matches!(
@@ -1115,10 +1410,13 @@ mod tests {
         drop(s);
         assert!(read_record(&e.inst).is_some());
 
-        let mut s = GameSession::reattach(&e.inst).expect("reattach");
+        let mut s = GameSession::reattach(&e.inst).attached().expect("reattach");
         assert_eq!(s.pid(), pid);
         // Already attached in this process now.
-        assert!(GameSession::reattach(&e.inst).is_none());
+        assert!(matches!(
+            GameSession::reattach(&e.inst),
+            Reattach::HeldElsewhere(RunningInfo { pid: p, .. }) if p == pid
+        ));
         assert!(read_record(&e.inst).is_some());
         let mut rx = s.logs();
         let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -1147,7 +1445,10 @@ mod tests {
             log: CURRENT_LOG.into(),
         };
         crate::launch::running::write_record(&e.inst, &rec).unwrap();
-        assert!(GameSession::reattach(&e.inst).is_none());
+        assert!(matches!(
+            GameSession::reattach(&e.inst),
+            Reattach::NotRunning
+        ));
         assert!(read_record(&e.inst).is_none());
 
         let other = RunningRecord {
@@ -1155,7 +1456,10 @@ mod tests {
             ..rec
         };
         crate::launch::running::write_record(&e.inst, &other).unwrap();
-        assert!(GameSession::reattach(&e.inst).is_none());
+        assert!(matches!(
+            GameSession::reattach(&e.inst),
+            Reattach::NotRunning
+        ));
     }
 
     #[tokio::test]
@@ -1221,12 +1525,20 @@ mod tests {
         }
     }
 
-    fn handle(pid: u32, token: Option<u64>, state: u8, signals: Signals) -> KillHandle {
+    fn handle(
+        pid: u32,
+        token: Option<u64>,
+        state: u8,
+        stop_marker: &Path,
+        signals: Signals,
+    ) -> KillHandle {
         KillHandle {
             pid,
             token,
             killed: Arc::new(AtomicBool::new(false)),
             state: Arc::new(AtomicU8::new(state)),
+            stop_marker: stop_marker.to_path_buf(),
+            external: false,
             signals,
         }
     }
@@ -1280,6 +1592,8 @@ mod tests {
         );
         killer.kill().await.unwrap();
         assert!(group_gone(pid).await, "group members survived the kill");
+        // The leader had already exited on its own: no stop request for it.
+        assert!(!marker(&e).exists());
         s.wait().await;
     }
 
@@ -1294,10 +1608,11 @@ mod tests {
         s.wait().await; // reaps the leader
         assert!(!platform::process_group_members(pid).is_empty());
         SENT.with(|s| s.borrow_mut().clear());
-        handle(pid, Some(token), RUNNING, recording(None))
+        handle(pid, Some(token), RUNNING, &marker(&e), recording(None))
             .kill_blocking()
             .unwrap();
         assert_eq!(sent(), []);
+        assert!(!marker(&e).exists());
         // Clean up the test's own leftover member (its group is still ours).
         platform::kill_process_group(pid).unwrap();
         assert!(group_gone(pid).await);
@@ -1317,14 +1632,20 @@ mod tests {
         assert_eq!(sent(), []);
 
         let (mut child, pid, token) = own_sleeper(&e.inst.dir);
-        handle(pid, Some(token), EXITED, recording(None))
+        handle(pid, Some(token), EXITED, &marker(&e), recording(None))
             .kill_blocking()
             .unwrap();
         assert_eq!(sent(), [], "an exited session's handle stays silent");
-        handle(pid, Some(token), RUNNING, recording(None))
+        assert!(!marker(&e).exists());
+        handle(pid, Some(token), RUNNING, &marker(&e), recording(None))
             .kill_blocking()
             .unwrap();
         assert_eq!(sent(), [("pid", pid)], "the seam is what would signal");
+        assert_eq!(
+            std::fs::read_to_string(marker(&e)).unwrap(),
+            pid.to_string(),
+            "the stop request is written before signalling"
+        );
         platform::kill_pid(pid).unwrap();
         child.wait().unwrap();
     }
@@ -1336,15 +1657,18 @@ mod tests {
     async fn failed_kill_rolls_back_the_killed_flag_until_sigkill() {
         let dir = tempfile::tempdir().unwrap();
         let (mut child, pid, token) = own_sleeper(dir.path());
+        let stop = dir.path().join(STOP_REQUEST);
         for (sigkill_delivered, flag) in [(false, false), (true, true)] {
             let h = handle(
                 pid,
                 Some(token),
                 RUNNING,
+                &stop,
                 recording(Some(sigkill_delivered)),
             );
             assert!(h.kill_blocking().is_err());
             assert_eq!(h.killed.load(Ordering::SeqCst), flag);
+            assert_eq!(stop.exists(), flag, "the stop request is rolled back too");
         }
         platform::kill_pid(pid).unwrap();
         child.wait().unwrap();
@@ -1458,7 +1782,10 @@ mod tests {
         drop(s);
         rec.instance_id = "copied-from".into();
         crate::launch::running::write_record(&e.inst, &rec).unwrap();
-        assert!(GameSession::reattach(&e.inst).is_none());
+        assert!(matches!(
+            GameSession::reattach(&e.inst),
+            Reattach::NotRunning
+        ));
         assert!(read_record(&e.inst).is_none());
         crate::launch::running::write_record(&e.inst, &rec).unwrap();
         assert!(refuse_if_running(&e.inst).is_ok());

@@ -1,12 +1,73 @@
-//! `logs --follow`: stream a reattached game's log until it exits.
+//! `logs --follow`: stream a game's log until it exits, through a reattached
+//! session or, when another Patina process holds the session, from the log
+//! file directly.
 
 use std::future::Future;
+use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 
-use patina_core::launch::{GameSession, LogLine, SessionExit};
+use patina_core::launch::{GameSession, Log4jXmlParser, LogLine, SessionExit, Stream};
 
 /// How long to keep printing the drained tail after the game exited.
 const DRAIN_GRACE: Duration = Duration::from_secs(3);
+/// How often [`follow_file`] looks for new output.
+const FILE_POLL: Duration = Duration::from_millis(200);
+
+/// Prints the log file at `path` of a game whose session another process
+/// holds: everything already in it, then new lines as they are written,
+/// until `running()` reports the game gone (returns `true` after printing
+/// the rest) or `stop` resolves (returns `false`). Read-only: the file is
+/// never changed, and an open file keeps working when the holder renames it
+/// to a crash log.
+pub async fn follow_file(
+    path: &Path,
+    mut out: impl FnMut(LogLine),
+    mut running: impl FnMut() -> bool,
+    stop: impl Future<Output = ()>,
+) -> std::io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let mut parser = Log4jXmlParser::new();
+    let mut partial: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    tokio::pin!(stop);
+    loop {
+        // Sampled before reading: output written before the game ended is
+        // in the file by the time this read reaches its end.
+        let alive = running();
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            partial.extend_from_slice(&buf[..n]);
+            while let Some(i) = partial.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = partial.drain(..=i).collect();
+                emit(&mut parser, &line[..i], &mut out);
+            }
+        }
+        if !alive {
+            if !partial.is_empty() {
+                emit(&mut parser, &partial, &mut out);
+            }
+            parser.finish(Stream::Stdout).into_iter().for_each(&mut out);
+            return Ok(true);
+        }
+        tokio::select! {
+            _ = &mut stop => return Ok(false),
+            _ = tokio::time::sleep(FILE_POLL) => {}
+        }
+    }
+}
+
+fn emit(parser: &mut Log4jXmlParser, raw: &[u8], out: &mut impl FnMut(LogLine)) {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let text = String::from_utf8_lossy(raw);
+    parser
+        .push_line(&text, Stream::Stdout)
+        .into_iter()
+        .for_each(out);
+}
 
 /// Sends each log line of `session` to `out` until the game exits (returns
 /// its exit) or `stop` resolves (returns `None`; the game keeps running).
@@ -115,7 +176,7 @@ mod tests {
         };
         write_record(&inst, &rec).unwrap();
 
-        let session = GameSession::reattach(&inst).expect("reattach");
+        let session = GameSession::reattach(&inst).attached().expect("reattach");
         let lines = Arc::new(Mutex::new(Vec::new()));
         let sink = lines.clone();
         let task = tokio::spawn(follow_logs(
@@ -135,6 +196,60 @@ mod tests {
         assert!(read_record(&inst).is_none());
         assert_eq!(*lines.lock().unwrap(), ["hello", "bye"]);
         let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn follow_file_prints_until_the_game_is_gone() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("current.log");
+        std::fs::write(&path, "one\n").unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let (r, sink) = (running.clone(), lines.clone());
+        let p = path.clone();
+        let task = tokio::spawn(async move {
+            follow_file(
+                &p,
+                move |l| sink.lock().unwrap().push(l.text),
+                move || r.load(Ordering::SeqCst),
+                std::future::pending(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"two\r\nthree").unwrap();
+        running.store(false, Ordering::SeqCst);
+        let ended = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(ended);
+        assert_eq!(*lines.lock().unwrap(), ["one", "two", "three"]);
+        // The file is only read.
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\r\nthree");
+    }
+
+    #[tokio::test]
+    async fn follow_file_stop_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("current.log");
+        std::fs::write(&path, "x\n").unwrap();
+        let ended = follow_file(
+            &path,
+            |_| {},
+            || true,
+            tokio::time::sleep(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap();
+        assert!(!ended);
     }
 
     #[tokio::test]
@@ -174,7 +289,7 @@ mod tests {
         };
         write_record(&inst, &rec).unwrap();
 
-        let session = GameSession::reattach(&inst).expect("reattach");
+        let session = GameSession::reattach(&inst).attached().expect("reattach");
         let out = follow_logs(
             session,
             |_| {},

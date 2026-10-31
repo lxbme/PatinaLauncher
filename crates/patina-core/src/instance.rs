@@ -388,7 +388,8 @@ impl InstanceStore {
         Self { root: root.into() }
     }
 
-    /// Takes the in-process lock for instance `id` of this store.
+    /// Takes the lock for instance `id` of this store, which other Patina
+    /// processes see too (see [`crate::locks`]).
     pub fn lock(&self, id: &str) -> Result<crate::locks::InstanceGuard, crate::locks::Busy> {
         crate::locks::Locks::global().instance(&self.root, id)
     }

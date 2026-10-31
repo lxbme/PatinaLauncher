@@ -317,7 +317,7 @@ mod tests {
             ),
             "{r:?}"
         );
-        assert!(!data.versions().join(ID).exists());
+        assert!(crate::locks::only_lock_files(&data.versions().join(ID)));
     }
 
     #[tokio::test]
@@ -375,7 +375,7 @@ mod tests {
         .await;
         assert!(matches!(r, Err(LoaderError::InstallerInvalid(_))), "{r:?}");
 
-        assert!(!data.versions().exists());
+        assert!(crate::locks::only_lock_files(&data.versions()));
     }
 
     /// The fake `unpack200`: exits 3 unless its input is the fixture's
@@ -507,7 +507,7 @@ mod tests {
             Err(LoaderError::LegacyLibraryUnavailable { name }) => assert_eq!(name, AKKA_NAME),
             other => panic!("unexpected {other:?}"),
         }
-        assert!(!data.versions().join(ID).exists());
+        assert!(crate::locks::only_lock_files(&data.versions().join(ID)));
         assert!(!data.libraries().join(&AKKA[1..]).exists());
 
         use crate::i18n::{Language, locale_lock, set_language};

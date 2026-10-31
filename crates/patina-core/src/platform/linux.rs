@@ -312,6 +312,12 @@ pub fn is_zombie_with_start(pid: u32, start: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether two metadata describe the same file (same device and inode).
+pub fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
 /// Process group id of a live process.
 pub fn process_group_of(pid: u32) -> Option<u32> {
     read_stat(pid).map(|(g, _)| g)

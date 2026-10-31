@@ -479,7 +479,9 @@ mod tests {
             ),
             "{r:?}"
         );
-        assert!(!f.data.versions().join(STORED_ID).exists());
+        assert!(crate::locks::only_lock_files(
+            &f.data.versions().join(STORED_ID)
+        ));
         assert_no_scratch_left(&f);
     }
 
@@ -545,7 +547,9 @@ mod tests {
         let r = install(&f, InstallerProfile::Modern { profile, version }, &None).await;
         assert!(r.is_err(), "{r:?}");
 
-        assert!(!f.data.versions().join(STORED_ID).exists());
+        assert!(crate::locks::only_lock_files(
+            &f.data.versions().join(STORED_ID)
+        ));
         assert!(f.java.runs().is_empty());
     }
 }

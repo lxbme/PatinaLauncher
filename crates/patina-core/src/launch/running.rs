@@ -2,7 +2,7 @@
 //! started earlier.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,41 @@ use crate::instance::Instance;
 pub const RUNNING_FILE: &str = "patina-running.json";
 /// Game output log, relative to the instance directory.
 pub const CURRENT_LOG: &str = "patina-logs/current.log";
+/// Stop request marker, relative to the instance directory (next to
+/// [`CURRENT_LOG`]). A [`super::KillHandle`] writes the game's pid here
+/// before signalling, so the launcher holding the session can tell a stop
+/// (even one escalated to SIGKILL) from a crash.
+pub const STOP_REQUEST: &str = "patina-logs/stop-request";
+
+/// A game of an instance that runs right now, as its running record and the
+/// live process agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningInfo {
+    pub pid: u32,
+    /// Wall-clock Unix seconds when the launcher started the game (display only).
+    pub started_at: u64,
+}
+
+impl From<&RunningRecord> for RunningInfo {
+    fn from(rec: &RunningRecord) -> Self {
+        Self {
+            pid: rec.pid,
+            started_at: rec.started_at,
+        }
+    }
+}
+
+/// The game of `inst` when one is running (record of this instance, verified
+/// against the live process). Read-only: takes no lock and never clears a
+/// record, so any process may ask, whoever holds the game's session.
+pub fn running_game(inst: &Instance) -> Option<RunningInfo> {
+    verified_record(inst).map(|rec| RunningInfo::from(&rec))
+}
+
+/// The stored record when it names `inst` and [`verify`] accepts it.
+pub(crate) fn verified_record(inst: &Instance) -> Option<RunningRecord> {
+    read_record(inst).filter(|rec| rec.instance_id == inst.id && verify(rec))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
@@ -65,6 +100,30 @@ pub fn clear_record(inst: &Instance) {
             "cannot remove running record {}: {e}",
             record_path(inst).display()
         );
+    }
+}
+
+/// Where the stop request marker of `inst` lives (see [`STOP_REQUEST`]).
+pub(crate) fn stop_request_path(inst: &Instance) -> PathBuf {
+    inst.dir.join(STOP_REQUEST)
+}
+
+/// Records that the game `pid` is being stopped on purpose (see
+/// [`STOP_REQUEST`]).
+pub(crate) fn write_stop_request(path: &Path, pid: u32) -> io::Result<()> {
+    crate::fsutil::write_atomic(path, pid.to_string().as_bytes())
+}
+
+/// The pid in the stop request marker; `None` when missing or unreadable.
+pub(crate) fn read_stop_request(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+pub(crate) fn clear_stop_request(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!("cannot remove stop request {}: {e}", path.display());
     }
 }
 
@@ -270,6 +329,55 @@ mod tests {
         // Right start time, but no marker in the command line.
         rec.start_time = info.start_time;
         assert!(!verify(&rec));
+    }
+
+    #[test]
+    fn running_game_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inst(dir.path());
+        assert_eq!(running_game(&i), None);
+        let stale = RunningRecord {
+            pid: 1,
+            start_time: 1,
+            instance_id: "i1".into(),
+            started_at: 0,
+            log: CURRENT_LOG.into(),
+        };
+        write_record(&i, &stale).unwrap();
+        assert_eq!(running_game(&i), None);
+        assert_eq!(read_record(&i), Some(stale), "a stale record is kept");
+
+        let mut child = spawn_detached(
+            &LaunchCommand {
+                program: "sh".into(),
+                args: ["-c", "sleep 60 & wait", "x", "-Dpatina.instance=i1"]
+                    .map(String::from)
+                    .to_vec(),
+                cwd: std::env::temp_dir(),
+            },
+            &dir.path().join("l.log"),
+        )
+        .unwrap();
+        let pid = child.id();
+        let _g = killer(pid);
+        let rec = RunningRecord {
+            pid,
+            start_time: proc_info(pid).unwrap().start_time,
+            instance_id: "i1".into(),
+            started_at: 7,
+            log: CURRENT_LOG.into(),
+        };
+        write_record(&i, &rec).unwrap();
+        assert_eq!(running_game(&i), Some(RunningInfo { pid, started_at: 7 }));
+        // Another instance's record (a copied directory) is not this game.
+        let foreign = Instance {
+            id: "other".into(),
+            ..inst(dir.path())
+        };
+        assert_eq!(running_game(&foreign), None);
+        assert_eq!(read_record(&i), Some(rec));
+        kill_pid(pid).unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

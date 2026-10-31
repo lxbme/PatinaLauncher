@@ -20,7 +20,7 @@ use patina_core::java::{ManagedRuntimes, detect_all};
 #[cfg(feature = "dev-offline")]
 use patina_core::launch::dev_offline_account;
 use patina_core::launch::running::CURRENT_LOG;
-use patina_core::launch::{GameSession, LogLine, SessionExit};
+use patina_core::launch::{GameSession, KillHandle, LogLine, Reattach, SessionExit, running_game};
 use patina_core::loader::LoaderKind;
 use patina_core::loader::list::{LoaderError, VersionPick, list_versions};
 use patina_core::loader::ops::{
@@ -33,7 +33,7 @@ use patina_dev::cli::{
     AccountCmd, Cli, Cmd, IconCmd, InstanceCmd, JavaCmd, LoaderCmd, LoaderSpec, ModsCmd, SourceCmd,
     Toggle, parse_pick,
 };
-use patina_dev::follow::follow_logs;
+use patina_dev::follow::{follow_file, follow_logs};
 use patina_dev::{out, outln};
 use tokio::sync::mpsc;
 
@@ -179,14 +179,27 @@ fn status(ctx: &Ctx) -> Result<()> {
         outln!("(no instances)");
     }
     for inst in &out.instances {
+        // Read-only first: a stopped game needs no lock.
+        if running_game(inst).is_none() {
+            outln!("{}  stopped", inst.id);
+            continue;
+        }
         // Dropping a reattached session releases its locks and keeps the record.
         match GameSession::reattach(inst) {
-            Some(s) => outln!("{}  running pid={}", inst.id, s.pid()),
-            None => outln!("{}  stopped", inst.id),
+            Reattach::Attached(s) => outln!("{}  running pid={}", inst.id, s.pid()),
+            Reattach::HeldElsewhere(info) => outln!(
+                "{}  running pid={} (held by another Patina process)",
+                inst.id,
+                info.pid
+            ),
+            Reattach::NotRunning => outln!("{}  stopped", inst.id),
         }
     }
     Ok(())
 }
+
+/// How long `kill` waits for a game held by another process to go away.
+const EXTERNAL_KILL_WAIT: Duration = Duration::from_secs(15);
 
 fn print_exit(exit: &SessionExit) {
     outln!("Game exited: {exit:?}");
@@ -197,15 +210,38 @@ fn print_exit(exit: &SessionExit) {
 
 async fn kill(ctx: &Ctx, id: &str) -> Result<()> {
     let inst = ctx.store().load(id)?;
-    let Some(session) = GameSession::reattach(&inst) else {
-        bail!("instance {id:?} is not running");
-    };
-    let pid = session.pid();
-    session.kill().await?;
-    // Waiting clears the running record and reports a crash if there was one.
-    let exit = session.wait().await;
-    outln!("Stopped pid {pid}");
-    print_exit(&exit);
+    match GameSession::reattach(&inst) {
+        Reattach::Attached(session) => {
+            let pid = session.pid();
+            session.kill().await?;
+            // Waiting clears the running record and reports a crash if there was one.
+            let exit = session.wait().await;
+            outln!("Stopped pid {pid}");
+            print_exit(&exit);
+        }
+        Reattach::HeldElsewhere(info) => {
+            // The holder sees the stop request and reports the exit itself.
+            if let Some(handle) = KillHandle::for_running(&inst) {
+                handle.kill().await?;
+            }
+            let deadline = Instant::now() + EXTERNAL_KILL_WAIT;
+            while running_game(&inst).is_some() {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "pid {} is still running {} s after the stop request",
+                        info.pid,
+                        EXTERNAL_KILL_WAIT.as_secs()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            outln!(
+                "Stopped pid {} (its session is held by another Patina process)",
+                info.pid
+            );
+        }
+        Reattach::NotRunning => bail!("instance {id:?} is not running"),
+    }
     Ok(())
 }
 
@@ -237,17 +273,19 @@ fn newest_crash_log(dir: &std::path::Path) -> Option<PathBuf> {
 
 async fn logs(ctx: &Ctx, id: &str, follow: bool) -> Result<()> {
     let inst = ctx.store().load(id)?;
-    let Some(session) = GameSession::reattach(&inst) else {
-        match newest_crash_log(&inst.dir.join("patina-logs")) {
-            Some(p) => outln!("{}", p.display()),
-            None => outln!("no crash logs"),
-        }
-        return Ok(());
+    let print_crash_log = || match newest_crash_log(&inst.dir.join("patina-logs")) {
+        Some(p) => outln!("{}", p.display()),
+        None => outln!("no crash logs"),
     };
+    // Read-only: works whoever holds the game's session.
+    if running_game(&inst).is_none() {
+        print_crash_log();
+        return Ok(());
+    }
+    let log = inst.dir.join(CURRENT_LOG);
     if !follow {
-        drop(session);
-        let mut f = std::fs::File::open(inst.dir.join(CURRENT_LOG))
-            .with_context(|| format!("opening the log of {id:?}"))?;
+        let mut f =
+            std::fs::File::open(&log).with_context(|| format!("opening the log of {id:?}"))?;
         if let Err(e) = std::io::copy(&mut f, &mut std::io::stdout().lock()) {
             patina_dev::out::exit_if_broken_pipe(&e);
             return Err(e.into());
@@ -259,8 +297,21 @@ async fn logs(ctx: &Ctx, id: &str, follow: bool) -> Result<()> {
     let stop = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    if let Some(exit) = follow_logs(session, print, stop).await {
-        print_exit(&exit);
+    match GameSession::reattach(&inst) {
+        Reattach::Attached(session) => {
+            if let Some(exit) = follow_logs(session, print, stop).await {
+                print_exit(&exit);
+            }
+        }
+        Reattach::HeldElsewhere(_) => {
+            let ended = follow_file(&log, print, || running_game(&inst).is_some(), stop)
+                .await
+                .with_context(|| format!("following the log of {id:?}"))?;
+            if ended {
+                outln!("Game exited (its session is held by another Patina process)");
+            }
+        }
+        Reattach::NotRunning => print_crash_log(),
     }
     Ok(())
 }
