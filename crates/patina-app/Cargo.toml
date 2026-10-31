@@ -1,0 +1,35 @@
+[package]
+name = "patina-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Development-only offline accounts, forwarded to patina-core. Off by default
+# so a release build never carries them; `cargo app` (see .cargo/config.toml)
+# enables it.
+dev-offline = ["patina-core/dev-offline"]
+
+[dependencies]
+gpui-kit.workspace = true
+patina-core = { version = "0.1.0", path = "../patina-core" }
+rust-i18n = "4"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+toml = "1.1.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+# Same source and version as the normal dependency; adds headless windows.
+gpui-kit = { workspace = true, features = ["test-support"] }
+serde-saphyr = "2.0.0"
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+
+[[bin]]
+name = "patina"
+path = "src/main.rs"

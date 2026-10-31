@@ -1,0 +1,7 @@
+app:
+  title: "Patina"
+
+single_instance:
+  title: "Patina 已经在运行"
+  body: "同一时间只能运行一个 Patina。"
+  close: "关闭"

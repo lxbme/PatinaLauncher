@@ -1,0 +1,7 @@
+app:
+  title: "Patina"
+
+single_instance:
+  title: "Patina is already running"
+  body: "Only one copy of Patina can run at a time."
+  close: "Close"

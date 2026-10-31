@@ -2,3 +2,5 @@
 # The development CLI with offline accounts (the `dev-offline` feature), e.g.
 # `cargo dev launch my-instance --offline Dev`.
 dev = "run -p patina-dev --features dev-offline --"
+# The desktop app with offline accounts, e.g. `cargo app`.
+app = "run -p patina-app --features dev-offline --"
