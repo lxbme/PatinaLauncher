@@ -290,7 +290,7 @@ impl AccountService {
             let mut store = service.recover(&mut operation, store).await?;
             check_cancel(&cancel)?;
             store.set_current(&id).map_err(AuthError::Account)?;
-            let store = service.save(store).await?;
+            let store = service.save(&mut operation, store).await?;
             service.publish(&store, true);
             Ok(())
         })
@@ -315,7 +315,7 @@ impl AccountService {
                 .add_offline(&name)
                 .map_err(AuthError::Account)?
                 .clone();
-            let store = service.save(store).await?;
+            let store = service.save(&mut operation, store).await?;
             service.publish(&store, true);
             Ok(account)
         })
@@ -339,10 +339,9 @@ impl AccountService {
                 .await?;
             check_cancel(&cancel)?;
             store.remove(&id).map_err(AuthError::Account)?;
-            let store = service.save(store).await?;
+            let store = service.save(&mut operation, store).await?;
             if let Some(reference) = account.token_ref {
                 operation.state.pending.remove(&reference);
-                operation.state.revoked.remove(&reference);
                 operation.state.metadata.remove(&reference);
             }
             service.publish(&store, true);
@@ -461,8 +460,7 @@ impl AccountService {
                         .verification = None;
                     // Publish fail-closed policy even if durable revocation fails.
                     self.publish(&store, true);
-                    store = self.save(store).await?;
-                    operation.state.revoked.remove(&reference);
+                    store = self.save(&mut operation, store).await?;
                     self.publish(&store, false);
                 }
                 return Err(error);
@@ -491,11 +489,14 @@ impl AccountService {
             .state
             .metadata
             .insert(reference.clone(), account.clone());
-        self.write_record(reference.clone(), record).await?;
-        operation.state.pending.remove(&reference);
-        let store = self.save(store).await?;
+        // The durable rotated record has no Minecraft cache. Commit its verified
+        // identity/skin/proof before enabling the fresh cache, so loss of private
+        // retry state can require another refresh but cannot grant stale identity.
+        let store = self.save(&mut operation, store).await?;
         operation.state.metadata.remove(&reference);
         self.publish(&store, true);
+        self.write_record(reference.clone(), record).await?;
+        operation.state.pending.remove(&reference);
         check_cancel(&cancel)?;
         if self.inner.clock.unix_seconds() >= session.expires_at() {
             return Err(AuthError::SessionExpired);

@@ -340,3 +340,5 @@ mod failure_tests;
 mod launch_tests;
 #[path = "service_process_tests.rs"]
 mod process_tests;
+#[path = "service_recovery_tests.rs"]
+mod recovery_tests;

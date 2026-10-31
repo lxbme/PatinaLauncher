@@ -51,7 +51,29 @@ impl AccountService {
             }
         }
     }
-    pub(super) async fn save(&self, store: AccountStore) -> Result<AccountStore, AuthError> {
+    pub(super) async fn save(
+        &self,
+        operation: &mut Operation,
+        mut store: AccountStore,
+    ) -> Result<AccountStore, AuthError> {
+        // Every writer merges fail-closed state, including remove/login which
+        // deliberately bypass broken secret-save recovery. Also sanitize queued
+        // metadata so a later retry cannot restore proof after retiring markers.
+        let state = &mut *operation.state;
+        for account in store
+            .accounts
+            .iter_mut()
+            .chain(&mut store.hidden)
+            .chain(state.metadata.values_mut())
+        {
+            if account
+                .token_ref
+                .as_ref()
+                .is_some_and(|r| state.revoked.contains(r))
+            {
+                account.verification = None;
+            }
+        }
         let data = self.inner.data.clone();
         #[cfg(test)]
         let fail = self
@@ -60,7 +82,7 @@ impl AccountService {
             .lock()
             .expect("metadata fault")
             .take();
-        blocking(move || {
+        let store = blocking(move || {
             store.save_durable(
                 &data,
                 #[cfg(test)]
@@ -68,7 +90,11 @@ impl AccountService {
             )?;
             Ok(store)
         })
-        .await
+        .await?;
+        // All surviving references are now durably cleared; absent references
+        // were durably removed/replaced. Errors above retain every marker.
+        operation.state.revoked.clear();
+        Ok(store)
     }
     pub(super) async fn read_record(
         &self,
@@ -123,10 +149,6 @@ impl AccountService {
         operation.state.pending.retain(|r, _| refs.contains(r));
         operation.state.revoked.retain(|r| refs.contains(r));
         operation.state.metadata.retain(|r, _| refs.contains(r));
-        for (reference, record) in operation.state.pending.clone() {
-            self.write_record(reference.clone(), record).await?;
-            operation.state.pending.remove(&reference);
-        }
         if !operation.state.metadata.is_empty() {
             for account in &mut store.accounts {
                 if let Some(updated) = account
@@ -137,22 +159,18 @@ impl AccountService {
                     *account = updated.clone();
                 }
             }
-            store = self.save(store).await?;
+            store = self.save(operation, store).await?;
             operation.state.metadata.clear();
             self.publish(&store, true);
         }
+        // Same ordering as refresh commit: never persist a fresh cache before
+        // its associated metadata, including storage-only retry after failure.
+        for (reference, record) in operation.state.pending.clone() {
+            self.write_record(reference.clone(), record).await?;
+            operation.state.pending.remove(&reference);
+        }
         if !operation.state.revoked.is_empty() {
-            for account in &mut store.accounts {
-                if account
-                    .token_ref
-                    .as_ref()
-                    .is_some_and(|r| operation.state.revoked.contains(r))
-                {
-                    account.verification = None;
-                }
-            }
-            store = self.save(store).await?;
-            operation.state.revoked.clear();
+            store = self.save(operation, store).await?;
             self.publish(&store, true);
         }
         // Deferred deletion is retried on every explicit operation. An unavailable
@@ -217,10 +235,9 @@ impl AccountService {
         store.set_current(&id).map_err(AuthError::Account)?;
         // After replacement starts, cancellation no longer rolls back. On any
         // save error leave the journal intact: replacement may already be visible.
-        let store = self.save(store).await?;
+        let store = self.save(&mut operation, store).await?;
         if let Some(old) = old {
             operation.state.pending.remove(&old);
-            operation.state.revoked.remove(&old);
             operation.state.metadata.remove(&old);
         }
         self.publish(&store, true);
