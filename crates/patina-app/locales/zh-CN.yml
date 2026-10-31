@@ -303,3 +303,47 @@ mods:
   name_taken: "同名文件已存在"
   failed: '无法更改"%{name}"：%{error}'
   busy: "%{reason}，暂时不能更改 Mod"
+
+downloads:
+  kind:
+    mod: "Mod"
+    resource_pack: "资源包"
+    shader: "光影"
+    modpack: "整合包"
+  search_placeholder: "在线搜索"
+  filters:
+    title: "筛选"
+    platform: "平台"
+    game_version: "游戏版本"
+    loader: "加载器"
+    category: "分类"
+    target: "目标实例"
+    sort: "排序"
+    all_versions: "全部版本"
+    all_loaders: "全部加载器"
+    all_categories: "全部分类"
+    no_target: "未选择"
+    versions_failed: "游戏版本列表加载失败"
+    search_versions: "搜索版本"
+  platform:
+    modrinth: "Modrinth"
+    curseforge: "CurseForge"
+  sort:
+    relevance: "相关度"
+    downloads: "下载量"
+    updated: "最近更新"
+  results:
+    unavailable_title: "在线下载即将推出"
+    unavailable_hint: "可以先在实例的 Mods 页管理本地文件"
+    loading: "正在搜索…"
+    failed: "在线搜索失败"
+    retry: "重试"
+    empty: "没有结果"
+    downloads: "%{count} 次下载"
+    by_author: "作者 %{author}"
+  detail:
+    title: "详情"
+    empty: "选择一个项目查看详情"
+    install_to: "安装到 %{instance}"
+    choose_instance: "选择实例…"
+    install_soon: "在线下载即将推出"

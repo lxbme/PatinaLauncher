@@ -303,3 +303,47 @@ mods:
   name_taken: "A file with the same name already exists"
   failed: "Couldn’t change “%{name}”: %{error}"
   busy: "%{reason}, so mods can’t be changed now"
+
+downloads:
+  kind:
+    mod: "Mods"
+    resource_pack: "Resource packs"
+    shader: "Shaders"
+    modpack: "Modpacks"
+  search_placeholder: "Search online"
+  filters:
+    title: "Filters"
+    platform: "Platform"
+    game_version: "Game version"
+    loader: "Loader"
+    category: "Category"
+    target: "Target instance"
+    sort: "Sort by"
+    all_versions: "All versions"
+    all_loaders: "All loaders"
+    all_categories: "All categories"
+    no_target: "None"
+    versions_failed: "Couldn’t load game versions"
+    search_versions: "Search versions"
+  platform:
+    modrinth: "Modrinth"
+    curseforge: "CurseForge"
+  sort:
+    relevance: "Relevance"
+    downloads: "Downloads"
+    updated: "Recently updated"
+  results:
+    unavailable_title: "Online downloads are coming soon"
+    unavailable_hint: "For now, manage local files on an instance’s Mods tab."
+    loading: "Searching…"
+    failed: "Couldn’t search online"
+    retry: "Retry"
+    empty: "No results"
+    downloads: "%{count} downloads"
+    by_author: "by %{author}"
+  detail:
+    title: "Details"
+    empty: "Select a project to see its details."
+    install_to: "Install to %{instance}"
+    choose_instance: "Choose instance…"
+    install_soon: "Online downloads are coming soon."

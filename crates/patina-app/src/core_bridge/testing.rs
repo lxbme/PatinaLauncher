@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use patina_core::content::online::{ContentSource, OnlineError, OnlinePage, OnlineQuery};
 use patina_core::instance::InstanceStore;
 use patina_core::loader::ops::{LoaderAction, OpOutcome};
 use patina_core::loader::{LoaderError, LoaderKind, LoaderVersion, VersionPick};
@@ -73,14 +74,102 @@ pub fn core_with_launch_and_ops(
         catalog: Some(catalog),
         launch_backend: Some(launch),
         version_ops: Some(ops),
+        ..Fakes::default()
     };
     Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
+/// [`core`] whose online searches go to `source` (a [`FakeSource`]).
+pub fn core_with_source(
+    rt: Handle,
+    data: DataDirs,
+    catalog: Arc<dyn Catalog>,
+    source: Arc<dyn ContentSource>,
+) -> Core {
+    let fakes = Fakes {
+        catalog: Some(catalog),
+        content_source: Some(source),
+        ..Fakes::default()
+    };
+    Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
+type Answerer = Box<dyn Fn(&OnlineQuery) -> Result<OnlinePage, OnlineError> + Send + Sync>;
+type Waiting = (
+    OnlineQuery,
+    futures::channel::oneshot::Sender<Result<OnlinePage, OnlineError>>,
+);
+
+enum SourceMode {
+    Answer(Answerer),
+    /// Every search waits for [`FakeSource::answer`].
+    Gated(Mutex<Vec<Option<Waiting>>>),
+}
+
+/// An online source that records its queries. It answers with a canned
+/// result ([`FakeSource::new`]), with a function of the query
+/// ([`FakeSource::with`]) or when told to ([`FakeSource::gated`]).
+pub struct FakeSource {
+    mode: SourceMode,
+    queries: Mutex<Vec<OnlineQuery>>,
+}
+
+impl FakeSource {
+    pub fn new(result: Result<OnlinePage, OnlineError>) -> Self {
+        Self::with(move |_| result.clone())
+    }
+
+    /// Answers each query with `f(query)`.
+    pub fn with(
+        f: impl Fn(&OnlineQuery) -> Result<OnlinePage, OnlineError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            mode: SourceMode::Answer(Box::new(f)),
+            queries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A source whose searches stay in flight until [`FakeSource::answer`].
+    pub fn gated() -> Self {
+        Self {
+            mode: SourceMode::Gated(Mutex::new(Vec::new())),
+            queries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Answers the `n`th search (0-based, in call order) of a gated source.
+    pub fn answer(&self, n: usize, result: Result<OnlinePage, OnlineError>) {
+        let SourceMode::Gated(waiting) = &self.mode else {
+            panic!("not a gated source");
+        };
+        let (_, tx) = waiting.lock().unwrap()[n].take().expect("answered once");
+        tx.send(result).ok();
+    }
+
+    /// The queries so far, oldest first.
+    pub fn queries(&self) -> Vec<OnlineQuery> {
+        self.queries.lock().unwrap().clone()
+    }
+}
+
+impl ContentSource for FakeSource {
+    fn search(&self, q: OnlineQuery) -> BoxFuture<'static, Result<OnlinePage, OnlineError>> {
+        self.queries.lock().unwrap().push(q.clone());
+        match &self.mode {
+            SourceMode::Answer(f) => futures::future::ready(f(&q)).boxed(),
+            SourceMode::Gated(waiting) => {
+                let (tx, rx) = futures::channel::oneshot::channel();
+                waiting.lock().unwrap().push(Some((q, tx)));
+                async move { rx.await.unwrap_or(Err(OnlineError::Unavailable)) }.boxed()
+            }
+        }
+    }
 }
 
 /// Canned version lists. With no manifest set, asking for it fails; a loader
 /// with no versions for a Minecraft version answers `NoVersions`.
 pub struct FakeCatalog {
-    manifest: Result<VersionManifest, String>,
+    manifest: Mutex<Result<VersionManifest, String>>,
     loaders: Vec<LoaderVersion>,
     manifest_requests: AtomicUsize,
     loader_requests: AtomicUsize,
@@ -89,7 +178,7 @@ pub struct FakeCatalog {
 impl FakeCatalog {
     pub fn new() -> Self {
         Self {
-            manifest: Err("no manifest in this fake".into()),
+            manifest: Mutex::new(Err("no manifest in this fake".into())),
             loaders: Vec::new(),
             manifest_requests: AtomicUsize::new(0),
             loader_requests: AtomicUsize::new(0),
@@ -97,12 +186,17 @@ impl FakeCatalog {
     }
 
     pub fn with_manifest(mut self, manifest: VersionManifest) -> Self {
-        self.manifest = Ok(manifest);
+        self.manifest = Mutex::new(Ok(manifest));
         self
     }
 
+    /// Changes the answer to later manifest requests.
+    pub fn set_manifest(&self, manifest: Result<VersionManifest, String>) {
+        *self.manifest.lock().unwrap() = manifest;
+    }
+
     pub fn with_manifest_error(mut self, error: impl Into<String>) -> Self {
-        self.manifest = Err(error.into());
+        self.manifest = Mutex::new(Err(error.into()));
         self
     }
 
@@ -133,7 +227,7 @@ impl Default for FakeCatalog {
 impl Catalog for FakeCatalog {
     fn manifest(&self) -> BoxFuture<'static, Result<VersionManifest, String>> {
         self.manifest_requests.fetch_add(1, Ordering::SeqCst);
-        futures::future::ready(self.manifest.clone()).boxed()
+        futures::future::ready(self.manifest.lock().unwrap().clone()).boxed()
     }
 
     fn loader_versions(

@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 use gpui_kit::{App, Global, Task};
 use patina_core::accounts::{AccountError, AccountStore};
 use patina_core::config::{ConfigError, GlobalConfig};
+use patina_core::content::online::{ContentSource, UnavailableSource};
 use patina_core::download::{Mirror, resolve_choice};
 use patina_core::instance::InstanceStore;
 use patina_core::loader::{LoaderError, LoaderKind, LoaderVersion, list_versions};
@@ -102,6 +103,9 @@ pub struct Core {
     pub launch_backend: Arc<dyn LaunchBackend>,
     /// Loader and version changes, injectable for UI tests.
     pub version_ops: Arc<dyn VersionOps>,
+    /// Online mod/pack search, injectable for UI tests. Production has no
+    /// real source yet ([`UnavailableSource`]).
+    pub content_source: Arc<dyn ContentSource>,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
@@ -140,6 +144,7 @@ pub(super) struct Fakes {
     pub(super) catalog: Option<Arc<dyn Catalog>>,
     pub(super) launch_backend: Option<Arc<dyn LaunchBackend>>,
     pub(super) version_ops: Option<Arc<dyn VersionOps>>,
+    pub(super) content_source: Option<Arc<dyn ContentSource>>,
 }
 
 impl Core {
@@ -163,6 +168,7 @@ impl Core {
             catalog,
             launch_backend,
             version_ops,
+            content_source,
         } = fakes;
         let client = {
             let _rt = rt.enter();
@@ -204,6 +210,7 @@ impl Core {
                 store: store.clone(),
             })
         });
+        let content_source = content_source.unwrap_or_else(|| Arc::new(UnavailableSource));
         let core = Core {
             rt,
             store,
@@ -211,6 +218,7 @@ impl Core {
             catalog,
             launch_backend,
             version_ops,
+            content_source,
             config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),

@@ -7,6 +7,7 @@ pub mod assets;
 pub mod content;
 pub mod core_bridge;
 pub mod disk_usage;
+pub mod downloads;
 pub mod fonts;
 pub mod i18n;
 pub mod instances;
@@ -41,7 +42,7 @@ const _: () = assert!(!patina_core::DEV_OFFLINE);
 pub const APP_ID: &str = "patina";
 
 /// Sets up the app-wide state the windows rely on: the settings, the CJK
-/// font, the zoom keys, the shell's, instances page's and log's keys and
+/// font, the zoom keys, the shell's, instances page's, downloads page's and log's keys and
 /// the accounts-changed signal. Call once, after
 /// `gpui_kit::init` and before [`open_main_window`].
 pub fn init(settings: SettingsStore, cx: &mut App) {
@@ -51,6 +52,7 @@ pub fn init(settings: SettingsStore, cx: &mut App) {
     shell::init(cx);
     instances::init(cx);
     content::init(cx);
+    downloads::init(cx);
     search::init(cx);
     launch::log_view::init(cx);
     core_bridge::AccountsChanged::init(cx);

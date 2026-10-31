@@ -6,7 +6,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::future::Either;
-use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{ActiveTheme, IconName, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
@@ -15,6 +14,7 @@ use gpui_kit::{
 
 use super::placeholder;
 use super::{Nav, OpenDownloads, Rail, ShellState, StatusBar, TitleBarView};
+use crate::downloads::DownloadsPage;
 use crate::fonts;
 use crate::instances::{InstancesChanged, InstancesPage};
 use gpui_kit::component::WindowExt as _;
@@ -37,6 +37,7 @@ pub struct RootView {
     rail: Entity<Rail>,
     status_bar: Entity<StatusBar>,
     instances: Entity<InstancesPage>,
+    downloads: Entity<DownloadsPage>,
     focus: FocusHandle,
     _observe: Subscription,
     _instances_changed: Subscription,
@@ -51,6 +52,7 @@ impl RootView {
         focus.focus(window, cx);
         let instances = cx.new(|cx| InstancesPage::new(window, cx));
         let model = instances.read(cx).model().clone();
+        let downloads = cx.new(|cx| DownloadsPage::new(model.clone(), window, cx));
         // This app's own instance operations change the status bar's
         // count and size at once, without waiting for its throttle.
         let _instances_changed = cx.subscribe(&model, |this, _, _: &InstancesChanged, cx| {
@@ -69,10 +71,14 @@ impl RootView {
             rail: cx.new(|cx| Rail::new(shell.clone(), cx)),
             status_bar: cx.new(|cx| StatusBar::new(window, cx)),
             instances,
+            downloads,
             _observe: cx.observe(&shell, |this, shell, cx| {
-                let shown = shell.read(cx).nav() == Nav::Instances;
+                let nav = shell.read(cx).nav();
                 this.instances
-                    .update(cx, |page, cx| page.set_shown(shown, cx));
+                    .update(cx, |page, cx| page.set_shown(nav == Nav::Instances, cx));
+                if nav == Nav::Downloads {
+                    this.downloads.update(cx, |page, cx| page.shown(cx));
+                }
                 cx.notify();
             }),
             _instances_changed,
@@ -96,6 +102,10 @@ impl RootView {
 
     pub fn instances(&self) -> &Entity<InstancesPage> {
         &self.instances
+    }
+
+    pub fn downloads(&self) -> &Entity<DownloadsPage> {
+        &self.downloads
     }
 
     /// The launch flow's requests for the shell and the window.
@@ -136,9 +146,17 @@ impl RootView {
         }
     }
 
-    /// Shows the downloads page. Its target and query are not used yet: the
-    /// downloads page takes them over once it exists (plan 4c, Task 6).
-    fn open_downloads(&mut self, _: &OpenDownloads, _: &mut Window, cx: &mut Context<Self>) {
+    /// Shows the downloads page, aimed at the action's target instance and
+    /// searching its words.
+    fn open_downloads(
+        &mut self,
+        action: &OpenDownloads,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (target, query) = (action.target.as_deref(), action.query.as_deref());
+        self.downloads
+            .update(cx, |page, cx| page.open(target, query, window, cx));
         self.shell
             .update(cx, |s, cx| s.navigate(Nav::Downloads, cx));
     }
@@ -148,8 +166,8 @@ impl RootView {
             .update(cx, |t, cx| t.focus_search(window, cx));
     }
 
-    /// The page for `nav`. Every page but the instances page is a
-    /// placeholder until plan 4c.
+    /// The page for `nav`. The accounts and settings pages are
+    /// placeholders until plan 4c fills them.
     fn render_page(&self, nav: Nav) -> AnyElement {
         let page = div()
             .id(nav.page_id())
@@ -159,9 +177,7 @@ impl RootView {
             .test_support();
         match nav {
             Nav::Instances => page.child(self.instances.clone()).into_any_element(),
-            Nav::Downloads => page
-                .child(placeholder::page(Lucide::Download, nav.label()))
-                .into_any_element(),
+            Nav::Downloads => page.child(self.downloads.clone()).into_any_element(),
             Nav::Accounts => page
                 .child(placeholder::page(IconName::CircleUser, nav.label()))
                 .into_any_element(),

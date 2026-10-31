@@ -6820,3 +6820,539 @@ fn a_failed_index_says_so_and_retries(cx: &mut TestAppContext) {
     });
     assert!(!shows(&app, cx, "search-index-failed"));
 }
+
+// --- the downloads page ------------------------------------------------------
+
+mod downloads {
+    use super::*;
+    use patina_app::core_bridge::testing::FakeSource;
+    use patina_app::downloads::{DEBOUNCE, DownloadsModel, Results, hit_row_id, kind_tab_id};
+    use patina_app::shell::OpenDownloads;
+    use patina_core::content::online::{
+        ContentKind, OnlineError, OnlineHit, OnlinePage, SortOrder,
+    };
+    use patina_core::loader::LoaderKind;
+
+    fn model(app: &Booted, cx: &mut TestAppContext) -> Entity<DownloadsModel> {
+        cx.update(|cx| app.root.read(cx).downloads().read(cx).model().clone())
+    }
+
+    /// Boots over instances "Fab" (1.21.1, Fabric) and "Van" (1.20.1,
+    /// vanilla) with the list loaded; online searches go to `source`.
+    fn app_with(
+        cx: &mut TestAppContext,
+        dir: &Path,
+        source: Option<Arc<FakeSource>>,
+    ) -> (Booted, Entity<DownloadsModel>) {
+        app_with_catalog(cx, dir, source, Arc::new(FakeCatalog::new()))
+    }
+
+    fn app_with_catalog(
+        cx: &mut TestAppContext,
+        dir: &Path,
+        source: Option<Arc<FakeSource>>,
+        catalog: Arc<FakeCatalog>,
+    ) -> (Booted, Entity<DownloadsModel>) {
+        let store = InstanceStore::new(DataDirs::new(dir).instances());
+        store.create("Fab", "1.21.1").unwrap();
+        set_loader(&store, "Fab", ComponentUid::Fabric);
+        store.create("Van", "1.20.1").unwrap();
+        let app = match source {
+            None => boot_with(cx, dir, AppSettings::default(), catalog),
+            Some(source) => boot_core(cx, dir, AppSettings::default(), |rt, data| {
+                testing::core_with_source(rt, data, catalog, source)
+            }),
+        };
+        list_settled(&instances_model(&app, cx), cx);
+        let m = model(&app, cx);
+        (app, m)
+    }
+
+    fn state(m: &Entity<DownloadsModel>, cx: &mut TestAppContext) -> Results {
+        m.read_with(cx, |m, _| m.results().clone())
+    }
+
+    fn hit(id: &str) -> OnlineHit {
+        OnlineHit {
+            id: id.into(),
+            title: format!("Title {id}"),
+            author: "someone".into(),
+            summary: "A project.".into(),
+            downloads: 1234,
+            updated: 0,
+            icon_url: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn target_instance_fills_filters(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_app, m) = app_with(cx, tmp.path(), None);
+        assert_eq!(m.read_with(cx, |m, _| m.target().map(str::to_owned)), None);
+
+        assert!(m.update(cx, |m, cx| m.set_target(Some("Fab"), cx)));
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.target(), Some("Fab"));
+            assert_eq!(m.mc_version(), Some("1.21.1"));
+            assert_eq!(m.loader(), Some(LoaderKind::Fabric));
+        });
+
+        // A vanilla instance clears the loader; an unknown id changes nothing.
+        assert!(m.update(cx, |m, cx| m.set_target(Some("Van"), cx)));
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.mc_version(), Some("1.20.1"));
+            assert_eq!(m.loader(), None);
+        });
+        assert!(!m.update(cx, |m, cx| m.set_target(Some("Nope"), cx)));
+        m.read_with(cx, |m, _| assert_eq!(m.target(), Some("Van")));
+
+        // No target keeps the filters.
+        assert!(m.update(cx, |m, cx| m.set_target(None, cx)));
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.target(), None);
+            assert_eq!(m.mc_version(), Some("1.20.1"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn packs_only_take_game_version(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_app, m) = app_with(cx, tmp.path(), None);
+        for kind in [
+            ContentKind::ResourcePack,
+            ContentKind::Shader,
+            ContentKind::Modpack,
+        ] {
+            m.update(cx, |m, cx| {
+                m.set_kind(kind, cx);
+                m.set_target(Some("Fab"), cx);
+            });
+            m.read_with(cx, |m, _| {
+                assert_eq!(m.mc_version(), Some("1.21.1"), "{kind:?}");
+                assert_eq!(m.loader(), None, "{kind:?}");
+                assert_eq!(m.query().loader, None);
+            });
+        }
+        // Back on mods the target's loader applies again.
+        m.update(cx, |m, cx| m.set_kind(ContentKind::Mod, cx));
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.loader(), Some(LoaderKind::Fabric));
+            assert_eq!(m.target(), Some("Fab"));
+        });
+        // And leaving mods drops it again.
+        m.update(cx, |m, cx| m.set_kind(ContentKind::Shader, cx));
+        m.read_with(cx, |m, _| assert_eq!(m.loader(), None));
+    }
+
+    #[gpui_kit::test]
+    fn manual_filter_change_resets_target(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_app, m) = app_with(cx, tmp.path(), None);
+        let target =
+            |cx: &mut TestAppContext| m.read_with(cx, |m, _| m.target().map(str::to_owned));
+
+        m.update(cx, |m, cx| m.set_target(Some("Fab"), cx));
+        // The same value changes nothing.
+        m.update(cx, |m, cx| m.set_mc_version(Some("1.21.1".into()), cx));
+        assert_eq!(target(cx).as_deref(), Some("Fab"));
+        m.update(cx, |m, cx| m.set_mc_version(Some("1.20.1".into()), cx));
+        assert_eq!(target(cx), None);
+
+        m.update(cx, |m, cx| m.set_target(Some("Fab"), cx));
+        m.update(cx, |m, cx| m.set_loader(Some(LoaderKind::Forge), cx));
+        assert_eq!(target(cx), None);
+
+        // Clearing a filter the target has is a disagreement too.
+        m.update(cx, |m, cx| m.set_target(Some("Fab"), cx));
+        m.update(cx, |m, cx| m.set_mc_version(None, cx));
+        assert_eq!(target(cx), None);
+
+        // The loader does not matter for packs.
+        m.update(cx, |m, cx| {
+            m.set_kind(ContentKind::ResourcePack, cx);
+            m.set_target(Some("Fab"), cx);
+            m.set_loader(Some(LoaderKind::Forge), cx);
+        });
+        assert_eq!(target(cx).as_deref(), Some("Fab"));
+        m.read_with(cx, |m, _| assert_eq!(m.loader(), None));
+    }
+
+    #[gpui_kit::test]
+    fn unavailable_source_shows_placeholder(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, m) = app_with(cx, tmp.path(), None);
+        // Nothing is asked before the page is shown.
+        assert_eq!(state(&m, cx), Results::Idle);
+
+        click(&app, cx, "rail-downloads");
+        assert_eq!(nav(&app, cx), Nav::Downloads);
+        settle(cx, |cx| state(&m, cx) == Results::Unavailable);
+        assert!(shows(&app, cx, "downloads-unavailable"));
+
+        // The install button waits for a target and for a real source.
+        assert!(shows(&app, cx, "downloads-install"));
+        assert!(disabled(&app, cx, "downloads-install"));
+        assert_eq!(
+            label_of(&app, cx, "downloads-install").as_deref(),
+            Some("Choose instance…")
+        );
+        m.update(cx, |m, cx| m.set_target(Some("Fab"), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            label_of(&app, cx, "downloads-install").as_deref(),
+            Some("Install to Fab")
+        );
+        assert!(disabled(&app, cx, "downloads-install"));
+    }
+
+    #[gpui_kit::test]
+    fn entry_from_mods_tab_sets_target(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _tab, _mods) = mods_app(cx, tmp.path(), |_| {});
+        click(&app, cx, "mods-online");
+        assert_eq!(nav(&app, cx), Nav::Downloads);
+        let m = model(&app, cx);
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.target(), Some("Alpha"));
+            assert_eq!(m.mc_version(), Some("1.21.1"));
+        });
+        settle(cx, |cx| state(&m, cx) == Results::Unavailable);
+    }
+
+    #[gpui_kit::test]
+    fn search_words_reach_the_source_and_hits_show(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Arc::new(FakeSource::new(Ok(OnlinePage {
+            hits: vec![hit("a"), hit("b")],
+            total: 2,
+        })));
+        let (app, m) = app_with(cx, tmp.path(), Some(source.clone()));
+
+        // From the global search: the words, no target.
+        cx.update_window(app.handle, |_, window, cx| {
+            window.dispatch_action(
+                Box::new(OpenDownloads {
+                    target: None,
+                    query: Some("sodium".into()),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        settle(cx, |cx| matches!(state(&m, cx), Results::Loaded(_)));
+        assert_eq!(nav(&app, cx), Nav::Downloads);
+        let queries = source.queries();
+        assert_eq!(queries.len(), 1, "opening searches once");
+        assert_eq!(queries[0].text, "sodium");
+        assert_eq!(queries[0].kind, ContentKind::Mod);
+        assert_eq!(queries[0].limit, patina_app::downloads::PAGE_SIZE);
+        assert_eq!(m.read_with(cx, |m, _| m.target().map(str::to_owned)), None);
+        let typed = cx.update(|cx| {
+            let page = app.root.read(cx).downloads().read(cx);
+            page.input().read(cx).value().to_string()
+        });
+        assert_eq!(typed, "sodium", "the words show in the search box");
+        assert!(shows(&app, cx, hit_row_id("a")));
+        assert!(shows(&app, cx, hit_row_id("b")));
+        assert!(!shows(&app, cx, "downloads-unavailable"));
+
+        // A click shows the hit in the detail column.
+        click(&app, cx, hit_row_id("b"));
+        assert_eq!(
+            m.read_with(cx, |m, _| m.selected().map(str::to_owned))
+                .as_deref(),
+            Some("b")
+        );
+        assert!(shows(&app, cx, "downloads-detail"));
+
+        // Another kind and sort ask again, right away.
+        m.update(cx, |m, cx| m.set_sort(SortOrder::Downloads, cx));
+        click(&app, cx, kind_tab_id(ContentKind::Shader));
+        settle(cx, |cx| matches!(state(&m, cx), Results::Loaded(_)));
+        let last = source.queries().pop().unwrap();
+        assert_eq!(last.kind, ContentKind::Shader);
+        assert_eq!(last.sort, SortOrder::Downloads);
+        assert_eq!(
+            m.read_with(cx, |m, _| m.selected().map(str::to_owned)),
+            None
+        );
+    }
+
+    #[gpui_kit::test]
+    fn typing_is_debounced_and_a_failure_can_be_retried(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Arc::new(FakeSource::new(Err(OnlineError::Network("boom".into()))));
+        let (app, m) = app_with(cx, tmp.path(), Some(source.clone()));
+        click(&app, cx, "rail-downloads");
+        settle(cx, |cx| matches!(state(&m, cx), Results::Failed(_)));
+        assert!(shows(&app, cx, "downloads-failed"));
+        assert_eq!(source.queries().len(), 1);
+
+        click(&app, cx, "downloads-search");
+        type_text(&app, cx, "abc");
+        assert_eq!(m.read_with(cx, |m, _| m.text().to_string()), "abc");
+        assert_eq!(source.queries().len(), 1, "waits for the last keystroke");
+        cx.executor().advance_clock(DEBOUNCE);
+        settle(cx, |_| source.queries().len() == 2);
+        assert_eq!(source.queries()[1].text, "abc");
+
+        settle(cx, |cx| matches!(state(&m, cx), Results::Failed(_)));
+        click(&app, cx, "downloads-retry");
+        settle(cx, |_| source.queries().len() == 3);
+    }
+
+    #[gpui_kit::test]
+    fn the_page_fits_the_smallest_window(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _m) = app_with(cx, tmp.path(), None);
+        cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+        click(&app, cx, "rail-downloads");
+        for id in [
+            "downloads-search",
+            "downloads-sort",
+            "downloads-version",
+            "downloads-loader",
+            "downloads-category",
+            "downloads-target",
+            "downloads-install",
+            kind_tab_id(ContentKind::Mod),
+            kind_tab_id(ContentKind::Modpack),
+        ] {
+            assert!(inside_window(&app, cx, id), "{id} is cut off at 960×600");
+        }
+        // Loader filters are for mods only.
+        click(&app, cx, kind_tab_id(ContentKind::Shader));
+        assert!(!shows(&app, cx, "downloads-loader"));
+    }
+
+    #[gpui_kit::test]
+    fn kind_tabs_step_with_the_keyboard(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, m) = app_with(cx, tmp.path(), None);
+        click(&app, cx, "rail-downloads");
+        click(&app, cx, "downloads-search");
+        press(&app, cx, "ctrl-pagedown");
+        assert_eq!(m.read_with(cx, |m, _| m.kind()), ContentKind::ResourcePack);
+        press(&app, cx, "ctrl-pageup");
+        press(&app, cx, "ctrl-pageup");
+        assert_eq!(m.read_with(cx, |m, _| m.kind()), ContentKind::Modpack);
+    }
+
+    fn page_versions(app: &Booted, cx: &mut TestAppContext) -> patina_app::downloads::Versions {
+        cx.update(|cx| app.root.read(cx).downloads().read(cx).versions())
+    }
+
+    fn hit_ids(m: &Entity<DownloadsModel>, cx: &mut TestAppContext) -> Vec<String> {
+        match state(m, cx) {
+            Results::Loaded(page) => page.hits.into_iter().map(|h| h.id).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn game_versions_load_on_demand_and_failure_can_be_retried(cx: &mut TestAppContext) {
+        use patina_app::downloads::Versions;
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(FakeCatalog::new());
+        let (app, _m) = app_with_catalog(cx, tmp.path(), None, catalog.clone());
+        cx.run_until_parked();
+        assert_eq!(catalog.manifest_requests(), 0, "not read at startup");
+        assert_eq!(page_versions(&app, cx), Versions::NotLoaded);
+
+        click(&app, cx, "rail-downloads");
+        settle(cx, |_| catalog.manifest_requests() == 1);
+        settle(cx, |cx| page_versions(&app, cx) == Versions::Failed);
+        assert!(shows(&app, cx, "downloads-versions-failed"));
+
+        // The next visit asks again.
+        click(&app, cx, "rail-instances");
+        click(&app, cx, "rail-downloads");
+        settle(cx, |_| catalog.manifest_requests() == 2);
+        settle(cx, |cx| page_versions(&app, cx) == Versions::Failed);
+
+        // The retry button does too, and a success clears the note.
+        catalog.set_manifest(Ok(VersionManifest {
+            latest: Latest {
+                release: "1.21.1".into(),
+                snapshot: "24w45a".into(),
+            },
+            versions: vec![
+                manifest_entry("1.21.1", VersionKind::Release),
+                manifest_entry("1.20.1", VersionKind::Release),
+            ],
+        }));
+        click(&app, cx, "downloads-versions-retry");
+        settle(cx, |cx| page_versions(&app, cx) == Versions::Loaded);
+        assert_eq!(catalog.manifest_requests(), 3);
+        assert!(!shows(&app, cx, "downloads-versions-failed"));
+
+        // Loaded versions are not read again.
+        click(&app, cx, "rail-instances");
+        click(&app, cx, "rail-downloads");
+        cx.run_until_parked();
+        assert_eq!(catalog.manifest_requests(), 3);
+    }
+
+    #[gpui_kit::test]
+    fn hits_are_keyboard_reachable(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Arc::new(FakeSource::new(Ok(OnlinePage {
+            hits: vec![hit("a"), hit("b"), hit("c")],
+            total: 3,
+        })));
+        let (app, m) = app_with(cx, tmp.path(), Some(source));
+        click(&app, cx, "rail-downloads");
+        settle(cx, |cx| matches!(state(&m, cx), Results::Loaded(_)));
+        let selected =
+            |cx: &mut TestAppContext| m.read_with(cx, |m, _| m.selected().map(str::to_owned));
+        assert_eq!(selected(cx), None);
+
+        // A click hands the keyboard to the list.
+        click(&app, cx, hit_row_id("a"));
+        assert_eq!(selected(cx).as_deref(), Some("a"));
+        assert_eq!(
+            element(&app, cx, "downloads-hits").unwrap().focused(),
+            Some(true)
+        );
+        press(&app, cx, "up");
+        assert_eq!(selected(cx).as_deref(), Some("a"), "top stays");
+        press(&app, cx, "down");
+        press(&app, cx, "down");
+        press(&app, cx, "down");
+        assert_eq!(selected(cx).as_deref(), Some("c"), "bottom stays");
+        assert!(shows(&app, cx, "downloads-detail"));
+        press(&app, cx, "up");
+        assert_eq!(selected(cx).as_deref(), Some("b"));
+
+        // Enter and Space select the first hit when none is selected.
+        m.update(cx, |m, cx| m.select(None, cx));
+        press(&app, cx, "enter");
+        assert_eq!(selected(cx).as_deref(), Some("a"));
+        m.update(cx, |m, cx| m.select(None, cx));
+        press(&app, cx, "space");
+        assert_eq!(selected(cx).as_deref(), Some("a"));
+    }
+
+    #[gpui_kit::test]
+    fn a_late_answer_is_dropped_and_old_hits_stay_meanwhile(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = Arc::new(FakeSource::gated());
+        let (app, m) = app_with(cx, tmp.path(), Some(source.clone()));
+        let page = |kind: &str| OnlinePage {
+            hits: vec![hit(&format!("{kind}-1"))],
+            total: 1,
+        };
+        click(&app, cx, "rail-downloads");
+        settle(cx, |_| source.queries().len() == 1);
+        m.update(cx, |m, cx| m.set_kind(ContentKind::Shader, cx));
+        settle(cx, |_| source.queries().len() == 2);
+
+        // The mod answer arrives after the kind changed: not shown.
+        source.answer(0, Ok(page("mod")));
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(hit_ids(&m, cx).is_empty());
+        assert!(m.read_with(cx, |m, _| m.is_searching()));
+        source.answer(1, Ok(page("shader")));
+        settle(cx, |cx| hit_ids(&m, cx) == ["shader-1"]);
+        assert!(!m.read_with(cx, |m, _| m.is_searching()));
+        assert!(shows(&app, cx, hit_row_id("shader-1")));
+
+        // A new search keeps the list and shows progress instead.
+        m.update(cx, |m, cx| m.set_kind(ContentKind::ResourcePack, cx));
+        settle(cx, |_| source.queries().len() == 3);
+        assert_eq!(hit_ids(&m, cx), ["shader-1"]);
+        assert!(shows(&app, cx, hit_row_id("shader-1")));
+        assert!(shows(&app, cx, "downloads-searching"));
+        source.answer(2, Ok(page("pack")));
+        settle(cx, |cx| hit_ids(&m, cx) == ["pack-1"]);
+        assert!(!shows(&app, cx, "downloads-searching"));
+    }
+
+    #[gpui_kit::test]
+    fn target_follows_its_instance_when_it_changes(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, m) = app_with(cx, tmp.path(), None);
+        let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+        let instances = instances_model(&app, cx);
+        let refresh = |cx: &mut TestAppContext| {
+            instances.update(cx, |i, cx| i.refresh(cx));
+            list_settled(&instances, cx);
+            cx.run_until_parked();
+        };
+        click(&app, cx, "rail-downloads");
+        m.update(cx, |m, cx| m.set_target(Some("Fab"), cx));
+
+        // Its version changed on disk: the filters follow.
+        let mut fab = store.load("Fab").unwrap();
+        fab.config.set_mc_version("1.20.4");
+        store.save(&fab).unwrap();
+        refresh(cx);
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.target(), Some("Fab"));
+            assert_eq!(m.mc_version(), Some("1.20.4"));
+        });
+
+        // Renamed: the button names it.
+        fab.config.name = "Fab2".into();
+        store.save(&fab).unwrap();
+        refresh(cx);
+        assert_eq!(
+            label_of(&app, cx, "downloads-install").as_deref(),
+            Some("Install to Fab2")
+        );
+
+        // Deleted: no target any more, filters stay.
+        store.delete("Fab").unwrap();
+        refresh(cx);
+        m.read_with(cx, |m, _| {
+            assert_eq!(m.target(), None);
+            assert_eq!(m.mc_version(), Some("1.20.4"));
+        });
+        assert_eq!(
+            label_of(&app, cx, "downloads-install").as_deref(),
+            Some("Choose instance…")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn entry_rules_are_explicit(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_app, m) = app_with(cx, tmp.path(), None);
+        let open = |cx: &mut TestAppContext, t: Option<&str>, q: Option<&str>| {
+            m.update(cx, |m, cx| m.open(t, q, cx));
+        };
+        let look = |cx: &mut TestAppContext| {
+            m.read_with(cx, |m, _| {
+                (m.target().map(str::to_owned), m.text().to_owned())
+            })
+        };
+
+        // From search: the words, no target.
+        open(cx, None, Some(" sodium "));
+        assert_eq!(look(cx), (None, "sodium".into()));
+
+        // From the Mods tab: the target, empty words.
+        open(cx, Some("Fab"), None);
+        assert_eq!(look(cx), (Some("Fab".into()), String::new()));
+        m.read_with(cx, |m, _| assert_eq!(m.loader(), Some(LoaderKind::Fabric)));
+
+        // With words and a target set, a search entry clears the target.
+        m.update(cx, |m, cx| m.set_text("lithium", cx));
+        open(cx, None, Some("iris"));
+        assert_eq!(look(cx), (None, "iris".into()));
+
+        // Both together apply both.
+        open(cx, Some("Van"), Some("x"));
+        assert_eq!(look(cx), (Some("Van".into()), "x".into()));
+
+        // An unknown target is ignored; the words still apply.
+        open(cx, Some("nope"), Some("y"));
+        assert_eq!(look(cx), (Some("Van".into()), "y".into()));
+        open(cx, Some("nope"), None);
+        assert_eq!(look(cx), (Some("Van".into()), "y".into()));
+    }
+}
