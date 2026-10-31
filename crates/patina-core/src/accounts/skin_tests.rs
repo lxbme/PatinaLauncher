@@ -597,3 +597,135 @@ async fn failed_removal_keeps_head_and_cross_owner_change_advances_reader_revisi
     );
     assert!(f.service.snapshot().await.unwrap().revision() > revision);
 }
+
+#[test]
+fn icc_capacity_overshoot_is_excluded_before_both_core_decoders() {
+    use super::skin::pixel_png;
+    use std::io::Write;
+    for size in [900 * 1024, 2 * 1024 * 1024] {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![0; size]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        // Exercise the actual pinned vulnerable allocation, not a model or
+        // global allocator. Both success and partial-error vectors overshoot.
+        let old = match fdeflate::decompress_to_vec_bounded(&compressed, 992 * 1024) {
+            Ok(bytes) => {
+                assert!(size < 992 * 1024);
+                bytes
+            }
+            Err(fdeflate::BoundedDecompressionError::OutputTooLarge { partial_output }) => {
+                assert!(size > 992 * 1024);
+                partial_output
+            }
+            Err(_) => panic!("valid synthetic deflate"),
+        };
+        assert!(old.capacity() > 1024 * 1024, "capacity {}", old.capacity());
+        eprintln!(
+            "isolated fdeflate ICC probe: decoded={size}, length={}, capacity={}",
+            old.len(),
+            old.capacity()
+        );
+        drop(old);
+        let original = png(64, 64);
+        let mut data = b"profile\0\0".to_vec();
+        data.extend(compressed);
+        let mut annotated = original.clone();
+        annotated.splice(33..33, chunk(b"iCCP", &data));
+        assert!(annotated.len() < 256 * 1024);
+        let input = pixel_png(&annotated).unwrap();
+        // This seam feeds the shared core PngDecoder for network and cache.
+        // No ancillary byte can reach parse_iccp/decompress_to_vec_bounded.
+        assert!(input == original, "ICC reached the decoder input");
+        assert!(input.capacity() <= 256 * 1024);
+        assert!(
+            input.capacity() + super::skin::PIXEL_DECODE_ALLOCATION_BOUND
+                - super::skin::MAX_DOWNLOAD
+                <= 1024 * 1024
+        );
+        assert!(std::mem::size_of::<fdeflate::Decompressor>() <= 2048);
+        assert_eq!(
+            decode_head(&annotated).unwrap(),
+            decode_head(&original).unwrap()
+        );
+    }
+}
+
+#[test]
+fn pixel_png_preserves_palette_transparency_and_bounds_chunk_framing() {
+    use super::skin::pixel_png;
+    use std::io::Write;
+    let mut indexed = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend(64u32.to_be_bytes());
+    ihdr.extend(64u32.to_be_bytes());
+    ihdr.extend([8, 3, 0, 0, 0]);
+    indexed.extend(chunk(b"IHDR", &ihdr));
+    indexed.extend(chunk(b"PLTE", &[200, 40, 20, 0, 0, 220, 0, 0, 0]));
+    indexed.extend(chunk(b"tRNS", &[255, 128, 0]));
+    let mut raw = Vec::new();
+    for y in 0..64 {
+        raw.push(0);
+        for x in 0..64 {
+            raw.push(if (8..16).contains(&y) && (8..16).contains(&x) {
+                0
+            } else if (8..16).contains(&y) && (40..48).contains(&x) {
+                1
+            } else {
+                2
+            });
+        }
+    }
+    let mut compressed =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    compressed.write_all(&raw).unwrap();
+    indexed.extend(chunk(b"IDAT", &compressed.finish().unwrap()));
+    indexed.extend(chunk(b"IEND", &[]));
+    assert_eq!(pixel_png(&indexed).unwrap(), indexed);
+    let head = image::load_from_memory(&decode_head(&indexed).unwrap())
+        .unwrap()
+        .into_rgba8();
+    assert!((99..=100).contains(&head.get_pixel(0, 0)[0]));
+    assert!((119..=121).contains(&head.get_pixel(0, 0)[2]));
+    let pixels = super::skin::decode_pixels(&indexed).unwrap();
+    assert_eq!(pixels.get_pixel(0, 0)[3], 0);
+    assert_eq!(pixels.get_pixel(8, 8)[3], 255);
+    assert_eq!(pixels.get_pixel(40, 8)[3], 128);
+    let mut blended = *pixels.get_pixel(8, 8);
+    image::Pixel::blend(&mut blended, pixels.get_pixel(40, 8));
+    assert_eq!(*head.get_pixel(0, 0), blended);
+    for kind in [b"iCCP", b"iTXt", b"zTXt", b"eXIf", b"vpAg"] {
+        let mut annotated = indexed.clone();
+        annotated.splice(33..33, chunk(kind, &vec![0; 128 * 1024]));
+        let filtered = pixel_png(&annotated).unwrap();
+        assert_eq!(filtered, indexed);
+        assert!(filtered.capacity() <= 256 * 1024);
+    }
+    for (kind, size) in [(b"PLTE", 769), (b"tRNS", 257), (b"ABCD", 0)] {
+        let mut invalid = png(64, 64);
+        invalid.splice(33..33, chunk(kind, &vec![0; size]));
+        assert!(pixel_png(&invalid).is_err());
+    }
+    let mut truncated = png(64, 64);
+    truncated[33..37].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(pixel_png(&truncated).is_err());
+    let mut trailing = png(64, 64);
+    trailing.extend(b"trailing");
+    assert!(pixel_png(&trailing).is_err());
+}
+
+#[test]
+fn rgba16_pixel_stream_stays_supported_without_metadata() {
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+        64,
+        64,
+        image::Rgba([65535u16, 0, 0, 32768]),
+    ))
+    .write_to(&mut encoded, ImageFormat::Png)
+    .unwrap();
+    let output = decode_head(encoded.get_ref()).unwrap();
+    let head = image::load_from_memory(&output).unwrap().into_rgba8();
+    assert_eq!(head.dimensions(), (64, 64));
+    assert_eq!(head.get_pixel(0, 0)[0], 255);
+    assert!(head.get_pixel(0, 0)[3] > 128 && head.get_pixel(0, 0)[3] < 255);
+}

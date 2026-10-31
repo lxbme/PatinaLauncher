@@ -10,17 +10,50 @@ const MAX_HEADS: usize = 64;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const RASTER_BYTES: usize = 64 * 64 * 4;
 
+/// The service emits only noninterlaced RGBA8 IHDR/IDAT/IEND. Refuse any
+/// ancillary data before constructing image's PNG parser (including ICC).
+/// No filtering copy is allocated here; core owns normalization of raw skins.
+fn normalized_head_input(bytes: &[u8]) -> bool {
+    if bytes.len() > 256 * 1024
+        || bytes.len() < 33
+        || &bytes[..16] != b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"
+        || bytes[16..24] != [0, 0, 0, 64, 0, 0, 0, 64]
+        || bytes[24..29] != [8, 6, 0, 0, 0]
+    {
+        return false;
+    }
+    let mut offset: usize = 33;
+    let mut data = false;
+    while let Some(header) = bytes.get(offset..offset + 8) {
+        let len = u32::from_be_bytes(header[..4].try_into().expect("chunk length")) as usize;
+        let Some(end) = offset.checked_add(12).and_then(|n| n.checked_add(len)) else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
+        match &header[4..8] {
+            b"IDAT" => data = true,
+            b"IEND" => return len == 0 && data && end == bytes.len(),
+            _ => return false,
+        }
+        offset = end;
+    }
+    false
+}
+
 struct PreparedHead(image::RgbaImage);
 impl PreparedHead {
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > 256 * 1024 {
+        if !normalized_head_input(bytes) {
             return None;
         }
         let mut limits = Limits::default();
         limits.max_image_width = Some(64);
         limits.max_image_height = Some(64);
-        // Reserve the maximum 16-bit decoded source outside png's budget.
-        limits.max_alloc = Some(1024 * 1024 - 64 * 64 * 8);
+        // No metadata parser path is reachable. The core pixel-stream bound
+        // also covers this decoder, with no filter copy and RGBA8-only output.
+        limits.max_alloc = Some(1024 * 1024);
         let decoder = PngDecoder::with_limits(Cursor::new(bytes), limits).ok()?;
         if decoder.dimensions() != (64, 64) {
             return None;
@@ -48,6 +81,8 @@ pub(super) struct AvatarCache {
     entries: HashMap<String, HeadEntry>,
     pending: HashMap<String, Task<()>>,
     bytes: usize,
+    // App queue/final-decode admission. Non-preemptible core decodes retain
+    // their own service-owned admission even when this pipeline is aborted.
     loads: Arc<tokio::sync::Semaphore>,
 }
 // Task7's single-owner migration calls new/reconcile/load. Do not instantiate
@@ -472,6 +507,35 @@ mod tests {
         // GPUI temporarily removes the current window from App.windows here.
         cx.update(|_, cx| cache.update(cx, |cache, cx| cache.reconcile(2, &[], cx)));
         cx.update(|window, _| assert!(!window.has_image_atlas_entry(&image)));
+    }
+    #[test]
+    fn normalized_head_guard_rejects_metadata_before_png_parser() {
+        let mut original = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(RgbaImage::new(64, 64))
+            .write_to(&mut original, ImageFormat::Png)
+            .unwrap();
+        for kind in [b"iCCP", b"zTXt", b"eXIf"] {
+            let data = b"profile\0\0\x78\x9c\x03\x00\x00\x00\x00\x01";
+            let mut body = kind.to_vec();
+            body.extend(data);
+            let mut crc = !0u32;
+            for &byte in &body {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ if crc & 1 != 0 { 0xedb88320 } else { 0 };
+                }
+            }
+            let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+            chunk.extend(body);
+            chunk.extend((!crc).to_be_bytes());
+            let mut annotated = original.get_ref().clone();
+            annotated.splice(33..33, chunk);
+            assert!(
+                PreparedHead::decode(&annotated).is_none(),
+                "unused ancillary reached app decoder: {kind:?}"
+            );
+        }
+        assert!(PreparedHead::decode(original.get_ref()).is_some());
     }
     #[test]
     fn malformed_heads_use_letter_fallback() {

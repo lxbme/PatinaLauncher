@@ -5398,6 +5398,7 @@ dependencies = [
  "chrono",
  "dirs 7.0.0",
  "fastnbt",
+ "fdeflate",
  "flate2",
  "futures",
  "hex",

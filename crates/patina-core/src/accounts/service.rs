@@ -119,6 +119,9 @@ struct Inner {
     data: DataDirs,
     client: MsaClient,
     skin: super::skin::SkinClient,
+    skin_decodes: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    skin_decode_probe: std::sync::Mutex<Option<Arc<skin::DecodeProbe>>>,
     credentials: Arc<CredentialStore>,
     clock: Arc<dyn AuthClock>,
     operation: Arc<Mutex<OperationState>>,
@@ -195,6 +198,9 @@ impl AccountService {
                 data,
                 client,
                 skin: super::skin::SkinClient::production(),
+                skin_decodes: Arc::new(tokio::sync::Semaphore::new(1)),
+                #[cfg(test)]
+                skin_decode_probe: std::sync::Mutex::new(None),
                 credentials: Arc::new(credentials),
                 clock,
                 operation: Arc::new(Mutex::new(OperationState::default())),

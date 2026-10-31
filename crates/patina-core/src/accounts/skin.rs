@@ -8,6 +8,16 @@ use std::{io::Cursor, time::Duration};
 
 pub(super) const MAX_DOWNLOAD: usize = 256 * 1024;
 const MAX_DECODE: u64 = 1024 * 1024;
+// png 0.18.1 / fdeflate 0.3.7 with metadata excluded by pixel_png:
+// 256KiB fixed filter copy; 512KiB inflater allowance (two <=2^15-entry
+// u16 secondary tables, 2x Vec growth and realloc overlap, 18KiB primary
+// tables/reset overlap and <=2KiB boxed state); 128KiB PNG allowance
+// (<=66KiB unfilter Vec + old allocation, rows, <=1KiB individual chunk/palette buffers);
+// 32KiB RGBA16 output. IDAT streams into the bounded frame, never an ICC Vec.
+// These conservative capacity allowances total 928KiB, not a length limit.
+pub(super) const PIXEL_DECODE_ALLOCATION_BOUND: usize =
+    MAX_DOWNLOAD + 512 * 1024 + 128 * 1024 + 32 * 1024;
+const _: () = assert!(PIXEL_DECODE_ALLOCATION_BOUND <= MAX_DECODE as usize);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SkinError {
@@ -99,7 +109,10 @@ impl SkinClient {
     }
 }
 
-pub(super) fn decode_head(bytes: &[u8]) -> Result<Vec<u8>, SkinError> {
+/// Exclude unused metadata *before* png parses it. Keep only the PNG pixel
+/// stream and bounded palette/transparency chunks; library code still owns
+/// CRC validation, inflate, filtering, color conversion and interlacing.
+pub(super) fn pixel_png(bytes: &[u8]) -> Result<Vec<u8>, SkinError> {
     if bytes.len() > MAX_DOWNLOAD {
         return Err(SkinError::TooLarge);
     }
@@ -111,22 +124,78 @@ pub(super) fn decode_head(bytes: &[u8]) -> Result<Vec<u8>, SkinError> {
     if width != 64 || !matches!(height, 32 | 64) {
         return Err(SkinError::InvalidDimensions);
     }
-    // with_limits applies png's allocation budget during header/chunk parsing,
-    // unlike constructing an unlimited decoder and setting limits afterwards.
+    // One allocation with no growth, including when every chunk is retained.
+    let mut pixels = Vec::with_capacity(bytes.len());
+    pixels.extend_from_slice(&bytes[..33]);
+    let mut offset = 33;
+    let mut palette = false;
+    let mut transparency = false;
+    let mut data = false;
+    let mut data_ended = false;
+    while let Some(header) = bytes.get(offset..offset + 8) {
+        let len = u32::from_be_bytes(header[..4].try_into().expect("chunk length")) as usize;
+        let end = offset
+            .checked_add(12)
+            .and_then(|n| n.checked_add(len))
+            .ok_or(SkinError::InvalidPng)?;
+        let chunk = bytes.get(offset..end).ok_or(SkinError::InvalidPng)?;
+        let kind = &header[4..8];
+        if !kind.iter().all(u8::is_ascii_alphabetic) || !kind[2].is_ascii_uppercase() {
+            return Err(SkinError::InvalidPng);
+        }
+        let keep = match kind {
+            b"PLTE" if !palette && !data && (3..=768).contains(&len) && len.is_multiple_of(3) => {
+                palette = true;
+                true
+            }
+            b"tRNS" if !transparency && !data && (1..=256).contains(&len) => {
+                transparency = true;
+                true
+            }
+            b"IDAT" if !data_ended => {
+                data = true;
+                true
+            }
+            b"IEND" if len == 0 && data && end == bytes.len() => {
+                pixels.extend_from_slice(chunk);
+                return Ok(pixels);
+            }
+            b"tRNS" => return Err(SkinError::InvalidPng),
+            _ if kind[0].is_ascii_uppercase() => return Err(SkinError::InvalidPng),
+            _ => false,
+        };
+        if data && kind != b"IDAT" {
+            data_ended = true;
+        }
+        if keep {
+            pixels.extend_from_slice(chunk);
+        }
+        offset = end;
+    }
+    Err(SkinError::InvalidPng)
+}
+
+/// One decoder input path for both downloaded skins and replaced cached heads.
+pub(super) fn decode_pixels(bytes: &[u8]) -> Result<RgbaImage, SkinError> {
+    let pixels = pixel_png(bytes)?;
+    // The allowlist/capacity accounting excludes ancillary allocation; limits
+    // remain defense in depth, not a claim about Vec capacity in dependencies.
     let mut limits = Limits::default();
     limits.max_image_width = Some(64);
     limits.max_image_height = Some(64);
-    // DynamicImage allocates its output outside png's internal budget.
-    // A 64×64 RGBA16 source is the largest supported output (32 KiB).
-    limits.max_alloc = Some(MAX_DECODE - 64 * 64 * 8);
+    limits.max_alloc = Some(MAX_DECODE);
     let decoder =
-        PngDecoder::with_limits(Cursor::new(bytes), limits).map_err(|_| SkinError::Decode)?;
-    if decoder.dimensions() != (width, height) {
+        PngDecoder::with_limits(Cursor::new(pixels), limits).map_err(|_| SkinError::Decode)?;
+    if decoder.dimensions().0 != 64 || !matches!(decoder.dimensions().1, 32 | 64) {
         return Err(SkinError::InvalidDimensions);
     }
-    let skin = DynamicImage::from_decoder(decoder)
+    Ok(DynamicImage::from_decoder(decoder)
         .map_err(|_| SkinError::Decode)?
-        .into_rgba8();
+        .into_rgba8())
+}
+
+pub(super) fn decode_head(bytes: &[u8]) -> Result<Vec<u8>, SkinError> {
+    let skin = decode_pixels(bytes)?;
     let mut face = RgbaImage::new(8, 8);
     for y in 0..8 {
         for x in 0..8 {

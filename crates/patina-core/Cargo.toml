@@ -46,6 +46,8 @@ oo7 = { version = "=0.6.0", default-features = false, features = ["async-std", "
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+# Isolated capacity regression for image -> png's pinned inflater.
+fdeflate = "=0.3.7"
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "p2p"] }
 tokio = { version = "1.54.1", features = ["test-util"] }
 fastnbt = "2.6.3"
