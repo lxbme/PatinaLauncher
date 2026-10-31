@@ -192,3 +192,5 @@ auth:
     entitlement: "game ownership check"
     profile: "Minecraft profile"
     skin: "skin download"
+credentials:
+  keyring_label: "Patina credentials"

@@ -192,3 +192,5 @@ auth:
     entitlement: "游戏所有权验证"
     profile: "Minecraft 档案"
     skin: "皮肤下载"
+credentials:
+  keyring_label: "Patina 凭据"

@@ -88,6 +88,7 @@ mod peer {
         mode: Mutex<&'static str>,
         key: Mutex<Option<Key>>,
         saved: Mutex<Vec<u8>>,
+        label: Mutex<Option<String>>,
         prompts: AtomicUsize,
         unlocks: AtomicUsize,
         encrypted_sessions: AtomicUsize,
@@ -159,12 +160,20 @@ mod peer {
         }
         async fn create_item(
             &self,
-            properties: HashMap<String, OwnedValue>,
+            mut properties: HashMap<String, OwnedValue>,
             secret: DBusSecretInner,
             replace: bool,
         ) -> (OwnedObjectPath, OwnedObjectPath) {
             assert!(replace);
             assert!(properties.contains_key("org.freedesktop.Secret.Item.Attributes"));
+            *self.0.label.lock().unwrap() = Some(
+                String::try_from(
+                    properties
+                        .remove("org.freedesktop.Secret.Item.Label")
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
             save(&self.0, secret);
             let mode = *self.0.mode.lock().unwrap();
             if mode == "write-hang" {
@@ -239,6 +248,10 @@ mod peer {
         *state.mode.lock().unwrap() = "create";
         let (_server, client) = connections(state.clone()).await;
         write_connected(&client, REF, PAYLOAD).await.unwrap();
+        assert!(matches!(
+            state.label.lock().unwrap().as_deref(),
+            Some("Patina credentials" | "Patina 凭据")
+        ));
         assert_eq!(*state.saved.lock().unwrap(), PAYLOAD);
         *state.mode.lock().unwrap() = "read";
         assert_eq!(

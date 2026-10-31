@@ -286,7 +286,8 @@ mod linux {
                 return Err(CredentialError::Unavailable);
             }
             let attributes = [("service", "patina-launcher"), ("username", reference)];
-            let properties = api::Properties::for_item("Patina credential", &attributes);
+            let properties =
+                api::Properties::for_item(&rust_i18n::t!("credentials.keyring_label"), &attributes);
             let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = collection
                 .call("CreateItem", &(properties, secret, true))
                 .await
