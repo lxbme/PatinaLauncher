@@ -55,7 +55,14 @@ mod linux {
         fd: OwnedFd,
     }
     pub(crate) struct CredentialLock {
-        _fd: OwnedFd,
+        fd: OwnedFd,
+    }
+    impl Drop for CredentialLock {
+        fn drop(&mut self) {
+            // Closing alone can retain the lock in a concurrent fork's copy of
+            // the open file description, until that child reaches CLOEXEC.
+            let _ = fs::flock(&self.fd, fs::FlockOperation::Unlock);
+        }
     }
     #[cfg(test)]
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,6 +107,17 @@ mod linux {
             return Err(CredentialError::UnsafePath);
         }
         Ok(())
+    }
+    #[test]
+    fn guard_drop_unlocks_even_with_inherited_open_file_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = PrivateCredentialDir::open(&DataDirs::new(tmp.path())).unwrap();
+        let guard = dir.try_lock().unwrap().unwrap();
+        // A concurrent fork can inherit this description until CLOEXEC runs.
+        let inherited = rustix::io::dup(&guard.fd).unwrap();
+        drop(guard);
+        assert!(dir.try_lock().unwrap().is_some());
+        drop(inherited);
     }
     #[test]
     fn foreign_owner_metadata_is_rejected_without_chown() {
@@ -361,7 +379,7 @@ mod linux {
             };
             match fs::flock(&fd, fs::FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => {
-                    let guard = CredentialLock { _fd: fd };
+                    let guard = CredentialLock { fd };
                     self.cleanup_temps()?;
                     Ok(Some(guard))
                 }
