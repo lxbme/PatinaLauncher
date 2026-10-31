@@ -548,3 +548,52 @@ pub fn cached_avatar(
 ) -> Option<Arc<gpui_kit::RenderImage>> {
     crate::accounts::avatar::cached_image(account, cx)
 }
+
+#[derive(Default)]
+struct AccountSnapshotDelivery {
+    count: usize,
+    error: Option<(
+        tokio::sync::oneshot::Sender<u64>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+}
+impl gpui_kit::Global for AccountSnapshotDelivery {}
+
+/// Holds the follower's next actual error result after capture but before it
+/// reads the latest producer revision. Returns capture acknowledgement and release.
+pub fn hold_next_account_snapshot_error(
+    cx: &mut gpui_kit::App,
+) -> (
+    tokio::sync::oneshot::Receiver<u64>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (captured, capture) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    cx.set_global(AccountSnapshotDelivery {
+        count: 0,
+        error: Some((captured, released)),
+    });
+    (capture, release)
+}
+
+/// Counts follower deliveries only after the test barrier has been installed.
+pub fn account_snapshot_delivery_count(cx: &gpui_kit::App) -> usize {
+    cx.global::<AccountSnapshotDelivery>().count
+}
+
+pub(super) fn account_snapshot_delivery(
+    cx: &mut gpui_kit::App,
+    observed: u64,
+    is_error: bool,
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    if !cx.has_global::<AccountSnapshotDelivery>() {
+        return None;
+    }
+    let delivery = cx.global_mut::<AccountSnapshotDelivery>();
+    delivery.count += 1;
+    if is_error && let Some((captured, released)) = delivery.error.take() {
+        let _ = captured.send(observed);
+        return Some(released);
+    }
+    None
+}

@@ -675,3 +675,135 @@ fn changing_selection_during_warnings_keeps_captured_identity(cx: &mut TestAppCo
         other.id
     );
 }
+
+#[gpui_kit::test]
+fn superseded_error_delivery_does_not_poison_recovered_avatar_revision(cx: &mut TestAppContext) {
+    use patina_app::core_bridge::AccountsChanged;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = patina_app::runtime::start();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(chain(&server));
+    rt.block_on(Mock::given(path("/6")).and(method("GET")).and(header("authorization", "Bearer MC_SYNTHETIC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"0123456789abcdef0123456789abcdef","name":"Steve","skins":[{"state":"ACTIVE","url":"https://textures.minecraft.net/texture/abcdef"}]})))
+        .with_priority(1).mount(&server));
+    for (hash, pixel) in [
+        ("abcdef", [20, 80, 160, 255]),
+        ("fedcba", [160, 80, 20, 255]),
+    ] {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, image::Rgba(pixel)))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        rt.block_on(
+            Mock::given(path(format!("/texture/{hash}")))
+                .and(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(png.into_inner()))
+                .expect(1)
+                .mount(&server),
+        );
+    }
+    let accounts = service(DataDirs::new(tmp.path()), &server);
+    let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+        testing::core_with_accounts(rt, data, Arc::new(FakeCatalog::new()), accounts.clone())
+    });
+    open_page(&app, cx);
+    click(&app, cx, "accounts-add-msa");
+    settle(cx, |cx| shows(&app, cx, "login-done"));
+    click(&app, cx, "login-close");
+    settle(cx, |cx| shows(&app, cx, "switcher-head"));
+    let initial = rt.block_on(accounts.snapshot()).unwrap();
+    let old_image = cx
+        .update(|cx| testing::cached_avatar(initial.current().unwrap(), cx))
+        .unwrap();
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.has_image_atlas_entry(&old_image));
+    })
+    .unwrap();
+    let metadata = accounts_file(tmp.path());
+    let recovered_metadata = metadata.replace("skin_hash = \"abcdef\"", "skin_hash = \"fedcba\"");
+    assert_ne!(metadata, recovered_metadata);
+
+    let (mut captured, release) = cx.update(testing::hold_next_account_snapshot_error);
+    std::fs::write(tmp.path().join("accounts.toml"), "not [valid").unwrap();
+    assert!(rt.block_on(accounts.reload()).is_err());
+    let error_revision = *accounts.changes().borrow();
+    assert_eq!(error_revision, initial.revision() + 1);
+    // The barrier acknowledges only an Err returned by the real service, not a
+    // request that might subsequently read the recovered successful snapshot.
+    settle(cx, |_| {
+        captured
+            .try_recv()
+            .is_ok_and(|revision| revision == error_revision)
+    });
+    assert!(rt.block_on(accounts.snapshot()).is_err());
+    assert_eq!(
+        cx.update(|cx| testing::account_snapshot_delivery_count(cx)),
+        1
+    );
+    assert_eq!(
+        cx.update(|cx| AccountsChanged::epoch(cx).read(cx).get()),
+        initial.revision()
+    );
+
+    std::fs::write(tmp.path().join("accounts.toml"), recovered_metadata).unwrap();
+    rt.block_on(accounts.reload()).unwrap();
+    let recovered = rt.block_on(accounts.snapshot()).unwrap();
+    assert_eq!(recovered.revision(), error_revision + 1);
+    let account = recovered.current().unwrap();
+    assert_eq!(account.skin_hash(), Some("fedcba"));
+    release.send(()).unwrap();
+    settle(cx, |cx| {
+        cx.update(|cx| testing::account_snapshot_delivery_count(cx)) == 2
+            && cx.update(|cx| AccountsChanged::epoch(cx).read(cx).get()) == recovered.revision()
+    });
+    let mut loaded = None;
+    for _ in 0..500 {
+        cx.run_until_parked();
+        loaded = cx.update(|cx| testing::cached_avatar(account, cx));
+        if loaded.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let image = loaded.expect("recovered revision must load its head after obsolete Err delivery");
+    assert!(!Arc::ptr_eq(&image, &old_image));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .within("accounts")
+                .find("account-head-0123456789abcdef0123456789abcdef")
+                .visible()
+        );
+        assert!(window.find("switcher-head").visible());
+        assert!(window.has_image_atlas_entry(&image));
+        assert!(!window.has_image_atlas_entry(&old_image));
+    })
+    .unwrap();
+
+    // No extra mutation/revision is needed to load the recovered head. Repeated
+    // follow and unchanged reloads must leave the settled follower asleep.
+    cx.update(|cx| {
+        AccountsChanged::follow_core(cx);
+        AccountsChanged::follow_core(cx);
+    });
+    for _ in 0..3 {
+        rt.block_on(accounts.reload()).unwrap();
+        cx.run_until_parked();
+    }
+    assert_eq!(*accounts.changes().borrow(), recovered.revision());
+    assert_eq!(
+        cx.update(|cx| AccountsChanged::epoch(cx).read(cx).get()),
+        recovered.revision()
+    );
+    assert_eq!(
+        cx.update(|cx| testing::account_snapshot_delivery_count(cx)),
+        2
+    );
+    assert!(Arc::ptr_eq(
+        &image,
+        &cx.update(|cx| testing::cached_avatar(account, cx)).unwrap()
+    ));
+}

@@ -46,7 +46,22 @@ impl AccountsChanged {
                 let snapshot = cx
                     .update(|cx| run(cx, async move { read_service.snapshot().await }))
                     .await;
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(released) = cx.update(|cx| {
+                    super::testing::account_snapshot_delivery(
+                        cx,
+                        observed,
+                        snapshot.as_ref().is_ok_and(Result::is_err),
+                    )
+                }) {
+                    let _ = released.await;
+                }
                 let latest = *changes.borrow();
+                // Errors carry no revision: never attribute a superseded read to
+                // the latest producer state, even when that read failed.
+                if observed != latest {
+                    continue;
+                }
                 cx.update(|cx| {
                     let accounts = snapshot.as_ref().ok().and_then(|s| s.as_ref().ok());
                     // Never reconcile an obsolete successful read under a newer revision.
@@ -68,9 +83,6 @@ impl AccountsChanged {
                         }
                     });
                 });
-                if latest != observed {
-                    continue;
-                }
                 if changes.changed().await.is_err() {
                     break;
                 }
