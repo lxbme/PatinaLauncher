@@ -87,6 +87,11 @@ mod peer {
     struct State {
         mode: Mutex<&'static str>,
         key: Mutex<Option<Key>>,
+        peer_public: Mutex<Option<Vec<u8>>>,
+        public_padding: AtomicUsize,
+        get_secret_calls: AtomicUsize,
+        set_secret_calls: AtomicUsize,
+        create_item_calls: AtomicUsize,
         saved: Mutex<Vec<u8>>,
         label: Mutex<Option<String>>,
         prompts: AtomicUsize,
@@ -119,11 +124,16 @@ mod peer {
         ) -> (OwnedValue, OwnedObjectPath) {
             assert_eq!(algorithm, "dh-ietf1024-sha256-aes128-cbc-pkcs7");
             self.0.encrypted_sessions.fetch_add(1, Ordering::SeqCst);
+            if let Some(public) = self.0.peer_public.lock().unwrap().as_ref() {
+                return (Key::new(public.clone()).into(), path(SESSION));
+            }
             let private = Key::generate_private_key().unwrap();
             let public = Key::generate_public_key(&private).unwrap();
             let remote = Key::try_from(input).unwrap();
             *self.0.key.lock().unwrap() = Some(Key::generate_aes_key(&private, &remote).unwrap());
-            (public.into(), path(SESSION))
+            let mut encoded = vec![0; self.0.public_padding.load(Ordering::SeqCst)];
+            encoded.extend_from_slice(public.as_ref());
+            (Key::new(encoded).into(), path(SESSION))
         }
         fn read_alias(&self, alias: &str) -> OwnedObjectPath {
             assert_eq!(alias, "default");
@@ -163,7 +173,13 @@ mod peer {
             mut properties: HashMap<String, OwnedValue>,
             secret: DBusSecretInner,
             replace: bool,
-        ) -> (OwnedObjectPath, OwnedObjectPath) {
+        ) -> zbus::fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
+            self.0.create_item_calls.fetch_add(1, Ordering::SeqCst);
+            if self.0.peer_public.lock().unwrap().is_some() {
+                return Err(zbus::fdo::Error::Failed(
+                    "unexpected secret operation".into(),
+                ));
+            }
             assert!(replace);
             assert!(properties.contains_key("org.freedesktop.Secret.Item.Attributes"));
             *self.0.label.lock().unwrap() = Some(
@@ -180,16 +196,22 @@ mod peer {
                 std::future::pending::<()>().await;
             }
             if mode == "create-prompt" {
-                (path("/"), path("/test/prompt"))
+                Ok((path("/"), path("/test/prompt")))
             } else {
-                (path(PATH), path("/"))
+                Ok((path(PATH), path("/")))
             }
         }
     }
     struct Item(Arc<State>);
     #[zbus::interface(name = "org.freedesktop.Secret.Item")]
     impl Item {
-        fn get_secret(&self, session: OwnedObjectPath) -> DBusSecretInner {
+        fn get_secret(&self, session: OwnedObjectPath) -> zbus::fdo::Result<DBusSecretInner> {
+            self.0.get_secret_calls.fetch_add(1, Ordering::SeqCst);
+            if self.0.peer_public.lock().unwrap().is_some() {
+                return Err(zbus::fdo::Error::Failed(
+                    "unexpected secret operation".into(),
+                ));
+            }
             assert_eq!(session.as_str(), SESSION);
             let key = self.0.key.lock().unwrap();
             let iv = if *self.0.mode.lock().unwrap() == "bad-iv" {
@@ -199,13 +221,30 @@ mod peer {
             };
             let ciphertext = oo7::crypto::encrypt(PAYLOAD, key.as_ref().unwrap(), [0; 16]).unwrap();
             if iv.len() != 16 {
-                return DBusSecretInner(session, iv, ciphertext, oo7::ContentType::Blob);
+                return Ok(DBusSecretInner(
+                    session,
+                    iv,
+                    ciphertext,
+                    oo7::ContentType::Blob,
+                ));
             }
             let ciphertext = oo7::crypto::encrypt(PAYLOAD, key.as_ref().unwrap(), &iv).unwrap();
-            DBusSecretInner(session, iv, ciphertext, oo7::ContentType::Blob)
+            Ok(DBusSecretInner(
+                session,
+                iv,
+                ciphertext,
+                oo7::ContentType::Blob,
+            ))
         }
-        fn set_secret(&self, secret: DBusSecretInner) {
+        fn set_secret(&self, secret: DBusSecretInner) -> zbus::fdo::Result<()> {
+            self.0.set_secret_calls.fetch_add(1, Ordering::SeqCst);
+            if self.0.peer_public.lock().unwrap().is_some() {
+                return Err(zbus::fdo::Error::Failed(
+                    "unexpected secret operation".into(),
+                ));
+            }
             save(&self.0, secret);
+            Ok(())
         }
         fn delete(&self) -> OwnedObjectPath {
             if *self.0.mode.lock().unwrap() == "delete-prompt" {
@@ -242,6 +281,168 @@ mod peer {
         let (a, b) = tokio::join!(server, client);
         (a.unwrap(), b.unwrap())
     }
+    // Independent fixture: RFC 2409 section 6.2, not the production bound.
+    fn oakley_group_2_prime() -> Vec<u8> {
+        hex::decode(concat!(
+            "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+            "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+            "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+            "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+            "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381",
+            "FFFFFFFFFFFFFFFF",
+        ))
+        .unwrap()
+    }
+    fn padded(value: &[u8], zeros: usize) -> Vec<u8> {
+        let mut encoded = vec![0; zeros];
+        encoded.extend_from_slice(value);
+        encoded
+    }
+
+    #[tokio::test]
+    async fn invalid_dh_public_values_never_reach_secrets_or_file_fallback() {
+        use crate::accounts::{
+            credentials::{CredentialRecord, CredentialStore},
+            error::AuthError,
+            testing::MemoryCredentials,
+        };
+        use crate::paths::DataDirs;
+        let prime = oakley_group_2_prime();
+        let mut minus_one = prime.clone();
+        *minus_one.last_mut().unwrap() = 0xfe;
+        let mut plus_one = prime.clone();
+        for byte in plus_one.iter_mut().rev() {
+            let (next, carry) = byte.overflowing_add(1);
+            *byte = next;
+            if !carry {
+                break;
+            }
+        }
+        let cases = [
+            ("empty", vec![]),
+            ("zero", vec![0]),
+            ("padded zero", vec![0; 129]),
+            ("one", vec![1]),
+            ("padded one", padded(&[1], 128)),
+            ("p minus one", minus_one.clone()),
+            ("padded p minus one", padded(&minus_one, 1)),
+            ("p", prime.clone()),
+            ("padded p", padded(&prime, 1)),
+            ("p plus one", plus_one),
+            ("maximum 1024-bit value", vec![0xff; 128]),
+            (
+                "oversized significant value",
+                [vec![1], vec![0; 128]].concat(),
+            ),
+            (
+                "padded oversized significant value",
+                [vec![0, 1], vec![0; 128]].concat(),
+            ),
+        ];
+        for (case, public) in cases {
+            let state = Arc::new(State::default());
+            *state.peer_public.lock().unwrap() = Some(public);
+            let (_server, client) = connections(state.clone()).await;
+            assert_eq!(
+                read_connected(&client, REF).await.err(),
+                Some(CredentialError::Corrupt),
+                "{case}: read classification"
+            );
+            assert_eq!(
+                write_connected(&client, REF, PAYLOAD).await,
+                Err(CredentialError::Corrupt),
+                "{case}: update classification"
+            );
+            *state.mode.lock().unwrap() = "create";
+            let error = write_connected(&client, REF, PAYLOAD)
+                .await
+                .expect_err("invalid peer must fail");
+            assert_eq!(
+                error,
+                CredentialError::Corrupt,
+                "{case}: create classification"
+            );
+            assert_eq!(
+                state.encrypted_sessions.load(Ordering::SeqCst),
+                3,
+                "{case}: actual OpenSession calls"
+            );
+            assert_eq!(
+                state.get_secret_calls.load(Ordering::SeqCst),
+                0,
+                "{case}: GetSecret reached"
+            );
+            assert_eq!(
+                state.set_secret_calls.load(Ordering::SeqCst),
+                0,
+                "{case}: SetSecret reached"
+            );
+            assert_eq!(
+                state.create_item_calls.load(Ordering::SeqCst),
+                0,
+                "{case}: CreateItem reached"
+            );
+            assert_eq!(state.prompts.load(Ordering::SeqCst), 0);
+            assert_eq!(state.unlocks.load(Ordering::SeqCst), 0);
+
+            // Pass the actual adapter failure through the unchanged store policy.
+            let tmp = tempfile::tempdir().unwrap();
+            let keyring = Arc::new(MemoryCredentials::default());
+            keyring.set_write_error(Some(error));
+            let files = Arc::new(MemoryCredentials::default());
+            let store = CredentialStore::new(DataDirs::new(tmp.path()), keyring, files.clone());
+            assert_eq!(
+                store.write(REF, &CredentialRecord::decode(PAYLOAD).unwrap()),
+                Err(AuthError::CredentialCorrupt),
+                "{case}: fallback must not succeed"
+            );
+            assert!(
+                files.read(REF).unwrap().is_none(),
+                "{case}: fallback file backend was written"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dh_public_range_boundaries_accept_unsigned_leading_zero_encodings() {
+        let mut minus_two = oakley_group_2_prime();
+        *minus_two.last_mut().unwrap() = 0xfd;
+        for public in [
+            vec![2],
+            padded(&[2], 128),
+            minus_two.clone(),
+            padded(&minus_two, 1),
+        ] {
+            let state = Arc::new(State::default());
+            *state.peer_public.lock().unwrap() = Some(public);
+            let (_server, client) = connections(state.clone()).await;
+            // The fixture deliberately refuses GetSecret for overridden keys.
+            // Reaching it proves range acceptance, not a successful exchange.
+            assert_eq!(
+                read_connected(&client, REF).await.err(),
+                Some(CredentialError::Corrupt)
+            );
+            assert_eq!(state.get_secret_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_padded_dh_public_values_complete_encrypted_exchange() {
+        for zeros in [0, 1, 128] {
+            let state = Arc::new(State::default());
+            state.public_padding.store(zeros, Ordering::SeqCst);
+            *state.mode.lock().unwrap() = "create";
+            let (_server, client) = connections(state.clone()).await;
+            write_connected(&client, REF, PAYLOAD).await.unwrap();
+            *state.mode.lock().unwrap() = "read";
+            assert!(read_connected(&client, REF).await.unwrap().is_some());
+            assert_eq!(state.create_item_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.get_secret_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.prompts.load(Ordering::SeqCst), 0);
+            assert_eq!(state.unlocks.load(Ordering::SeqCst), 0);
+        }
+    }
+
     #[tokio::test]
     async fn encrypted_read_write_and_delete_never_prompt() {
         let state = Arc::new(State::default());
