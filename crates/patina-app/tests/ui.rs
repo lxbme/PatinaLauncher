@@ -16,7 +16,7 @@ use patina_app::instances::{
     InstancesModel, RunState, forget_cached_image, icon_for, instance_icon, pick_id, row_id,
     save_icon,
 };
-use patina_app::launch::{OpError, OpKind, OpState};
+use patina_app::launch::{LevelFilter, LogView, OpError, OpKind, OpState};
 use patina_app::settings::{self, AppSettings, SettingsStore};
 use patina_app::shell::{AccountLabel, Nav, RootView, StatusBar};
 use patina_app::single_instance;
@@ -24,6 +24,7 @@ use patina_app::theme::{self, ProductColors};
 use patina_core::accounts::AccountStore;
 use patina_core::config::SourceChoice;
 use patina_core::instance::{Component, ComponentUid, InstanceIcon, InstanceStore};
+use patina_core::launch::LogLevel;
 use patina_core::paths::DataDirs;
 
 /// The booted app: its main window, root view, and the runtime the core
@@ -2132,4 +2133,156 @@ fn the_list_scrolls_to_the_new_instance(cx: &mut TestAppContext) {
     settle(cx, |cx| selected(&model, cx).as_deref() == Some("Zed"));
     // Sorted last (never played, by name); scrolled into view.
     assert!(shows(&app, cx, row_id("Zed")));
+}
+
+// ---- Log tab ----
+
+fn log_view(app: &Booted, cx: &mut TestAppContext) -> Entity<LogView> {
+    cx.update(|cx| {
+        let page = app.root.read(cx).instances().read(cx);
+        page.detail()
+            .read(cx)
+            .log_view()
+            .expect("log tab shown")
+            .clone()
+    })
+}
+
+#[gpui_kit::test]
+fn the_log_tab_shows_follows_and_copies(cx: &mut TestAppContext) {
+    use gpui_kit::{ScrollDelta, point};
+
+    let tmp = tempfile::tempdir().unwrap();
+    InstanceStore::new(DataDirs::new(tmp.path()).instances())
+        .create("Logs", "1.21.1")
+        .unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "tab-log");
+    let view = log_view(&app, cx);
+    assert!(shows(&app, cx, "log-lines"));
+    assert!(!shows(&app, cx, "log-omitted"));
+
+    // Output arrives; the view follows it.
+    let buffer = model.update(cx, |m, cx| m.log_buffer("Logs", cx));
+    buffer.update(cx, |b, cx| {
+        for n in 0..500 {
+            let level = if n % 50 == 0 {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            };
+            b.push(level, format!("line {n}"));
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(shows(&app, cx, "log-lines"));
+    assert!(view.read_with(cx, |v, _| v.autoscroll()));
+
+    // Scrolling up leaves autoscroll off; the switch turns it back on.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.scroll(
+            "log-lines",
+            ScrollDelta::Pixels(point(gpui_kit::px(0.), gpui_kit::px(400.))),
+            cx,
+        )
+    })
+    .unwrap();
+    assert!(!view.read_with(cx, |v, _| v.autoscroll()), "scrolled up");
+    click(&app, cx, "log-autoscroll");
+    assert!(view.read_with(cx, |v, _| v.autoscroll()));
+
+    // Scrolling back down to the end turns it on by itself.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.scroll(
+            "log-lines",
+            ScrollDelta::Pixels(point(gpui_kit::px(0.), gpui_kit::px(400.))),
+            cx,
+        )
+    })
+    .unwrap();
+    assert!(!view.read_with(cx, |v, _| v.autoscroll()));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.scroll(
+            "log-lines",
+            ScrollDelta::Pixels(point(gpui_kit::px(0.), gpui_kit::px(-100000.))),
+            cx,
+        )
+    })
+    .unwrap();
+    assert!(
+        view.read_with(cx, |v, _| v.autoscroll()),
+        "back at the bottom"
+    );
+
+    // The filter narrows the rows; copy takes the whole buffer anyway.
+    click(&app, cx, "log-filter-warn");
+    assert_eq!(view.read_with(cx, |v, cx| v.visible_len(cx)), 10);
+    assert_eq!(view.read_with(cx, |v, _| v.filter()), LevelFilter::WarnUp);
+    click(&app, cx, "log-copy");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied.lines().count(), 500);
+    assert!(copied.starts_with("line 0\nline 1\n"));
+    click(&app, cx, "log-filter-all");
+    assert_eq!(view.read_with(cx, |v, cx| v.visible_len(cx)), 500);
+
+    // Overflow shows the omitted banner.
+    buffer.update(cx, |b, cx| {
+        for n in 0..25_000 {
+            b.push(LogLevel::Info, format!("more {n}"));
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(shows(&app, cx, "log-omitted"));
+    let omitted = cx
+        .update_window(app.handle, |_, window, _| {
+            window.find("log-omitted").label().map(str::to_owned)
+        })
+        .unwrap();
+    assert_eq!(
+        omitted.as_deref(),
+        Some("5500 earlier lines omitted. See the log file for the full output.")
+    );
+
+    // A saved crash log shows its file name.
+    assert!(!shows(&app, cx, "log-crash-banner"));
+    let crash = tmp.path().join("patina-logs/20260101-000000-crash.log");
+    model.update(cx, |m, cx| m.set_crash_log("Logs", Some(crash), cx));
+    assert!(shows(&app, cx, "log-crash-banner"));
+    assert!(shows(&app, cx, "log-crash-open"));
+
+    // The next launch starts clean.
+    model.update(cx, |m, cx| {
+        m.begin_log("Logs", cx);
+    });
+    assert_eq!(buffer.read_with(cx, |b, _| (b.len(), b.dropped())), (0, 0));
+    assert!(!shows(&app, cx, "log-crash-banner"));
+}
+
+#[gpui_kit::test]
+fn a_deleted_instance_forgets_its_log(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Gone", "1.21.1").unwrap();
+    store.create("Kept", "1.21.1").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    model.update(cx, |m, cx| {
+        for id in ["Gone", "Kept"] {
+            m.log_buffer(id, cx);
+            m.set_crash_log(id, Some(format!("{id}.log").into()), cx);
+        }
+    });
+    std::fs::remove_dir_all(DataDirs::new(tmp.path()).instances().join("Gone")).unwrap();
+    refresh(&model, cx);
+    model.read_with(cx, |m, _| {
+        assert!(m.crash_log("Gone").is_none());
+        assert!(m.crash_log("Kept").is_some());
+        assert!(!m.has_log("Gone"));
+        assert!(m.has_log("Kept"));
+    });
 }

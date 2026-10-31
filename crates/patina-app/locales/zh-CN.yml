@@ -130,3 +130,12 @@ ops:
   amount_kb: "%{done}/%{total} KB"
   retry: "重试"
   dismiss: "关闭"
+log:
+  filter_all: "全部"
+  filter_warn: "警告及以上"
+  autoscroll: "自动滚动"
+  copy_all: "复制全部"
+  open_folder: "打开日志文件夹"
+  omitted: "较早的 %{count} 行已省略，完整内容见日志文件"
+  crash_saved: "日志已保存到 %{name}"
+  open_crash_folder: "打开文件夹"

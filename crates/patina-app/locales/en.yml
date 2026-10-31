@@ -130,3 +130,12 @@ ops:
   amount_kb: "%{done}/%{total} KB"
   retry: "Retry"
   dismiss: "Dismiss"
+log:
+  filter_all: "All"
+  filter_warn: "Warnings and above"
+  autoscroll: "Auto-scroll"
+  copy_all: "Copy all"
+  open_folder: "Open log folder"
+  omitted: "%{count} earlier lines omitted. See the log file for the full output."
+  crash_saved: "Log saved to %{name}"
+  open_crash_folder: "Open folder"

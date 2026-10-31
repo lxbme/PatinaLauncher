@@ -9,9 +9,9 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    Rems, Render, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window,
-    div, px, rems,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Rems, Render, StatefulInteractiveElement, Styled, Subscription, Task,
+    TestSupportExt, Window, div, px, rems,
 };
 use patina_core::instance::Instance;
 use rust_i18n::t;
@@ -24,7 +24,7 @@ use super::{
 };
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
-use crate::launch::OpState;
+use crate::launch::{LogView, OpState};
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
 use crate::shell::placeholder;
 use crate::theme::ProductColors;
@@ -125,6 +125,8 @@ pub struct DetailView {
     tab: DetailTab,
     stats: StatsState,
     stats_task: Task<()>,
+    /// The log tab of the selected instance, made when it is first shown.
+    log: Option<Entity<LogView>>,
     _observe: Subscription,
 }
 
@@ -136,6 +138,7 @@ impl DetailView {
             tab: DetailTab::default(),
             stats: StatsState::default(),
             stats_task: Task::ready(()),
+            log: None,
             _observe,
         };
         this.sync_stats(cx);
@@ -144,6 +147,11 @@ impl DetailView {
 
     pub fn tab(&self) -> DetailTab {
         self.tab
+    }
+
+    /// The log tab's view, once the tab has been shown for the selection.
+    pub fn log_view(&self) -> Option<&Entity<LogView>> {
+        self.log.as_ref()
     }
 
     pub fn set_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
@@ -165,10 +173,27 @@ impl DetailView {
         s.java.filter(|_| s.id.as_deref() == Some(id))
     }
 
+    /// Makes the log view follow the selection.
+    fn sync_log(&mut self, cx: &mut Context<Self>) {
+        let id = match self.model.read(cx).selected_entry() {
+            Some(Entry::Healthy(instance)) => instance.id.clone(),
+            _ => return,
+        };
+        let current = self
+            .log
+            .as_ref()
+            .is_some_and(|v| v.read(cx).instance_id() == id);
+        if !current {
+            let model = self.model.clone();
+            self.log = Some(cx.new(|cx| LogView::new(model, id, cx)));
+        }
+    }
+
     /// Starts reading the stats when the selected instance or the list
     /// changed. One read at a time per instance; a newer one for another
     /// instance makes the older result stale.
     fn sync_stats(&mut self, cx: &mut Context<Self>) {
+        self.sync_log(cx);
         let model = self.model.read(cx);
         let Some(Entry::Healthy(instance)) = model.selected_entry() else {
             cx.notify();
@@ -463,6 +488,10 @@ impl DetailView {
 
     fn render_body(&self, instance: &Instance, cx: &App) -> AnyElement {
         match self.tab {
+            DetailTab::Log => match &self.log {
+                Some(log) => log.clone().into_any_element(),
+                None => div().into_any_element(),
+            },
             DetailTab::Overview => overview::render(instance, self.stats(&instance.id), cx),
             tab => placeholder::page(tab.icon(), tab.label()).into_any_element(),
         }

@@ -2,15 +2,18 @@
 //! selection, and which instances are running.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use gpui_kit::{Context, EventEmitter, SharedString, Subscription, Task, Window};
+use gpui_kit::{
+    AppContext as _, Context, Entity, EventEmitter, SharedString, Subscription, Task, Window,
+};
 use patina_core::instance::{BrokenInstance, Instance, ListOutcome};
 use patina_core::progress::{ProgressSink, TaskProgress};
 
 use crate::core_bridge::{Core, Revision, forward_progress, run, run_blocking};
-use crate::launch::{OpError, OpKind, OpState, ProgressTracker, RetryAction};
+use crate::launch::{LogBuffer, OpError, OpKind, OpState, ProgressTracker, RetryAction};
 
 /// Identifies one operation when it finishes.
 struct OpMeta {
@@ -88,6 +91,12 @@ pub struct InstancesModel {
     /// Operations by instance id; see [`InstancesModel::start_op`].
     ops: HashMap<String, OpEntry>,
     next_op: u64,
+    /// The game output of each instance that ran (or is running) in this
+    /// session. Entities of their own, so a log batch notifies only the log
+    /// view, never the model's other observers.
+    logs: HashMap<String, Entity<LogBuffer>>,
+    /// The crash log saved after the last run of an instance, if it crashed.
+    crash_logs: HashMap<String, PathBuf>,
     /// Broken entries being deleted, so a second request is ignored.
     deleting: HashSet<String>,
     revision: Revision,
@@ -118,6 +127,8 @@ impl InstancesModel {
             running: HashMap::new(),
             ops: HashMap::new(),
             next_op: 0,
+            logs: HashMap::new(),
+            crash_logs: HashMap::new(),
             deleting: HashSet::new(),
             revision: Revision::default(),
             task: Task::ready(()),
@@ -199,6 +210,50 @@ impl InstancesModel {
         let changed = match state {
             Some(state) => self.running.insert(id.to_string(), state) != Some(state),
             None => self.running.remove(id).is_some(),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The log buffer of instance `id`, created empty on first use. It keeps
+    /// the last run's output until [`InstancesModel::begin_log`].
+    pub fn log_buffer(&mut self, id: &str, cx: &mut Context<Self>) -> Entity<LogBuffer> {
+        if let Some(buffer) = self.logs.get(id) {
+            return buffer.clone();
+        }
+        let buffer = cx.new(|_| LogBuffer::new());
+        self.logs.insert(id.to_string(), buffer.clone());
+        buffer
+    }
+
+    /// Whether instance `id` has a log buffer.
+    pub fn has_log(&self, id: &str) -> bool {
+        self.logs.contains_key(id)
+    }
+
+    /// Starts a new run's log: empties the buffer and forgets the previous
+    /// crash log. Returns the buffer to forward the session's lines into.
+    pub fn begin_log(&mut self, id: &str, cx: &mut Context<Self>) -> Entity<LogBuffer> {
+        let buffer = self.log_buffer(id, cx);
+        buffer.update(cx, |b, cx| {
+            b.clear();
+            cx.notify();
+        });
+        self.set_crash_log(id, None, cx);
+        buffer
+    }
+
+    /// The crash log saved after the last run of `id`.
+    pub fn crash_log(&self, id: &str) -> Option<&Path> {
+        self.crash_logs.get(id).map(PathBuf::as_path)
+    }
+
+    /// Records (or clears) the saved crash log of `id`.
+    pub fn set_crash_log(&mut self, id: &str, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        let changed = match path {
+            Some(path) => self.crash_logs.insert(id.to_string(), path.clone()) != Some(path),
+            None => self.crash_logs.remove(id).is_some(),
         };
         if changed {
             cx.notify();
@@ -450,6 +505,11 @@ impl InstancesModel {
         // nothing to hang on to. (Running ones end by themselves.)
         self.ops
             .retain(|id, e| e.state.is_running() || find_entry(&outcome, id).is_some());
+        // Nor does the log of an instance that is gone.
+        let running = &self.running;
+        let kept = |id: &String| running.contains_key(id) || find_entry(&outcome, id).is_some();
+        self.logs.retain(|id, _| kept(id));
+        self.crash_logs.retain(|id, _| kept(id));
         self.outcome = outcome;
         self.error = None;
         self.generation += 1;
