@@ -195,6 +195,12 @@ impl InstancesModel {
         cx.notify();
     }
 
+    /// The list as last read, healthy and broken entries (shared, so a
+    /// search can keep it while the list moves on).
+    pub fn outcome(&self) -> &Rc<ListOutcome> {
+        &self.outcome
+    }
+
     /// The display name of healthy instance `id`.
     pub fn display_name(&self, id: &str) -> Option<String> {
         display_name_in(&self.outcome, id)

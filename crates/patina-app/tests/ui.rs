@@ -6260,3 +6260,563 @@ fn a_hidden_local_tab_does_not_list(cx: &mut TestAppContext) {
     assert!(!list.read_with(cx, |l, _| l.is_reloading()));
     assert_eq!(listings.get(), 2);
 }
+
+// ---- Global search ----
+
+use patina_app::search::{
+    DEBOUNCE, GlobalSearch, IndexState, ModGroup, REFRESH_GAP, SearchItem, SearchModel,
+    SearchResults, search_row_id,
+};
+
+fn search_view(app: &Booted, cx: &mut TestAppContext) -> Entity<GlobalSearch> {
+    cx.update(|cx| app.root.read(cx).title_bar().read(cx).search().clone())
+}
+
+fn search_model(app: &Booted, cx: &mut TestAppContext) -> Entity<SearchModel> {
+    let view = search_view(app, cx);
+    view.read_with(cx, |s, _| s.model().clone())
+}
+
+/// Waits until the index has been built once and no refresh is in flight.
+fn indexed(model: &Entity<SearchModel>, cx: &mut TestAppContext) {
+    settle(cx, |cx| {
+        model.read_with(cx, |m, _| m.is_indexed() && !m.is_refreshing())
+    });
+}
+
+fn results(model: &Entity<SearchModel>, cx: &mut TestAppContext) -> Option<SearchResults> {
+    model.read_with(cx, |m, _| m.results().cloned())
+}
+
+/// Types `text` into the search box (which has the keyboard), lets the
+/// debounce pass and waits for the results of exactly `text`.
+fn search_for(app: &Booted, cx: &mut TestAppContext, text: &str) {
+    type_text(app, cx, text);
+    cx.executor().advance_clock(DEBOUNCE);
+    let model = search_model(app, cx);
+    settle(cx, |cx| {
+        model.read_with(cx, |m, _| m.results().is_some_and(|r| r.query == m.query()))
+    });
+}
+
+fn search_value(app: &Booted, cx: &mut TestAppContext) -> String {
+    element(app, cx, "search")
+        .and_then(|e| e.value().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn nav(app: &Booted, cx: &mut TestAppContext) -> Nav {
+    cx.update(|cx| app.root.read(cx).shell().read(cx).nav())
+}
+
+fn mod_item(instance_id: &str, file_name: &str) -> SearchItem {
+    SearchItem::Mod {
+        instance_id: instance_id.into(),
+        file_name: file_name.into(),
+    }
+}
+
+#[gpui_kit::test]
+fn groups_and_limits(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let packs: Vec<String> = (1..=7)
+        .map(|i| store.create(&format!("Pack {i}"), "1.21.1").unwrap().id)
+        .collect();
+    let home = store.create("Mods Home", "1.21.1").unwrap();
+    let mods = home.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    for i in 0..25 {
+        fabric_jar(
+            &mods,
+            &format!("pack-mod-{i:02}.jar"),
+            &format!("Pack Mod {i:02}"),
+        );
+    }
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = search_model(&app, cx);
+    list_settled(&instances_model(&app, cx), cx);
+    indexed(&model, cx);
+    click(&app, cx, "rail-settings");
+
+    press(&app, cx, "/");
+    search_for(&app, cx, "pack");
+    let found = results(&model, cx).unwrap();
+    let names: Vec<_> = found.instances.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["Pack 1", "Pack 2", "Pack 3", "Pack 4", "Pack 5"]);
+    let mods = found.mod_hits();
+    assert_eq!(mods.len(), 20);
+    assert_eq!(mods[0].hit.name, "Pack Mod 00");
+    assert_eq!(mods[0].instance_name, "Mods Home");
+    let items = found.items();
+    assert_eq!(items.len(), 5 + 20 + 1);
+    assert_eq!(items.last(), Some(&SearchItem::Online));
+
+    // Labelled groups; the first result is chosen. The long list
+    // scrolls: "online" is below the fold for now.
+    for group in ["search-group-instances", "search-group-mods"] {
+        assert!(shows(&app, cx, group), "{group}");
+    }
+    assert!(!shows(&app, cx, search_row_id(&SearchItem::Online)));
+    assert!(!shows(&app, cx, "search-indexing"));
+    let first = element(
+        &app,
+        cx,
+        search_row_id(&SearchItem::Instance(packs[0].clone())),
+    )
+    .unwrap();
+    assert_eq!(first.selected(), Some(true));
+    let row = element(
+        &app,
+        cx,
+        search_row_id(&mod_item(&home.id, "pack-mod-00.jar")),
+    )
+    .unwrap();
+    assert_eq!(row.label(), Some("Pack Mod 00 1.0 — Mods Home"));
+
+    // A click on an instance shows it on the instances page.
+    click(
+        &app,
+        cx,
+        search_row_id(&SearchItem::Instance(packs[2].clone())),
+    );
+    assert_eq!(nav(&app, cx), Nav::Instances);
+    assert_eq!(
+        selected(&instances_model(&app, cx), cx),
+        Some(packs[2].clone())
+    );
+    assert!(!shows(&app, cx, "search-popup"));
+    assert_eq!(search_value(&app, cx), "");
+
+    // Up from the first result wraps to "online", which opens the
+    // downloads page.
+    press(&app, cx, "/");
+    search_for(&app, cx, "pack");
+    press(&app, cx, "up");
+    let view = search_view(&app, cx);
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.chosen(cx)),
+        Some(SearchItem::Online)
+    );
+    // The chosen row is scrolled into view.
+    assert!(shows(&app, cx, search_row_id(&SearchItem::Online)));
+    press(&app, cx, "enter");
+    assert_eq!(nav(&app, cx), Nav::Downloads);
+    assert!(!shows(&app, cx, "search-popup"));
+
+    // Nothing local matches: said so, online still offered.
+    press(&app, cx, "/");
+    search_for(&app, cx, "zzz");
+    assert!(shows(&app, cx, "search-no-local"));
+    assert!(shows(&app, cx, "search-group-online"));
+    assert!(shows(&app, cx, search_row_id(&SearchItem::Online)));
+}
+
+#[gpui_kit::test]
+fn stale_search_results_are_dropped(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let alpha = store.create("Alpha", "1.21.1").unwrap();
+    store.create("Beta", "1.21.1").unwrap();
+    let mods = alpha.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "sodium.jar", "Sodium");
+    fabric_jar(&mods, "lithium.jar", "Lithium");
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = search_model(&app, cx);
+
+    // Before the index is built, the mods group says it is being built.
+    let held = model.read_with(cx, |m, _| m.hold_refreshes());
+    list_settled(&instances_model(&app, cx), cx);
+    press(&app, cx, "/");
+    search_for(&app, cx, "a");
+    assert_eq!(results(&model, cx).unwrap().mods, ModGroup::Indexing);
+    assert!(shows(&app, cx, "search-indexing"));
+    drop(held);
+    indexed(&model, cx);
+    // The index landing fills the group in.
+    settle(cx, |cx| {
+        results(&model, cx).is_some_and(|r| matches!(r.mods, ModGroup::Hits(_)))
+    });
+    assert!(!shows(&app, cx, "search-indexing"));
+
+    // Every applied result is recorded.
+    let applied = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let _observe = cx.update(|cx| {
+        let applied = applied.clone();
+        cx.observe(&model, move |model, cx| {
+            if let Some(r) = model.read(cx).results() {
+                let mut applied = applied.borrow_mut();
+                if applied.last() != Some(&r.query) {
+                    applied.push(r.query.clone());
+                }
+            }
+        })
+    });
+
+    // Quick typing: only the last words are searched.
+    press(&app, cx, "escape");
+    press(&app, cx, "/");
+    for ch in ["s", "o", "d"] {
+        type_text(&app, cx, ch);
+        cx.executor().advance_clock(DEBOUNCE / 3);
+        cx.run_until_parked();
+    }
+    // A search still in flight when the words change is dropped: the
+    // searches are held at their gate meanwhile.
+    let held = model.read_with(cx, |m, _| m.hold_searches());
+    cx.executor().advance_clock(DEBOUNCE);
+    cx.run_until_parked();
+    assert_eq!(results(&model, cx), None, "\"sod\" is in flight");
+    type_text(&app, cx, "i");
+    cx.executor().advance_clock(DEBOUNCE);
+    cx.run_until_parked();
+    drop(held);
+    settle(cx, |cx| {
+        results(&model, cx).is_some_and(|r| r.query == "sodi")
+    });
+    cx.run_until_parked();
+    let last = results(&model, cx).unwrap();
+    let names: Vec<_> = last.mod_hits().iter().map(|m| m.hit.name.clone()).collect();
+    assert_eq!(names, ["Sodium"]);
+    assert!(
+        !applied
+            .borrow()
+            .iter()
+            .any(|q| q == "s" || q == "so" || q == "sod"),
+        "applied: {:?}",
+        applied.borrow()
+    );
+    assert_eq!(applied.borrow().last().map(String::as_str), Some("sodi"));
+}
+
+#[gpui_kit::test]
+fn enter_on_mod_hit_navigates_and_focuses(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let beta = store.create("Beta", "1.21.1").unwrap();
+    let mods = beta.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    for i in 0..60 {
+        fabric_jar(&mods, &format!("mod-{i:03}.jar"), &format!("Mod {i:03}"));
+    }
+    fabric_jar(&mods, "sodium.jar", "Sodium");
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let instances = instances_model(&app, cx);
+    list_settled(&instances, cx);
+    let model = search_model(&app, cx);
+    indexed(&model, cx);
+    assert_eq!(selected(&instances, cx).as_deref(), Some("Alpha"));
+    click(&app, cx, "rail-accounts");
+
+    press(&app, cx, "/");
+    search_for(&app, cx, "sodi");
+    let sodium = mod_item(&beta.id, "sodium.jar");
+    let view = search_view(&app, cx);
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.chosen(cx)),
+        Some(sodium.clone())
+    );
+    // Down and back up across the groups.
+    press(&app, cx, "down");
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.chosen(cx)),
+        Some(SearchItem::Online)
+    );
+    press(&app, cx, "up");
+    assert_eq!(view.read_with(cx, |v, cx| v.chosen(cx)), Some(sodium));
+    press(&app, cx, "enter");
+
+    assert_eq!(nav(&app, cx), Nav::Instances);
+    assert_eq!(selected(&instances, cx), Some(beta.id.clone()));
+    let detail = cx.update(|cx| app.root.read(cx).instances().read(cx).detail().clone());
+    assert_eq!(
+        detail.read_with(cx, |d, _| d.tab()),
+        patina_app::instances::DetailTab::Mods
+    );
+    let tab = mods_tab(&app, cx);
+    settle(cx, |cx| {
+        tab.read_with(cx, |t, _| t.highlighted() == Some("sodium.jar"))
+    });
+    assert!(shows(&app, cx, mod_row_id("sodium.jar")));
+    assert!(!shows(&app, cx, "search-popup"));
+    assert_eq!(search_value(&app, cx), "");
+    // The keyboard is in the Mods list, not the search box.
+    assert_ne!(element(&app, cx, "search").unwrap().focused(), Some(true));
+    assert_eq!(
+        tab.read_with(cx, |t, _| t.selected().map(str::to_owned))
+            .as_deref(),
+        Some("sodium.jar")
+    );
+}
+
+#[gpui_kit::test]
+fn escape_restores_focus(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    store.create("Beta", "1.21.1").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    list_settled(&instances_model(&app, cx), cx);
+    let model = search_model(&app, cx);
+    indexed(&model, cx);
+    click(&app, cx, row_id("Beta"));
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| window.focused(cx))
+            .unwrap()
+    };
+    let before = focused(cx).expect("the list has the keyboard");
+
+    press(&app, cx, "/");
+    search_for(&app, cx, "al");
+    assert!(shows(&app, cx, "search-popup"));
+    assert_ne!(focused(cx).as_ref(), Some(&before));
+    press(&app, cx, "escape");
+    assert!(!shows(&app, cx, "search-popup"));
+    assert_eq!(search_value(&app, cx), "");
+    assert_eq!(focused(cx), Some(before.clone()), "the keyboard is back");
+
+    // A click outside closes the popup too.
+    press(&app, cx, "/");
+    search_for(&app, cx, "al");
+    assert!(shows(&app, cx, "search-popup"));
+    click(&app, cx, "title-settings");
+    assert!(!shows(&app, cx, "search-popup"));
+}
+
+#[gpui_kit::test]
+fn index_refresh_is_throttled(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let alpha = store.create("Alpha", "1.21.1").unwrap();
+    // A broken instance does not stop the index.
+    let broken = store.create("Broken", "1.21.1").unwrap();
+    break_config(&broken.dir);
+    let mods = alpha.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "sodium.jar", "Sodium");
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = search_model(&app, cx);
+    indexed(&model, cx);
+    let refreshes = |cx: &mut TestAppContext| model.read_with(cx, |m, _| m.refreshes());
+    // A refresh starts on gpui's thread, so right after parking one that
+    // should not have started shows as in flight (or already counted).
+    let idle = |cx: &mut TestAppContext| {
+        cx.run_until_parked();
+        assert!(!model.read_with(cx, |m, _| m.is_refreshing()));
+    };
+    // Let whatever startup queued run out, then leave a full gap.
+    for _ in 0..2 {
+        cx.executor().advance_clock(REFRESH_GAP);
+        cx.run_until_parked();
+        indexed(&model, cx);
+    }
+    cx.executor().advance_clock(REFRESH_GAP);
+    idle(cx);
+    let base = refreshes(cx);
+
+    // A change after a full gap refreshes at once.
+    fabric_jar(&mods, "lithium.jar", "Lithium");
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    indexed(&model, cx);
+    settle(cx, |cx| refreshes(cx) == base + 1);
+    let found = |cx: &mut TestAppContext, q: &str| {
+        model.read_with(cx, |m, _| m.index().unwrap().search(q, 5).len())
+    };
+    assert_eq!(found(cx, "lithium"), 1);
+
+    // More changes within the gap wait for its end, as one refresh.
+    fabric_jar(&mods, "iris.jar", "Iris");
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    idle(cx);
+    assert_eq!(refreshes(cx), base + 1);
+    cx.executor()
+        .advance_clock(REFRESH_GAP - Duration::from_secs(1));
+    idle(cx);
+    assert_eq!(refreshes(cx), base + 1);
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    settle(cx, |cx| refreshes(cx) == base + 2);
+    idle(cx);
+    assert_eq!(found(cx, "iris"), 1);
+
+    // Triggers while a refresh is in flight queue one rerun.
+    let held = model.read_with(cx, |m, _| m.hold_refreshes());
+    cx.executor().advance_clock(REFRESH_GAP);
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    cx.run_until_parked();
+    assert!(model.read_with(cx, |m, _| m.is_refreshing()));
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    gpui_kit::VisualTestContext::from_window(app.handle, cx).deactivate_window();
+    activate(&app, cx);
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    drop(held);
+    settle(cx, |cx| refreshes(cx) == base + 3);
+    idle(cx);
+    cx.executor().advance_clock(REFRESH_GAP);
+    cx.run_until_parked();
+    settle(cx, |cx| refreshes(cx) == base + 4);
+    cx.executor().advance_clock(REFRESH_GAP);
+    idle(cx);
+    assert_eq!(refreshes(cx), base + 4, "one rerun, not one per trigger");
+
+    // Coming back to the window after a full gap refreshes.
+    gpui_kit::VisualTestContext::from_window(app.handle, cx).deactivate_window();
+    activate(&app, cx);
+    settle(cx, |cx| refreshes(cx) == base + 5);
+}
+
+#[gpui_kit::test]
+fn searches_never_wait_for_a_refresh(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let alpha = store.create("Alpha", "1.21.1").unwrap();
+    let mods = alpha.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "sodium.jar", "Sodium");
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = search_model(&app, cx);
+    list_settled(&instances_model(&app, cx), cx);
+    indexed(&model, cx);
+
+    // A refresh held in flight after a full gap.
+    fabric_jar(&mods, "sodium-extra.jar", "Sodium Extra");
+    cx.executor().advance_clock(REFRESH_GAP);
+    cx.run_until_parked();
+    indexed(&model, cx);
+    let held = model.read_with(cx, |m, _| m.hold_refreshes());
+    cx.executor().advance_clock(REFRESH_GAP);
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    cx.run_until_parked();
+    assert!(model.read_with(cx, |m, _| m.is_refreshing()));
+
+    // The search lands with the index as it was.
+    press(&app, cx, "/");
+    search_for(&app, cx, "sodium");
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        let found = results(&model, cx).unwrap();
+        found
+            .mod_hits()
+            .iter()
+            .map(|m| m.hit.name.clone())
+            .collect()
+    };
+    assert_eq!(names(cx), ["Sodium"]);
+    assert!(model.read_with(cx, |m, _| m.is_refreshing()), "still held");
+
+    // The refreshed copy replaces it and the words are searched again.
+    drop(held);
+    settle(cx, |cx| names(cx).len() == 2);
+    assert_eq!(names(cx), ["Sodium", "Sodium Extra"]);
+}
+
+#[gpui_kit::test]
+fn enter_acts_only_on_the_current_results(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let beta = store.create("Beta", "1.21.1").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let instances = instances_model(&app, cx);
+    list_settled(&instances, cx);
+    let model = search_model(&app, cx);
+    indexed(&model, cx);
+    click(&app, cx, "rail-accounts");
+
+    press(&app, cx, "/");
+    search_for(&app, cx, "beta");
+    let view = search_view(&app, cx);
+    let beta_hit = SearchItem::Instance(beta.id.clone());
+    assert_eq!(view.read_with(cx, |v, cx| v.chosen(cx)), Some(beta_hit));
+
+    // New words, Enter before their results land: the old results stay on
+    // show but nothing is opened.
+    type_text(&app, cx, "x");
+    assert_eq!(results(&model, cx).unwrap().query, "beta");
+    assert!(shows(&app, cx, "search-popup"));
+    assert_eq!(view.read_with(cx, |v, cx| v.chosen(cx)), None);
+    press(&app, cx, "enter");
+    assert_eq!(nav(&app, cx), Nav::Accounts);
+    assert_eq!(selected(&instances, cx).as_deref(), Some("Alpha"));
+    assert_eq!(search_value(&app, cx), "betax");
+
+    // Once they land, Enter acts on them.
+    cx.executor().advance_clock(DEBOUNCE);
+    settle(cx, |cx| model.read_with(cx, |m, _| m.is_current()));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.chosen(cx)),
+        Some(SearchItem::Online)
+    );
+    press(&app, cx, "enter");
+    assert_eq!(nav(&app, cx), Nav::Downloads);
+}
+
+#[gpui_kit::test]
+fn a_vanished_instance_says_so(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let beta = store.create("Beta", "1.21.1").unwrap();
+    let mods = beta.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "sodium.jar", "Sodium");
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let instances = instances_model(&app, cx);
+    list_settled(&instances, cx);
+    let model = search_model(&app, cx);
+    indexed(&model, cx);
+
+    press(&app, cx, "/");
+    search_for(&app, cx, "sodium");
+    // Beta goes away behind the search's back.
+    std::fs::remove_dir_all(&beta.dir).unwrap();
+    refresh(&instances, cx);
+    press(&app, cx, "enter");
+    assert_eq!(
+        label_of(&app, cx, NOTICE_TEXT).as_deref(),
+        Some("Instance “Beta” no longer exists")
+    );
+    assert_eq!(selected(&instances, cx).as_deref(), Some("Alpha"));
+    assert!(!shows(&app, cx, "search-popup"));
+}
+
+#[gpui_kit::test]
+fn a_failed_index_says_so_and_retries(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = DataDirs::new(tmp.path());
+    let store = InstanceStore::new(data.instances());
+    let alpha = store.create("Alpha", "1.21.1").unwrap();
+    let mods = alpha.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "sodium.jar", "Sodium");
+    // The cache directory cannot be made: the index cannot be saved.
+    std::fs::write(data.cache(), b"not a directory").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = search_model(&app, cx);
+    list_settled(&instances_model(&app, cx), cx);
+    settle(cx, |cx| {
+        model.read_with(cx, |m, _| {
+            matches!(m.index_state(), IndexState::Failed(_)) && !m.is_refreshing()
+        })
+    });
+
+    press(&app, cx, "/");
+    search_for(&app, cx, "sodium");
+    assert!(matches!(
+        results(&model, cx).unwrap().mods,
+        ModGroup::Failed(_)
+    ));
+    assert!(shows(&app, cx, "search-index-failed"));
+    assert!(!shows(&app, cx, "search-no-local"));
+
+    // The next trigger tries again, without waiting for the gap.
+    std::fs::remove_file(data.cache()).unwrap();
+    cx.update(|cx| ModsEvents::emit(&alpha.id, cx));
+    indexed(&model, cx);
+    settle(cx, |cx| {
+        results(&model, cx).is_some_and(|r| r.mod_hits().len() == 1)
+    });
+    assert!(!shows(&app, cx, "search-index-failed"));
+}

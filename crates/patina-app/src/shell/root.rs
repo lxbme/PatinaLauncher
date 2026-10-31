@@ -63,7 +63,9 @@ impl RootView {
             close_after_saving(&page, &closing, window, cx)
         });
         Self {
-            title_bar: cx.new(|cx| TitleBarView::new(shell.clone(), window, cx)),
+            title_bar: cx.new(|cx| {
+                TitleBarView::new(shell.clone(), instances.clone(), focus.clone(), window, cx)
+            }),
             rail: cx.new(|cx| Rail::new(shell.clone(), cx)),
             status_bar: cx.new(|cx| StatusBar::new(window, cx)),
             instances,

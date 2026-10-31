@@ -17,6 +17,7 @@ pub mod notice;
 pub mod platform;
 pub mod runtime;
 pub mod scale;
+pub mod search;
 pub mod settings;
 pub mod shell;
 pub mod single_instance;
@@ -50,6 +51,7 @@ pub fn init(settings: SettingsStore, cx: &mut App) {
     shell::init(cx);
     instances::init(cx);
     content::init(cx);
+    search::init(cx);
     launch::log_view::init(cx);
     core_bridge::AccountsChanged::init(cx);
     cx.on_app_quit(|cx| {

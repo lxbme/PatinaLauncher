@@ -24,6 +24,16 @@ shell:
     settings: "Settings"
   search:
     placeholder: "Press / to search instances and mods"
+    group:
+      instances: "Instances"
+      mods: "Installed mods"
+      online: "Online"
+    indexing: "Indexing…"
+    index_failed: "Couldn’t build the mod index: %{error}"
+    gone: "Instance “%{name}” no longer exists"
+    online_soon: "Online search is coming soon"
+    no_local: "No matching instances or mods"
+    in_instance: "— %{instance}"
   title:
     signed_out: "Not signed in"
   placeholder:

@@ -1,6 +1,6 @@
 //! The title bar (client-side, `title_bar` fill): mark and name, a centred
-//! search box (`/` focuses it), then download activity, the current account,
-//! settings and the window controls.
+//! global search box (`/` focuses it; see [`GlobalSearch`]), then download
+//! activity, the current account, settings and the window controls.
 //!
 //! The bar is gpui-component's `TitleBar`, as in crypto_pro and the
 //! prototype: on a client-side decorated window it drags the window and draws
@@ -8,20 +8,21 @@
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, TitleBar, h_flex};
 use gpui_kit::{
-    App, AppContext, ClickEvent, Context, Decorations, Div, Entity, FontWeight, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Rems, Render, SharedString, Styled, Subscription,
-    Task, Window, div, rems,
+    App, AppContext, ClickEvent, Context, Decorations, Div, Entity, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Rems, Render, SharedString,
+    Styled, Subscription, Task, Window, div, rems,
 };
 use rust_i18n::t;
 
 use super::{Nav, ShellState};
 use crate::core_bridge::{AccountsChanged, Core, Revision};
 use crate::fonts::Strong;
+use crate::instances::InstancesPage;
 use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY};
+use crate::search::GlobalSearch;
 use crate::theme::ProductColors;
 
 /// What the account button says.
@@ -36,10 +37,10 @@ pub enum AccountLabel {
     SignedIn(SharedString),
 }
 
-/// The title bar; owns the search box's state and the account label.
+/// The title bar; owns the global search and the account label.
 pub struct TitleBarView {
     shell: Entity<ShellState>,
-    search: Entity<InputState>,
+    search: Entity<GlobalSearch>,
     account: AccountLabel,
     account_rev: Revision,
     account_load: Task<()>,
@@ -48,13 +49,17 @@ pub struct TitleBarView {
 
 impl TitleBarView {
     /// Reads the current account now and whenever the accounts change
-    /// ([`AccountsChanged`]).
-    pub fn new(shell: Entity<ShellState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("shell.search.placeholder").to_string())
-                .clean_on_escape()
-        });
+    /// ([`AccountsChanged`]); the search finds `page`'s instances and
+    /// their mods, and gives the keyboard to `home_focus` (the shell's)
+    /// when it has nowhere else to return it.
+    pub fn new(
+        shell: Entity<ShellState>,
+        page: Entity<InstancesPage>,
+        home_focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| GlobalSearch::new(shell.clone(), page, home_focus, window, cx));
         let _accounts_changed = cx.observe(&AccountsChanged::epoch(cx), |this, _, cx| {
             this.refresh_account(cx);
         });
@@ -73,6 +78,10 @@ impl TitleBarView {
     /// Moves the keyboard to the search box.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search.update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    pub fn search(&self) -> &Entity<GlobalSearch> {
+        &self.search
     }
 
     pub fn account(&self) -> &AccountLabel {
@@ -140,25 +149,12 @@ impl TitleBarView {
             )
     }
 
-    fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+    fn render_search(&self) -> impl IntoElement {
         no_drag(div())
             .flex_shrink(1.)
             .w(rems(20.))
             .min_w(rems(9.))
-            .child(
-                Input::new(&self.search)
-                    .id("search")
-                    .small()
-                    .cleanable(true)
-                    .rounded_full()
-                    .bg(theme.background)
-                    .prefix(
-                        Icon::new(IconName::Search)
-                            .xsmall()
-                            .text_color(theme.muted_foreground),
-                    ),
-            )
+            .child(self.search.clone())
     }
 
     fn render_actions(&self, client: bool) -> impl IntoElement {
@@ -244,7 +240,7 @@ impl Render for TitleBarView {
                     .size_full()
                     .gap_3()
                     .child(self.render_brand(cx))
-                    .child(self.render_search(cx))
+                    .child(self.render_search())
                     .child(self.render_actions(client)),
             )
     }

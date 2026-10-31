@@ -24,6 +24,16 @@ shell:
     settings: "设置"
   search:
     placeholder: "按 / 搜索实例、Mod"
+    group:
+      instances: "实例"
+      mods: "已安装的 Mod"
+      online: "在线"
+    indexing: "正在建立索引…"
+    index_failed: "无法建立 Mod 索引：%{error}"
+    gone: "实例“%{name}”已不存在"
+    online_soon: "在线搜索即将推出"
+    no_local: "没有匹配的实例或 Mod"
+    in_instance: "— %{instance}"
   title:
     signed_out: "未登录"
   placeholder:

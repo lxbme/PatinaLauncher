@@ -74,7 +74,10 @@ type Key = (String, String);
 
 /// The index is a rebuildable cache: with several processes sharing a data
 /// directory the last writer wins and the next refresh self-heals.
-#[derive(Debug)]
+///
+/// Cloning copies the in-memory records (no I/O), so a caller can refresh a
+/// copy while searches keep reading the original, then swap the copy in.
+#[derive(Debug, Clone)]
 pub struct ModIndex {
     cache_dir: PathBuf,
     records: BTreeMap<Key, Record>,
@@ -502,6 +505,25 @@ mod tests {
         let s = idx2.refresh(&e.store).await.unwrap();
         assert_eq!((s.parsed, s.reused, s.removed), (0, 1, 1));
         assert!(idx2.search("beta", 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_clone_refreshes_without_touching_the_original() {
+        let e = env();
+        let inst = e.store.create("Pack", "1.20.1").unwrap();
+        add_mod(&inst, "a.jar", "a", "Alpha", None);
+        let mut idx = ModIndex::open(&e.data);
+        idx.refresh(&e.store).await.unwrap();
+        add_mod(&inst, "b.jar", "b", "Beta", None);
+        let mut copy = idx.clone();
+        let s = copy.refresh(&e.store).await.unwrap();
+        assert_eq!((s.parsed, s.reused), (1, 1));
+        assert!(
+            idx.search("beta", 10).is_empty(),
+            "the original is as it was"
+        );
+        assert_eq!(copy.search("beta", 10).len(), 1);
+        assert_eq!(copy.search("alpha", 10), idx.search("alpha", 10));
     }
 
     #[tokio::test]
