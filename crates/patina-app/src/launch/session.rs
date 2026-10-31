@@ -1,9 +1,9 @@
 //! The run state of an instance's game and the pieces of launching that do
 //! not depend on the model: account lookup, reattaching, stopping a game
-//! another process holds. [`InstancesModel`] owns the state and its
+//! another process holds. [`InstanceActivity`] owns the state and its
 //! transitions (`launch`, `force_stop`, ...).
 //!
-//! [`InstancesModel`]: crate::instances::InstancesModel
+//! [`InstanceActivity`]: crate::instances::InstanceActivity
 
 use std::time::Duration;
 

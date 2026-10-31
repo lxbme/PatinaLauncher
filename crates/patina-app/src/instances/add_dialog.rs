@@ -33,7 +33,8 @@ use rust_i18n::t;
 
 use super::icon::{IconChoice, save_icon};
 use super::icon_picker::{IconPicked, IconPicker};
-use super::model::{InstancesChanged, InstancesModel};
+use super::labelled;
+use super::model::{InstancesChanged, InstancesModel, RefreshFailed};
 use super::version_picker::{LoaderChanged, LoaderPicker, VersionChosen, VersionPicker};
 use crate::core_bridge::{Core, run_blocking};
 use crate::fonts::Strong;
@@ -404,7 +405,12 @@ pub fn create_instance(
                 } else {
                     "add_instance.refresh_failed"
                 };
-                notify(t!(key, name = name, error = error).to_string(), cx);
+                // In place of the page's generic notice of the same failure.
+                let text = t!(key, name = name, error = error).to_string();
+                let notice = labelled(Notification::error(text.clone()), text);
+                let notice = notice.id::<RefreshFailed>();
+                cx.update(|window, cx| window.push_notification(notice, cx))
+                    .ok();
             }
         })
         .detach();

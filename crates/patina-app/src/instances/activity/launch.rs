@@ -1,5 +1,5 @@
-//! The launch flow of [`InstancesModel`] and the games it follows: a child
-//! module of the model, so it shares the model's private state.
+//! The launch flow of [`InstanceActivity`] and the games it follows: a
+//! child module of the activity, so it shares its private state.
 
 use std::rc::Rc;
 
@@ -11,8 +11,9 @@ use patina_core::launch::{
 };
 use rust_i18n::t;
 
-use super::{Entry, InstancesModel, LaunchFlow, OnFail, Track};
+use super::{ActivityEvent, Entry, InstanceActivity, LaunchFlow, OnFail, Track};
 use crate::core_bridge::{BridgeError, Core, run, run_blocking};
+use crate::instances::InstancesModel;
 use crate::launch::session::{
     AccountIssue, ELSEWHERE_POLL, reattach_all, resolve_account, stop_elsewhere,
 };
@@ -23,7 +24,7 @@ use crate::launch::{
 /// The launch flow and the games it follows. Transitions of an instance's
 /// [`RunState`]:
 ///
-/// - idle or `Exited` → `Starting` ([`InstancesModel::launch`]): the
+/// - idle or `Exited` → `Starting` ([`InstanceActivity::launch`]): the
 ///   account lookup, the prepare operation, the warnings (if any), the
 ///   spawn operation;
 /// - `Starting` → `Running` once the game is spawned, or back to idle when
@@ -35,14 +36,14 @@ use crate::launch::{
 ///   after a launch found the instance busy);
 /// - `HeldElsewhere` → idle once the game is gone, or `Running` when its
 ///   session became free and this app took it over.
-impl InstancesModel {
+impl InstanceActivity {
     fn next_token(&mut self) -> u64 {
         self.next_op += 1;
         self.next_op
     }
 
     /// Launches healthy instance `id` (see the type docs); returns whether
-    /// the launch started. A busy instance ([`InstancesModel::is_busy`])
+    /// the launch started. A busy instance ([`InstanceActivity::is_busy`])
     /// refuses.
     pub fn launch(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
         if self.is_busy(id) || !matches!(self.entry(id), Some(Entry::Healthy(_))) {
@@ -104,9 +105,11 @@ impl InstancesModel {
     /// Retries a launch of `id`.
     fn relaunch(id: &str) -> RetryAction {
         let id = id.to_string();
-        Rc::new(move |this: &mut Self, cx: &mut Context<Self>| {
-            this.launch(&id, cx);
-        })
+        Rc::new(
+            move |model: &mut InstancesModel, cx: &mut Context<InstancesModel>| {
+                model.launch(&id, cx);
+            },
+        )
     }
 
     /// Ends the flow and shows why it failed.
@@ -196,7 +199,9 @@ impl InstancesModel {
         if let Some(flow) = self.flows.get_mut(id) {
             flow.pending = Some(pending);
         }
-        cx.emit(LaunchEvent::ConfirmWarnings { id: id.to_string() });
+        cx.emit(ActivityEvent::Launch(LaunchEvent::ConfirmWarnings {
+            id: id.to_string(),
+        }));
     }
 
     /// The warnings of `id`'s prepared launch that waits for an answer, as
@@ -290,13 +295,13 @@ impl InstancesModel {
                 Err(error) => tracing::warn!(%error, "recording the play time failed"),
                 Ok(Ok(())) => {}
             }
-            this.update(cx, |this, cx| {
-                this.refresh(cx);
-                cx.emit(LaunchEvent::Spawned {
+            this.update(cx, |_, cx| {
+                cx.emit(ActivityEvent::Refresh);
+                cx.emit(ActivityEvent::Launch(LaunchEvent::Spawned {
                     id: key,
                     warnings,
                     record_saved,
-                });
+                }));
             })
             .ok();
         })
@@ -372,7 +377,7 @@ impl InstancesModel {
     /// Looks for the games of an earlier launcher session, once the list
     /// first loaded.
     pub(super) fn reattach_on_startup(&mut self, cx: &mut Context<Self>) {
-        let instances: Vec<Instance> = (self.outcome.instances.iter())
+        let instances: Vec<Instance> = (self.list.instances.iter())
             .filter(|i| !self.running.contains_key(&i.id))
             .cloned()
             .collect();
@@ -569,61 +574,5 @@ impl InstancesModel {
             self.running.remove(id);
             cx.notify();
         }
-    }
-
-    /// Applies the fix offered by `id`'s failed operation.
-    pub fn apply_fix(&mut self, id: &str, cx: &mut Context<Self>) {
-        let fix = match self.op(id) {
-            Some(OpState::Failed { fix: Some(fix), .. }) => *fix,
-            _ => return,
-        };
-        match fix {
-            OpFix::AddAccount => {
-                self.dismiss_op(id, cx);
-                cx.emit(LaunchEvent::ShowAccounts);
-            }
-            OpFix::ReinstallLoader => {
-                self.reinstall_and_launch(id, cx);
-            }
-        }
-    }
-
-    /// Reinstalls `id`'s loader (through `Core.version_ops`, as the versions
-    /// tab's repair does), then launches it again once the list shows the
-    /// reinstalled instance.
-    pub fn reinstall_and_launch(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
-        let ops = Core::global(cx).version_ops.clone();
-        let key = id.to_string();
-        let retry: RetryAction = {
-            let key = key.clone();
-            Rc::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                this.reinstall_and_launch(&key, cx);
-            })
-        };
-        self.start_op(
-            id,
-            OpKind::Reinstall,
-            {
-                let key = key.clone();
-                move |progress| {
-                    async move {
-                        ops.reinstall_loader(key, progress)
-                            .await
-                            .map_err(OpError::Loader)
-                    }
-                    .boxed()
-                }
-            },
-            move |this, _, cx| {
-                let listed = this.refresh_and_wait(cx);
-                cx.spawn(async move |this, cx| {
-                    listed.await;
-                    this.update(cx, |this, cx| this.launch(&key, cx)).ok();
-                })
-                .detach();
-            },
-            Some(retry),
-            cx,
-        )
     }
 }

@@ -23,7 +23,7 @@ pub fn open(model: Entity<InstancesModel>, id: String, window: &mut Window, cx: 
     let (name, warnings) = {
         let m = model.read(cx);
         let name = m.display_name(&id).unwrap_or_else(|| id.clone());
-        match m.pending_warnings(&id) {
+        match m.pending_warnings(&id, cx) {
             Some(warnings) => (name, warnings),
             None => return,
         }

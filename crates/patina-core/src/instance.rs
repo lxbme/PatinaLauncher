@@ -305,6 +305,10 @@ impl Instance {
 }
 
 const CONFIG_FILE: &str = "instance.toml";
+/// Held (`flock`) across a config's read, change and write by
+/// [`InstanceStore::update`], so concurrent changes of different fields (in
+/// this process or another) do not overwrite each other. Never deleted.
+pub const CONFIG_LOCK_FILE: &str = ".patina-config.lock";
 const ICON_FILE: &str = "icon.png";
 const ICON_SIZE: u32 = 128;
 const MAX_ICON_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
@@ -525,32 +529,55 @@ impl InstanceStore {
         Ok(())
     }
 
-    /// Changes the display name only; the directory id stays.
-    pub fn rename(&self, id: &str, new_name: &str) -> Result<Instance, InstanceError> {
-        let mut inst = self.load(id)?;
-        inst.config.name = new_name.to_string();
+    /// Reads instance `id`'s config as it is on disk now, changes it with
+    /// `f` and saves it, holding the config lock ([`CONFIG_LOCK_FILE`]) from
+    /// the read to the write: another update of the same instance, in this
+    /// process or another, waits, so neither loses the other's change. Use
+    /// it (not [`InstanceStore::load`] then [`InstanceStore::save`]) for
+    /// every change of an existing instance's config. Blocking; `f` runs
+    /// under the lock and must be quick.
+    ///
+    /// This is not the instance lock ([`InstanceStore::lock`]): it is held
+    /// only for the write, also while a game or an operation holds the
+    /// instance.
+    pub fn update(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut InstanceConfig),
+    ) -> Result<Instance, InstanceError> {
+        Self::check_id(id)?;
+        let dir = self.root.join(id);
+        // The lock file is never created for an instance that is not there.
+        if !dir.join(CONFIG_FILE).is_file() {
+            return Err(InstanceError::NotFound(id.to_string()));
+        }
+        let _lock = lock_config(&dir)?;
+        let mut inst = self.read(id)?;
+        f(&mut inst.config);
         self.save(&inst)?;
         Ok(inst)
     }
 
-    /// Records that the instance was just played. Re-reads the config so
-    /// changes made since the caller loaded it are kept. Takes no lock: it is
-    /// called while the game session holds the instance.
+    /// Changes the display name only; the directory id stays.
+    pub fn rename(&self, id: &str, new_name: &str) -> Result<Instance, InstanceError> {
+        self.update(id, |config| config.name = new_name.to_string())
+    }
+
+    /// Records that the instance was just played, keeping changes made since
+    /// the caller loaded it. Takes no instance lock: it is called while the
+    /// game session holds the instance.
     pub fn touch_played(&self, id: &str) -> Result<(), InstanceError> {
-        let mut inst = self.load(id)?;
-        inst.config.last_played = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
-        self.save(&inst)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.update(id, |config| config.last_played = Some(now))
+            .map(drop)
     }
 
     pub fn set_builtin_icon(&self, id: &str, name: &str) -> Result<Instance, InstanceError> {
-        let mut inst = self.load(id)?;
-        inst.config.icon = Some(InstanceIcon::Builtin(name.to_string()));
-        self.save(&inst)?;
+        let icon = InstanceIcon::Builtin(name.to_string());
+        let inst = self.update(id, |config| config.icon = Some(icon))?;
         remove_icon_file(&inst.dir)?;
         Ok(inst)
     }
@@ -558,18 +585,14 @@ impl InstanceStore {
     /// Crops `src` (png, jpeg or webp, at most 8 MiB) to a centered square,
     /// scales it to 128x128 and stores it as the instance's `icon.png`.
     pub fn set_custom_icon(&self, id: &str, src: &Path) -> Result<Instance, InstanceError> {
-        let mut inst = self.load(id)?;
+        let dir = self.load(id)?.dir;
         let png = render_icon(src)?;
-        write_atomic(&inst.dir.join(ICON_FILE), &png)?;
-        inst.config.icon = Some(InstanceIcon::Custom);
-        self.save(&inst)?;
-        Ok(inst)
+        write_atomic(&dir.join(ICON_FILE), &png)?;
+        self.update(id, |config| config.icon = Some(InstanceIcon::Custom))
     }
 
     pub fn clear_icon(&self, id: &str) -> Result<Instance, InstanceError> {
-        let mut inst = self.load(id)?;
-        inst.config.icon = None;
-        self.save(&inst)?;
+        let inst = self.update(id, |config| config.icon = None)?;
         remove_icon_file(&inst.dir)?;
         Ok(inst)
     }
@@ -601,7 +624,8 @@ impl InstanceStore {
         Ok(())
     }
 
-    /// Deletes instance `id` and its directory. Refuses while another
+    /// Deletes instance `id` and its directory, once a config update in
+    /// flight ([`InstanceStore::update`]) is written. Refuses while another
     /// operation holds the instance, and while its game runs
     /// ([`BusyKind::Running`](crate::locks::BusyKind::Running)).
     pub fn delete(&self, id: &str) -> Result<(), InstanceError> {
@@ -611,10 +635,28 @@ impl InstanceStore {
         if !dir.join(CONFIG_FILE).is_file() {
             return Err(InstanceError::NotFound(id.to_string()));
         }
+        // After the instance lock, as the loader operations take them: a
+        // config update in flight finishes first, and one that comes later
+        // finds no instance.
+        let _config = lock_config(&dir)?;
         crate::launch::running::refuse_while_running(&dir, id)?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+}
+
+/// Takes the config lock of instance directory `dir` (see
+/// [`InstanceStore::update`]), waiting while someone else holds it: every
+/// holder only reads, changes and writes one small file. Released when the
+/// returned file is dropped.
+fn lock_config(dir: &Path) -> Result<std::fs::File, InstanceError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(CONFIG_LOCK_FILE))?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn remove_icon_file(dir: &Path) -> Result<(), InstanceError> {
@@ -683,6 +725,69 @@ mod tests {
     }
 
     use crate::config::JavaSettings;
+
+    #[test]
+    fn concurrent_updates_of_different_fields_both_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let id = store.create("Pack", "1.21.1").unwrap().id;
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let slow = {
+            let (store, id) = (store.clone(), id.clone());
+            std::thread::spawn(move || {
+                store
+                    .update(&id, |config| {
+                        // Read; the other update starts meanwhile.
+                        read_tx.send(()).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        config.name = "Renamed".into();
+                    })
+                    .unwrap();
+            })
+        };
+        read_rx.recv().unwrap();
+        store
+            .update(&id, |config| config.last_played = Some(42))
+            .unwrap();
+        slow.join().unwrap();
+        let config = store.load(&id).unwrap().config;
+        assert_eq!(config.name, "Renamed");
+        assert_eq!(config.last_played, Some(42), "neither update is lost");
+        assert!(tmp.path().join(&id).join(CONFIG_LOCK_FILE).is_file());
+    }
+
+    #[test]
+    fn delete_waits_for_a_config_update_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let id = store.create("Pack", "1.21.1").unwrap().id;
+        let dir = tmp.path().join(&id);
+        // A writer holds the config lock (between its read and its write).
+        let held = lock_config(&dir).unwrap();
+        let deleting = {
+            let (store, id) = (store.clone(), id.clone());
+            std::thread::spawn(move || store.delete(&id))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            dir.join(CONFIG_FILE).is_file(),
+            "not removed under the writer"
+        );
+        drop(held);
+        deleting.join().unwrap().unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn update_of_a_missing_instance_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        assert!(matches!(
+            store.update("gone", |c| c.last_played = Some(1)),
+            Err(InstanceError::NotFound(_))
+        ));
+        assert!(!tmp.path().join("gone").exists());
+    }
 
     fn write_raw(tmp: &std::path::Path, id: &str, body: &str) {
         std::fs::create_dir_all(tmp.join(id)).unwrap();

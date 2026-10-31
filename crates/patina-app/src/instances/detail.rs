@@ -181,7 +181,9 @@ pub struct DetailView {
     page_focus: FocusHandle,
     /// The tab content's region, to tell whether the keyboard is in it.
     body_focus: FocusHandle,
-    _observe: Subscription,
+    /// The model (the selection, the list) and its activity (the header's
+    /// operation and run state).
+    _observe: [Subscription; 2],
 }
 
 impl DetailView {
@@ -192,7 +194,11 @@ impl DetailView {
         page_focus: FocusHandle,
         cx: &mut Context<Self>,
     ) -> Self {
-        let _observe = cx.observe(&model, |this, _, cx| this.sync_stats(cx));
+        let activity = model.read(cx).activity().clone();
+        let _observe = [
+            cx.observe(&model, |this, _, cx| this.sync_stats(cx)),
+            cx.observe(&activity, |this, _, cx| this.sync_stats(cx)),
+        ];
         let mut this = Self {
             model,
             tab: DetailTab::default(),
@@ -348,7 +354,7 @@ impl DetailView {
             return;
         };
         let generation = model.generation();
-        let op_changes = model.op_changes(&instance.id);
+        let op_changes = model.op_changes(&instance.id, cx);
         let same = self.stats.id.as_deref() == Some(instance.id.as_str());
         if same && self.stats.generation == generation && self.stats.op_changes == op_changes {
             cx.notify();
@@ -500,7 +506,10 @@ impl DetailView {
             )
             .map(|d| {
                 let model = self.model.read(cx);
-                match (model.op(&instance.id), model.run_state(&instance.id)) {
+                match (
+                    model.op(&instance.id, cx),
+                    model.run_state(&instance.id, cx),
+                ) {
                     (Some(op), _) => d.child(self.render_op(&instance.id, op, cx)),
                     (None, Some(RunState::Exited(exit))) => {
                         d.child(self.render_crash(&instance.id, exit.saved_log.clone(), cx))
@@ -522,10 +531,10 @@ impl DetailView {
             })
             .map(|d| {
                 let model = self.model.read(cx);
-                if !model.is_running(&instance.id) {
+                if !model.is_running(&instance.id, cx) {
                     return d;
                 }
-                let stopping = model.is_stopping(&instance.id);
+                let stopping = model.is_stopping(&instance.id, cx);
                 let (model, id) = (self.model.clone(), instance.id.clone());
                 d.child(
                     Button::new("instance-stop")
@@ -543,8 +552,9 @@ impl DetailView {
             })
             .child({
                 let model = self.model.read(cx);
-                let busy = model.is_busy(&instance.id);
-                let starting = matches!(model.run_state(&instance.id), Some(RunState::Starting));
+                let busy = model.is_busy(&instance.id, cx);
+                let starting =
+                    matches!(model.run_state(&instance.id, cx), Some(RunState::Starting));
                 let (model, id) = (self.model.clone(), instance.id.clone());
                 // What was typed in the settings is saved before the launch
                 // reads the instance.
@@ -788,7 +798,7 @@ impl DetailView {
         match self.tab {
             DetailTab::Log => {
                 let elsewhere = matches!(
-                    self.model.read(cx).run_state(&instance.id),
+                    self.model.read(cx).run_state(&instance.id, cx),
                     Some(RunState::HeldElsewhere { .. })
                 );
                 // The other process shows this game's log; this one does

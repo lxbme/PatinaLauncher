@@ -236,11 +236,11 @@ fn activate(app: &Booted, cx: &mut TestAppContext) {
 }
 
 fn run_state(m: &Entity<InstancesModel>, cx: &mut TestAppContext, id: &str) -> Option<RunState> {
-    m.read_with(cx, |m, _| m.run_state(id).cloned())
+    m.read_with(cx, |m, cx| m.run_state(id, cx).cloned())
 }
 
 fn op_of(m: &Entity<InstancesModel>, cx: &mut TestAppContext, id: &str) -> Option<OpState> {
-    m.read_with(cx, |m, _| m.op(id).cloned())
+    m.read_with(cx, |m, cx| m.op(id, cx).cloned())
 }
 
 fn selected(m: &Entity<InstancesModel>, cx: &mut TestAppContext) -> Option<String> {
@@ -799,7 +799,7 @@ fn e2e_04_launch_log_and_force_stop(cx: &mut TestAppContext) {
         run_state(&m, cx, FORGE_1201).is_none(),
         "a stop is no crash"
     );
-    assert!(m.read_with(cx, |m, _| m.crash_log(FORGE_1201).is_none()));
+    assert!(m.read_with(cx, |m, cx| m.crash_log(FORGE_1201, cx).is_none()));
     assert!(!shows(&app, cx, "instance-crash"));
     settle(cx, |_| gone(pid));
 }

@@ -2,7 +2,8 @@
 //! forwarder that fills it from a session's log channel ([`forward_logs`])
 //! and the virtualized view ([`LogView`]).
 //!
-//! Each instance has one `Entity<LogBuffer>` in the [`InstancesModel`]. The
+//! Each instance has one `Entity<LogBuffer>` in the
+//! [`InstanceActivity`](crate::instances::InstanceActivity). The
 //! buffer notifies only its observers, i.e. the log view, once per batch:
 //! the instance list and the header are not re-rendered by log output.
 //!
@@ -20,8 +21,8 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::scroll::{ScrollableElement as _, ScrollbarHandle};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable, VirtualListScrollHandle, h_flex, v_flex,
-    v_virtual_list,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, VirtualListScrollHandle, h_flex,
+    v_flex, v_virtual_list,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -36,7 +37,7 @@ use rust_i18n::t;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 
-use crate::instances::{Entry, InstancesModel};
+use crate::instances::{Entry, InstancesModel, observe_activity};
 use crate::layout::{GUTTER, TEXT_SECONDARY};
 
 /// Lines kept per instance; older ones are dropped and counted.
@@ -277,7 +278,7 @@ pub struct LogView {
     focus: FocusHandle,
     /// Row sizes, reused while the count and the rem size stay the same.
     sizes: Option<RowSizes>,
-    _observe: [Subscription; 2],
+    _observe: [Subscription; 3],
 }
 
 impl LogView {
@@ -286,7 +287,11 @@ impl LogView {
         let observe_buffer = cx.observe(&buffer, |this, _, cx| {
             this.rebuild(cx);
         });
-        // The crash-log banner comes from the model.
+        // The crash-log banner comes from the activity.
+        let observe_crash = {
+            let (activity, id) = (model.read(cx).activity().clone(), id.clone());
+            observe_activity(&activity, cx, move |a| a.crash_log(&id).map(Path::to_owned))
+        };
         let observe_model = cx.observe(&model, |_, _, cx| cx.notify());
         let scroll = VirtualListScrollHandle::new();
         Self {
@@ -303,7 +308,7 @@ impl LogView {
             scroll,
             focus: cx.focus_handle().tab_stop(true),
             sizes: None,
-            _observe: [observe_buffer, observe_model],
+            _observe: [observe_buffer, observe_crash, observe_model],
         }
     }
 
@@ -491,18 +496,23 @@ impl LogView {
                         this.update(cx, |v, cx| v.copy_all(cx)).ok();
                     })
             })
-            .child(
+            .child({
+                // An icon with a tooltip: with a label the toolbar does not
+                // fit the narrowest detail pane in English.
+                let open = t!("log.open_folder").to_string();
                 Button::new("log-open-folder")
                     .ghost()
                     .small()
-                    .label(t!("log.open_folder").to_string())
+                    .icon(Icon::new(IconName::FolderOpen))
+                    .tooltip(open.clone())
+                    .accessibility_label(open)
                     .disabled(log_dir.is_none())
                     .on_click(move |_, _, cx| {
                         if let Some(dir) = &log_dir {
                             cx.open_with_system(dir);
                         }
-                    }),
-            )
+                    })
+            })
     }
 
     fn banner(
@@ -554,7 +564,11 @@ impl Render for LogView {
                 sizes
             }
         };
-        let crash = self.model.read(cx).crash_log(&self.id).map(Path::to_owned);
+        let crash = self
+            .model
+            .read(cx)
+            .crash_log(&self.id, cx)
+            .map(Path::to_owned);
         // The scrollbar moved the list since the last frame.
         if self.scrollbar.moved.take() {
             self.autoscroll = self.at_bottom(window);

@@ -104,7 +104,7 @@ pub async fn install_loader(
 
     let mut config = inst.config.clone();
     config.set_loader(Some(component))?;
-    let instance = commit(store, id, config.components)?;
+    let instance = commit_async(store, id, config.components).await?;
     let notices = match previous {
         Some((old, _)) if old != kind => vec![LoaderNotice::ModsMayBeIncompatible],
         _ => Vec::new(),
@@ -145,7 +145,7 @@ pub async fn reinstall_loader(
     let mut config = inst.config.clone();
     config.set_loader(Some(component))?;
     Ok(OpOutcome {
-        instance: commit(store, id, config.components)?,
+        instance: commit_async(store, id, config.components).await?,
         notices: Vec::new(),
     })
 }
@@ -204,7 +204,7 @@ pub async fn set_mc_version(
         _ => {
             config.set_loader(None)?;
             return Ok(OpOutcome {
-                instance: commit(store, id, config.components)?,
+                instance: commit_async(store, id, config.components).await?,
                 notices: Vec::new(),
             });
         }
@@ -243,7 +243,7 @@ pub async fn set_mc_version(
     let component = install_version(launcher, target, &vanilla, false, &progress).await?;
     config.set_loader(Some(component))?;
     Ok(OpOutcome {
-        instance: commit(store, id, config.components)?,
+        instance: commit_async(store, id, config.components).await?,
         notices: Vec::new(),
     })
 }
@@ -360,17 +360,26 @@ async fn install_forge(
     }
 }
 
-/// Saves `components` into instance `id` as it is on disk now, so changes to
-/// its other fields made during a long install (name, Java settings) are kept.
+/// [`commit`] on the blocking pool: the config lock it takes may wait for
+/// another writer, which must not stall a runtime worker.
+async fn commit_async(
+    store: &InstanceStore,
+    id: &str,
+    components: Vec<Component>,
+) -> Result<Instance, LoaderError> {
+    let (store, id) = (store.clone(), id.to_string());
+    tokio::task::spawn_blocking(move || commit(&store, &id, components)).await?
+}
+
+/// Saves `components` into instance `id` as it is on disk now (under the
+/// config lock, [`InstanceStore::update`]), so changes to its other fields
+/// made during a long install (name, Java settings) are kept.
 fn commit(
     store: &InstanceStore,
     id: &str,
     components: Vec<Component>,
 ) -> Result<Instance, LoaderError> {
-    let mut inst = store.load(id)?;
-    inst.config.components = components;
-    store.save(&inst)?;
-    Ok(inst)
+    Ok(store.update(id, |config| config.components = components)?)
 }
 
 #[cfg(all(test, unix))]

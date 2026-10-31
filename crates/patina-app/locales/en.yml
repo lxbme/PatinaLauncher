@@ -47,6 +47,7 @@ instances:
   running: "Running"
   no_match: "No matching instances"
   list_failed: "Couldn’t read the instance list"
+  refresh_failed: "Couldn’t refresh the instance list: %{error}"
   filter:
     all: "All"
     running: "Running"

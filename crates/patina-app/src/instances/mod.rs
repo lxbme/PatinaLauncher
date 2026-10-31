@@ -1,12 +1,14 @@
 //! The instances page (layout A): the instance list on the left, the
 //! selected instance's detail on the right ([`InstancesPage`]).
 //!
-//! [`InstancesModel`] owns the domain state (the list, the selection, run
-//! states); the list column ([`InstanceList`]) and the detail
-//! ([`DetailView`]) are views that read it. With nothing to list the right
-//! side is the empty state; a broken entry shows its error and lets the
-//! user open or delete its folder.
+//! [`InstancesModel`] owns the domain state (the list, the selection) and
+//! the [`InstanceActivity`] (run states, operations, logs); the list
+//! column ([`InstanceList`]) and the detail ([`DetailView`]) are views that
+//! read them. With nothing to list the right side is the empty state; a
+//! broken entry shows its error and lets the user open or delete its
+//! folder.
 
+mod activity;
 mod add_dialog;
 mod broken;
 mod detail;
@@ -22,11 +24,13 @@ mod versions_tab;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext, Context, ElementId, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Rems, Render, Styled, Subscription,
-    Window, actions, div, rems,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Rems, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, TestSupportExt as _, Window, actions, div,
+    rems,
 };
 use patina_core::instance::InstanceConfig;
 use rust_i18n::t;
@@ -36,6 +40,8 @@ use crate::launch::{LaunchEvent, prelaunch_dialog};
 use crate::layout::TEXT_PRIMARY;
 use crate::theme::ProductColors;
 
+pub(crate) use activity::observe_activity;
+pub use activity::{ActivityEvent, InstanceActivity};
 pub use add_dialog::{
     AddInstanceForm, FormChanged, NewInstance, create_instance, default_name,
     open as open_add_instance_dialog,
@@ -47,9 +53,9 @@ pub use icon::{
 };
 pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
-pub use model::{Entry, InstancesChanged, InstancesModel};
+pub use model::{Entry, InstancesChanged, InstancesModel, RefreshFailed};
 pub use settings_tab::{SettingsForm, seed_java_list};
-pub use versions_tab::{Row as VersionsRow, VersionsTab};
+pub use versions_tab::{Incompatible, Row as VersionsRow, VersionsEvent, VersionsTab};
 // The run state lives with the launch flow; listed here for the views.
 pub use crate::launch::RunState;
 pub use overview::OverviewStats;
@@ -92,6 +98,23 @@ pub fn init(cx: &mut gpui_kit::App) {
     version_picker::init(cx);
 }
 
+/// Element id of the text of a notification made with [`labelled`].
+pub const NOTICE_TEXT: &str = "notice-text";
+
+/// `notification` (made with `text`) carrying `text` again as an empty
+/// labelled element ([`NOTICE_TEXT`]), so UI tests can tell which notice is
+/// on show: gpui-component's notification text has no id.
+pub(crate) fn labelled(notification: Notification, text: String) -> Notification {
+    let text = SharedString::from(text);
+    notification.content(move |_, _, _| {
+        div()
+            .id(NOTICE_TEXT)
+            .aria_label(text.clone())
+            .test_support()
+            .into_any_element()
+    })
+}
+
 /// Element id of the list row of entry `id` (healthy or broken).
 pub fn row_id(id: &str) -> ElementId {
     ElementId::Name(format!("instance-row-{id}").into())
@@ -107,6 +130,8 @@ pub struct InstancesPage {
     focus: FocusHandle,
     _observe: Subscription,
     _launch_events: Subscription,
+    _versions_events: Subscription,
+    _refresh_failed: Subscription,
 }
 
 impl InstancesPage {
@@ -124,6 +149,25 @@ impl InstancesPage {
                 }
             },
         );
+        // A version change's notices and questions, from the model.
+        let _versions_events = cx.subscribe_in(
+            &model,
+            window,
+            |_, model, event: &VersionsEvent, window, cx| {
+                versions_tab::show_event(model, event, window, cx);
+            },
+        );
+        // A refresh that failed keeps the last list; say so, in place of a
+        // notice still on show from the same run of failures.
+        let _refresh_failed = cx.subscribe_in(
+            &model,
+            window,
+            |_, _, RefreshFailed(error): &RefreshFailed, window, cx| {
+                let text = t!("instances.refresh_failed", error = error).to_string();
+                let notice = labelled(Notification::warning(text.clone()), text);
+                window.push_notification(notice.id::<RefreshFailed>(), cx);
+            },
+        );
         Self {
             list: cx.new(|cx| InstanceList::new(model.clone(), focus.clone(), cx)),
             detail: cx.new(|cx| DetailView::new(model.clone(), focus.clone(), cx)),
@@ -131,6 +175,8 @@ impl InstancesPage {
             focus,
             _observe,
             _launch_events,
+            _versions_events,
+            _refresh_failed,
         }
     }
 

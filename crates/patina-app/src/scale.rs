@@ -13,11 +13,29 @@
 //! window's minimum grows with the scale ([`min_window_size`]), and a step
 //! whose minimum would not fit the window's display is not offered: the zoom
 //! keys stop at the largest step that fits ([`largest_fitting`]).
+//!
+//! gpui (gpui-pre 0.3.9) sets a window's platform minimum only when it
+//! opens, so a step taken later cannot raise it: the window is grown to the
+//! step's minimum instead ([`follow_window`]), and the next start opens
+//! with the right platform minimum. Growing never fights the window
+//! manager ([`should_regrow`]):
+//!
+//! - a maximized, fullscreen or tiled window (client decorations reporting
+//!   tiled edges, as tiling compositors such as niri do) is never resized;
+//! - when a step is taken (a zoom key, a move to another display) a window
+//!   below the new minimum is grown;
+//! - when the window's bounds change (the user shrank it below the minimum
+//!   the platform still allows) it is grown back only where the tiling
+//!   state is known (client decorations, not tiled); with server
+//!   decorations Linux reports no tiling state, so a resize there is left
+//!   alone;
+//! - either way at most once per step: a compositor that insists on a
+//!   smaller size wins.
 
 use gpui_kit::component::Theme;
 use gpui_kit::{
-    AnyWindowHandle, App, Global, KeyBinding, Pixels, PlatformDisplay, Size, Window, actions, px,
-    size,
+    AnyWindowHandle, App, AppContext as _, Context, Decorations, Entity, Global, KeyBinding,
+    Pixels, PlatformDisplay, Size, Subscription, Window, actions, px, size,
 };
 
 use crate::settings::SettingsStore;
@@ -100,7 +118,66 @@ struct ScaleState {
     /// The largest step the main window's display can take.
     max: f32,
     /// The windows whose minimum follows the scale (the main window).
-    windows: Vec<AnyWindowHandle>,
+    followers: Vec<Entity<Follower>>,
+}
+
+/// Why a window's size is checked against the step's minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// A step was taken (a zoom key, a move to another display).
+    Step,
+    /// The window's bounds changed (the user or the window manager).
+    Bounds,
+}
+
+/// Whether a window below `step`'s minimum may be grown now (see the module
+/// docs): never when maximized, fullscreen (`max_or_full`) or tiled; on a
+/// bounds change only when the tiling state is known; and at most once per
+/// step (`last_grown` is the step the window was last grown for).
+fn should_regrow(
+    decorations: Decorations,
+    trigger: Trigger,
+    last_grown: Option<f32>,
+    step: f32,
+    max_or_full: bool,
+) -> bool {
+    if max_or_full {
+        return false;
+    }
+    match decorations {
+        Decorations::Client { tiling } if tiling.is_tiled() => return false,
+        // No tiling state (Linux with server decorations): a size the
+        // window manager or the user set stands.
+        Decorations::Server if trigger == Trigger::Bounds => return false,
+        _ => {}
+    }
+    last_grown != Some(step)
+}
+
+/// One window whose minimum follows the scale: its bounds observer and the
+/// step it was last grown for.
+struct Follower {
+    handle: AnyWindowHandle,
+    last_grown: Option<f32>,
+    _bounds: Subscription,
+}
+
+impl Follower {
+    /// Grows `window` to `step`'s minimum when it is smaller and
+    /// [`should_regrow`] allows it.
+    fn grow(&mut self, step: f32, trigger: Trigger, window: &mut Window) {
+        let max_or_full = window.is_maximized() || window.is_fullscreen();
+        let decorations = window.window_decorations();
+        if !should_regrow(decorations, trigger, self.last_grown, step, max_or_full) {
+            return;
+        }
+        let min = min_window_size(step);
+        let now = window.viewport_size();
+        if now.width < min.width || now.height < min.height {
+            self.last_grown = Some(step);
+            window.resize(now.max(&min));
+        }
+    }
 }
 
 impl Default for ScaleState {
@@ -109,7 +186,7 @@ impl Default for ScaleState {
             base: None,
             applied: DEFAULT_SCALE,
             max: UI_SCALES[UI_SCALES.len() - 1],
-            windows: Vec::new(),
+            followers: Vec::new(),
         }
     }
 }
@@ -190,20 +267,49 @@ pub fn startup_scale(scale: f32, cx: &mut App) -> f32 {
 
 /// Makes `window`'s minimum follow the scale: takes the limit from its
 /// display (now and whenever it moves to another one) and grows it when a
-/// larger step needs more room. Call once, right after opening the window
-/// with [`min_window_size`] of the scale it opened at.
+/// step needs more room (see the module docs). Call once, right after
+/// opening the window with [`min_window_size`] of the scale it opened at.
 pub fn follow_window(window: &mut Window, cx: &mut App) {
+    let handle = window.window_handle();
+    let follower = cx.new(|cx: &mut Context<Follower>| Follower {
+        handle,
+        last_grown: None,
+        _bounds: cx.observe_window_bounds(window, |this, window, cx| {
+            this.grow(applied_scale(cx), Trigger::Bounds, window);
+        }),
+    });
     cx.default_global::<ScaleState>()
-        .windows
-        .push(window.window_handle());
+        .followers
+        .push(follower.clone());
+    // Forget the window once it is closed.
+    let id = handle.window_id();
+    cx.on_window_closed(move |cx, closed| {
+        if closed == id && cx.has_global::<ScaleState>() {
+            let state = cx.global_mut::<ScaleState>();
+            state
+                .followers
+                .retain(|f| f.entity_id() != follower.entity_id());
+        }
+    })
+    .detach();
     limit_to_display(window, cx);
     window
-        .observe_window_display(|window, cx| {
+        .observe_window_display(move |window, cx| {
             limit_to_display(window, cx);
-            let scale = applied_scale(cx);
-            grow_to_min(scale, window);
+            let step = applied_scale(cx);
+            if let Some(follower) = follower_of(handle, cx) {
+                follower.update(cx, |f, _| f.grow(step, Trigger::Step, window));
+            }
         })
         .detach();
+}
+
+/// The follower of window `handle`, while it is followed.
+fn follower_of(handle: AnyWindowHandle, cx: &App) -> Option<Entity<Follower>> {
+    let state = cx.try_global::<ScaleState>()?;
+    (state.followers.iter())
+        .find(|f| f.read(cx).handle == handle)
+        .cloned()
 }
 
 /// Takes the limit from `window`'s display; a scale above it is lowered
@@ -215,23 +321,6 @@ fn limit_to_display(window: &Window, cx: &mut App) {
     if applied > max {
         tracing::info!(applied, max, "ui scale lowered to fit the display");
         apply_scale(max, cx);
-    }
-}
-
-/// Grows `window` to the minimum of `scale` when it is smaller (a maximized
-/// or fullscreen window is left to the platform).
-///
-/// gpui sets a window's platform minimum only when it opens, so a step
-/// taken later cannot raise it; growing the window gives the step its room
-/// now, and the next start opens with the new minimum.
-fn grow_to_min(scale: f32, window: &mut Window) {
-    if window.is_maximized() || window.is_fullscreen() {
-        return;
-    }
-    let min = min_window_size(scale);
-    let now = window.viewport_size();
-    if now.width < min.width || now.height < min.height {
-        window.resize(now.max(&min));
     }
 }
 
@@ -267,12 +356,18 @@ pub fn set_scale(scale: f32, cx: &mut App) {
     tracing::info!(scale, "ui scale changed");
     apply_scale(scale, cx);
     // The zoom keys run while their window is being updated; resize it
-    // once that is done.
-    let windows = cx.global::<ScaleState>().windows.clone();
+    // once that is done. A new step may grow each window once again.
+    let followers = cx.global::<ScaleState>().followers.clone();
     cx.defer(move |cx| {
-        for handle in windows {
+        for follower in followers {
+            let handle = follower.read(cx).handle;
             handle
-                .update(cx, |_, window, _| grow_to_min(scale, window))
+                .update(cx, |_, window, cx| {
+                    follower.update(cx, |f, _| {
+                        f.last_grown = None;
+                        f.grow(scale, Trigger::Step, window);
+                    })
+                })
                 .ok();
         }
     });
@@ -314,6 +409,46 @@ mod tests {
         assert_eq!(min_window_size(2.0), size(px(1920.), px(1200.)));
         // Unknown values snap first.
         assert_eq!(min_window_size(1.02), MIN_WINDOW);
+    }
+
+    #[test]
+    fn growing_never_fights_the_window_manager() {
+        use gpui_kit::Tiling;
+        let floating = Decorations::Client {
+            tiling: Tiling::default(),
+        };
+        let tiled = Decorations::Client {
+            tiling: Tiling::tiled(),
+        };
+        let half = Decorations::Client {
+            tiling: Tiling {
+                left: true,
+                ..Tiling::default()
+            },
+        };
+        let (step, bounds) = (Trigger::Step, Trigger::Bounds);
+        // A step grows a floating window, also with server decorations.
+        assert!(should_regrow(floating, step, None, 1.25, false));
+        assert!(should_regrow(Decorations::Server, step, None, 1.25, false));
+        // Tiled (any edge), maximized or fullscreen: never.
+        for trigger in [step, bounds] {
+            assert!(!should_regrow(tiled, trigger, None, 1.25, false));
+            assert!(!should_regrow(half, trigger, None, 1.25, false));
+            assert!(!should_regrow(floating, trigger, None, 1.25, true));
+        }
+        // A resize grows it back only where the tiling state is known.
+        assert!(should_regrow(floating, bounds, None, 1.25, false));
+        assert!(!should_regrow(
+            Decorations::Server,
+            bounds,
+            None,
+            1.25,
+            false
+        ));
+        // Once per step: a window manager that insists wins.
+        assert!(!should_regrow(floating, bounds, Some(1.25), 1.25, false));
+        assert!(!should_regrow(floating, step, Some(1.25), 1.25, false));
+        assert!(should_regrow(floating, bounds, Some(1.1), 1.25, false));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! rows (icon, name, last played; loader · version). Broken entries come
 //! after the healthy ones under "全部".
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
@@ -20,6 +21,7 @@ use patina_core::instance::{BrokenInstance, Instance};
 use patina_core::loader::LoaderKind;
 use rust_i18n::t;
 
+use super::activity::InstanceActivity;
 use super::model::{Entry, InstancesModel};
 use super::{
     AddInstance, icon_for, instance_icon, loader_color, loader_name, now_secs, row_id, tile,
@@ -133,11 +135,15 @@ impl Filter {
 
 /// The ids of the entries `filter` lets through, in list order: healthy
 /// instances, then (under "全部") the broken ones.
-pub fn visible_ids(model: &InstancesModel, filter: Filter) -> Vec<String> {
+pub fn visible_ids(
+    model: &InstancesModel,
+    activity: &InstanceActivity,
+    filter: Filter,
+) -> Vec<String> {
     let healthy = model
         .instances()
         .iter()
-        .filter(|i| filter.accepts(i, model.is_running(&i.id)))
+        .filter(|i| filter.accepts(i, activity.is_running(&i.id)))
         .map(|i| i.id.clone());
     let broken = model
         .broken()
@@ -154,6 +160,10 @@ pub struct InstanceList {
     filter: Filter,
     /// The visible rows' ids, rebuilt when the model or the filter changes.
     rows: Rc<Vec<String>>,
+    /// The listed instances whose game runs (the rows' dots). The list
+    /// follows the activity only through this and the running filter, so
+    /// an operation's progress does not re-render it.
+    running: HashSet<String>,
     /// Where [`AddInstance`] is dispatched (the instances page).
     page_focus: FocusHandle,
     /// The rows region: a Tab stop that takes Up / Down.
@@ -162,7 +172,7 @@ pub struct InstanceList {
     /// The selection the list last scrolled to; a new one (a created
     /// instance, a keyboard step) is scrolled into view.
     scrolled_to: Option<String>,
-    _observe: Subscription,
+    _observe: [Subscription; 2],
 }
 
 impl InstanceList {
@@ -171,11 +181,23 @@ impl InstanceList {
         page_focus: FocusHandle,
         cx: &mut Context<Self>,
     ) -> Self {
-        let _observe = cx.observe(&model, |this, _, cx| this.rebuild_rows(cx));
+        let activity = model.read(cx).activity().clone();
+        let _observe = [
+            cx.observe(&model, |this, _, cx| {
+                this.rebuild_rows(cx);
+                cx.notify();
+            }),
+            cx.observe(&activity, |this, _, cx| {
+                if this.rebuild_rows(cx) {
+                    cx.notify();
+                }
+            }),
+        ];
         let mut this = Self {
             model,
             filter: Filter::All,
             rows: Rc::default(),
+            running: HashSet::new(),
             page_focus,
             focus: cx.focus_handle().tab_stop(true),
             scroll: VirtualListScrollHandle::new(),
@@ -199,6 +221,7 @@ impl InstanceList {
         if self.filter != filter {
             self.filter = filter;
             self.rebuild_rows(cx);
+            cx.notify();
         }
     }
 
@@ -228,12 +251,25 @@ impl InstanceList {
         cx.notify();
     }
 
-    fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
+    /// Rebuilds the rows on show and the running set; returns whether
+    /// either changed or the selection was scrolled to. The caller notifies.
+    fn rebuild_rows(&mut self, cx: &mut Context<Self>) -> bool {
         let model = self.model.read(cx);
-        let rows = visible_ids(model, self.filter);
+        let activity = model.activity().read(cx);
+        let rows = visible_ids(model, activity, self.filter);
+        let running: HashSet<String> = (activity.running_ids())
+            .filter(|id| model.entry(id).is_some())
+            .map(str::to_owned)
+            .collect();
         let selected = model.selected().map(str::to_owned);
+        let mut changed = false;
         if *self.rows != rows {
             self.rows = Rc::new(rows);
+            changed = true;
+        }
+        if self.running != running {
+            self.running = running;
+            changed = true;
         }
         if selected != self.scrolled_to {
             if let Some(ix) =
@@ -242,8 +278,9 @@ impl InstanceList {
                 self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
             }
             self.scrolled_to = selected;
+            changed = true;
         }
-        cx.notify();
+        changed
     }
 
     fn render_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -325,7 +362,7 @@ impl InstanceList {
         };
         let content = match model.entry(id) {
             Some(Entry::Healthy(instance)) => {
-                healthy_row(instance, model.is_running(id), cx).into_any_element()
+                healthy_row(instance, self.running.contains(id), cx).into_any_element()
             }
             Some(Entry::Broken(broken)) => broken_row(broken, cx).into_any_element(),
             None => div().into_any_element(),

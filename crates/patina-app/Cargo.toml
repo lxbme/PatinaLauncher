@@ -12,9 +12,10 @@ workspace = true
 # so a release build never carries them; `cargo app` (see .cargo/config.toml)
 # enables it.
 dev-offline = ["patina-core/dev-offline"]
-# Test doubles (`core_bridge::testing`) for this crate's integration tests.
-# Never enabled by a release build.
-test-support = []
+# Test doubles (`core_bridge::testing`) for this crate's integration tests,
+# with the offline core's client (hence `reqwest`). Never enabled by a
+# release build.
+test-support = ["dep:reqwest"]
 # Builds the real end-to-end suite (`tests/e2e_real.rs`, network and a real
 # Minecraft), so a plain `cargo test -- --ignored` cannot run it by accident.
 e2e = ["dev-offline", "test-support"]
@@ -24,9 +25,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 futures = "0.3.34"
 gpui-kit.workspace = true
 patina-core = { version = "0.1.0", path = "../patina-core" }
-# Only to build the test core's offline client; the same version and
-# features as patina-core's, so nothing new is compiled.
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+# Only to build the test core's offline client (`test-support`); the same
+# version and features as patina-core's, so nothing new is compiled.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"], optional = true }
 rust-i18n = "4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -36,6 +37,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+# The offline client of this crate's unit tests (as `test-support` has it).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 # Same source and version as the normal dependency; adds headless windows.
 gpui-kit = { workspace = true, features = ["test-support"] }
 # This crate with its test doubles, for the integration tests in `tests/`.

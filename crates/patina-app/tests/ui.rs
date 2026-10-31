@@ -13,8 +13,8 @@ use patina_app::core_bridge::{AccountsChanged, Core, LaunchBackend, LoadError};
 use patina_app::i18n::Language;
 use patina_app::instances::{
     Filter, IconChoice, IconPicked, IconPicker, IconSource, InstanceList, InstancesChanged,
-    InstancesModel, RunState, forget_cached_image, icon_for, instance_icon, pick_id, row_id,
-    save_icon,
+    InstancesModel, NOTICE_TEXT, RunState, VersionsEvent, forget_cached_image, icon_for,
+    instance_icon, pick_id, row_id, save_icon,
 };
 use patina_app::launch::{LevelFilter, LogView, OpError, OpKind, OpState};
 use patina_app::settings::{self, AppSettings, SettingsStore};
@@ -292,6 +292,28 @@ fn zooming_in_grows_the_window_to_the_new_minimum(cx: &mut TestAppContext) {
         size.width >= px(1680.) && size.height >= px(1050.),
         "{size:?}"
     );
+}
+
+/// The test window reports server decorations (no tiling state, as on
+/// Linux with server decorations): a zoom step grows it, but a size set
+/// afterwards (by the user or a tiling compositor) stands.
+#[gpui_kit::test]
+fn a_resize_without_a_tiling_state_is_not_fought(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let handle = app.handle;
+    cx.simulate_window_resize(handle, gpui_kit::size(px(960.), px(600.)));
+    cx.run_until_parked();
+    for _ in 0..2 {
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-=", cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    assert_eq!(cx.update(|cx| SettingsStore::get(cx).ui_scale), 1.25);
+    assert_eq!(window_size(&app, cx), gpui_kit::size(px(1200.), px(750.)));
+    cx.simulate_window_resize(handle, gpui_kit::size(px(1000.), px(640.)));
+    cx.run_until_parked();
+    assert_eq!(window_size(&app, cx), gpui_kit::size(px(1000.), px(640.)));
 }
 
 /// Opens the already-running notice as the second instance does.
@@ -735,6 +757,43 @@ fn selection_survives_refresh(cx: &mut TestAppContext) {
     refresh(&model, cx);
     assert_eq!(selected(&model, cx).as_deref(), Some("Aaron"));
     assert!(!shows(&app, cx, row_id("Beta")));
+}
+
+#[gpui_kit::test]
+fn a_failed_refresh_keeps_the_list_and_says_so(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let instances = DataDirs::new(tmp.path()).instances();
+    InstanceStore::new(instances.clone())
+        .create("Alpha", "1.21.1")
+        .unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    assert_eq!(notification_count(&app, cx), 0);
+
+    // The directory becomes unreadable (a file in its place).
+    let aside = tmp.path().join("aside");
+    std::fs::rename(&instances, &aside).unwrap();
+    std::fs::write(&instances, "not a directory").unwrap();
+    refresh(&model, cx);
+    assert!(model.read_with(cx, |m, _| m.error().is_some()));
+    assert_eq!(
+        model.read_with(cx, |m, _| m.instances().len()),
+        1,
+        "the last list stays"
+    );
+    assert!(shows(&app, cx, row_id("Alpha")));
+    settle(cx, |cx| notification_count(&app, cx) == 1);
+    // Failing again (every window activation refreshes) does not pile up.
+    refresh(&model, cx);
+    cx.run_until_parked();
+    assert_eq!(notification_count(&app, cx), 1);
+
+    // Readable again: the error goes.
+    std::fs::remove_file(&instances).unwrap();
+    std::fs::rename(&aside, &instances).unwrap();
+    refresh(&model, cx);
+    assert!(model.read_with(cx, |m, _| m.error().is_none()));
 }
 
 #[gpui_kit::test]
@@ -1468,7 +1527,7 @@ fn items(phase: Phase, done: u64, total: u64) -> TaskProgress {
 }
 
 fn op_of(model: &Entity<InstancesModel>, cx: &mut TestAppContext, id: &str) -> Option<OpState> {
-    model.read_with(cx, |m, _| m.op(id).cloned())
+    model.read_with(cx, |m, cx| m.op(id, cx).cloned())
 }
 
 #[gpui_kit::test]
@@ -1549,6 +1608,60 @@ fn progress_follows_its_instance(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_progress_tick_notifies_neither_the_list_nor_the_model(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ids) = op_model(cx, tmp.path(), &["Alpha", "Beta"]);
+    let list = instance_list(&app, cx);
+    let done = Rc::new(Cell::new(0));
+    let (ok, gate, tick) = start_gated(&model, cx, &ids[0], || Ok(()), done.clone());
+    assert!(ok);
+    cx.run_until_parked();
+
+    // The versions tab of the selected instance (the one busy) shows only
+    // whether it is busy: not re-rendered by a tick either.
+    model.update(cx, |m, cx| m.select(&ids[0], cx));
+    cx.run_until_parked();
+    let versions = cx.update(|cx| {
+        let page = app.root.read(cx).instances().read(cx);
+        page.detail().read(cx).versions_view().cloned().unwrap()
+    });
+    let (list_notes, model_notes) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let tab_notes = Rc::new(Cell::new(0));
+    let _watch = cx.update(|cx| {
+        let (l, m, t) = (list_notes.clone(), model_notes.clone(), tab_notes.clone());
+        [
+            cx.observe(&list, move |_, _| l.set(l.get() + 1)),
+            cx.observe(&model, move |_, _| m.set(m.get() + 1)),
+            cx.observe(&versions, move |_, _| t.set(t.get() + 1)),
+        ]
+    });
+    tick.send(items(Phase::RunProcessor, 1, 2)).unwrap();
+    settle(cx, |cx| {
+        matches!(
+            op_of(&model, cx, &ids[0]),
+            Some(OpState::Running {
+                progress: Some(_),
+                ..
+            })
+        )
+    });
+    assert_eq!(list_notes.get(), 0, "the list is not notified by a tick");
+    assert_eq!(model_notes.get(), 0, "nor is the list's model");
+    assert_eq!(tab_notes.get(), 0, "nor the versions tab");
+
+    // A run state change (rare) still reaches the list: the running filter
+    // and the rows' dots follow it.
+    model.update(cx, |m, cx| m.set_run_state(&ids[1], Some(elsewhere()), cx));
+    cx.run_until_parked();
+    assert!(list_notes.get() > 0, "a game starting re-renders the list");
+
+    gate.send(()).unwrap();
+    settle(cx, |_| done.get() == 1);
+}
+
+#[gpui_kit::test]
 fn second_op_on_same_instance_is_rejected(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let (_app, model, ids) = op_model(cx, tmp.path(), &["Alpha"]);
@@ -1597,7 +1710,7 @@ fn busy_message_uses_display_name(cx: &mut TestAppContext) {
         what: BusyKind::Running(id.clone()),
     }));
     assert_eq!(
-        model.read_with(cx, |m, _| running.message(m)),
+        model.read_with(cx, |m, _| running.message(|id| m.display_name(id))),
         "“My Pack” is running; stop the game first"
     );
     assert_eq!(done.get(), 0);
@@ -1636,6 +1749,37 @@ fn result_for_a_deleted_instance_is_dropped(cx: &mut TestAppContext) {
         op_of(&model, cx, &ids[1]).is_none(),
         "no failure left behind"
     );
+}
+
+#[gpui_kit::test]
+fn a_failure_of_a_deleted_instance_goes_on_refresh(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_app, model, ids) = op_model(cx, tmp.path(), &["Alpha", "Beta"]);
+    let done = Rc::new(std::cell::Cell::new(0));
+    for id in &ids {
+        let (_, gate, tick) = start_gated(
+            &model,
+            cx,
+            id,
+            || Err(OpError::Message("boom".into())),
+            done.clone(),
+        );
+        drop(tick);
+        gate.send(()).unwrap();
+    }
+    let failed = |cx: &mut TestAppContext, id: &str| {
+        matches!(op_of(&model, cx, id), Some(OpState::Failed { .. }))
+    };
+    settle(cx, |cx| failed(cx, &ids[0]) && failed(cx, &ids[1]));
+    list_settled(&model, cx);
+
+    std::fs::remove_dir_all(DataDirs::new(tmp.path()).instances().join(&ids[0])).unwrap();
+    refresh(&model, cx);
+    assert!(
+        op_of(&model, cx, &ids[0]).is_none(),
+        "nothing to hang the failure on"
+    );
+    assert!(failed(cx, &ids[1]), "a listed instance keeps its failure");
 }
 
 #[gpui_kit::test]
@@ -2033,7 +2177,7 @@ fn create_closes_dialog_and_selects_new_instance(cx: &mut TestAppContext) {
     assert_eq!(created.config.icon, None);
     assert!(shows(&app, cx, "instance-detail"));
     assert!(
-        model.read_with(cx, |m, _| m.op("1.21.1").is_none()),
+        model.read_with(cx, |m, cx| m.op("1.21.1", cx).is_none()),
         "nothing to install"
     );
     settle(cx, |cx| usage_count(&status, cx) == Some(1));
@@ -2117,7 +2261,7 @@ fn failed_install_leaves_vanilla_instance_with_retry(cx: &mut TestAppContext) {
             window.render_frame(cx);
             window.click("instance-op-retry", cx);
             let model = model.read(cx);
-            model.op(id).cloned()
+            model.op(id, cx).cloned()
         })
         .unwrap();
     assert!(
@@ -2313,6 +2457,56 @@ fn enter_commits_only_from_the_name_and_the_lists(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn enter_in_the_name_creates(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    click(&app, cx, "add-instance-name");
+    press(&app, cx, "ctrl-a");
+    type_text(&app, cx, "Named");
+    press(&app, cx, "enter");
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("Named"));
+}
+
+/// A refresh that fails right after creating: the add dialog says what
+/// happened, in place of the page's generic notice.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_failed_refresh_after_creating_is_reported_once(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let instances = DataDirs::new(tmp.path()).instances();
+    std::fs::create_dir_all(&instances).unwrap();
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    let mode = |m| std::fs::set_permissions(&instances, std::fs::Permissions::from_mode(m));
+    // From here the directory takes new instances but cannot be listed.
+    mode(0o300).unwrap();
+    if std::fs::read_dir(&instances).is_ok() {
+        // Permissions do not apply (root): nothing to simulate.
+        mode(0o755).unwrap();
+        return;
+    }
+    click(&app, cx, "add-instance-create");
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| model.read_with(cx, |m, _| m.error().is_some()));
+    cx.run_until_parked();
+    let count = notification_count(&app, cx);
+    let text = label_of(&app, cx, NOTICE_TEXT);
+    mode(0o755).unwrap();
+    assert_eq!(count, 1, "one notice for one failure");
+    let text = text.expect("the notice's text");
+    assert!(
+        text.starts_with("Created “1.21.1”, but couldn’t read the instance list: "),
+        "the add dialog's notice, not the page's: {text}"
+    );
+    refresh(&model, cx);
+    assert!(model.read_with(cx, |m, _| m.entry("1.21.1").is_some()));
+}
+
+#[gpui_kit::test]
 fn create_failure_is_reported(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     // A file where the instances directory belongs: nothing can be created.
@@ -2370,6 +2564,39 @@ fn log_view(app: &Booted, cx: &mut TestAppContext) -> Entity<LogView> {
             .expect("log tab shown")
             .clone()
     })
+}
+
+#[gpui_kit::test]
+fn the_english_log_toolbar_fits_the_smallest_window(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    InstanceStore::new(DataDirs::new(tmp.path()).instances())
+        .create("Logs", "1.21.1")
+        .unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "tab-log");
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+    cx.run_until_parked();
+    for id in [
+        "log-filter-all",
+        "log-filter-warn",
+        "log-autoscroll",
+        "log-copy",
+        "log-open-folder",
+    ] {
+        let fits = cx
+            .update_window(app.handle, |_, window, cx| {
+                window.render_frame(cx);
+                let pane = window.find("instance-detail").bounds();
+                let e = window.find(id);
+                let b = e.bounds();
+                e.visible() && b.left() >= pane.left() && b.right() <= pane.right()
+            })
+            .unwrap();
+        assert!(fits, "{id} is cut off at 960×600");
+        assert!(inside_window(&app, cx, id), "{id} is outside the window");
+    }
 }
 
 #[gpui_kit::test]
@@ -2583,11 +2810,11 @@ fn a_deleted_instance_forgets_its_log(cx: &mut TestAppContext) {
     });
     std::fs::remove_dir_all(DataDirs::new(tmp.path()).instances().join("Gone")).unwrap();
     refresh(&model, cx);
-    model.read_with(cx, |m, _| {
-        assert!(m.crash_log("Gone").is_none());
-        assert!(m.crash_log("Kept").is_some());
-        assert!(!m.has_log("Gone"));
-        assert!(m.has_log("Kept"));
+    model.read_with(cx, |m, cx| {
+        assert!(m.crash_log("Gone", cx).is_none());
+        assert!(m.crash_log("Kept", cx).is_some());
+        assert!(!m.has_log("Gone", cx));
+        assert!(m.has_log("Kept", cx));
     });
 }
 
@@ -2742,7 +2969,7 @@ fn run_state(
     cx: &mut TestAppContext,
     id: &str,
 ) -> Option<RunState> {
-    model.read_with(cx, |m, _| m.run_state(id).cloned())
+    model.read_with(cx, |m, cx| m.run_state(id, cx).cloned())
 }
 
 /// The stop handle of `id`'s game once this app runs it.
@@ -2816,7 +3043,7 @@ fn second_launch_is_busy_with_display_name(cx: &mut TestAppContext) {
     // Running: 启动 is greyed and the model refuses a second launch.
     assert!(disabled(&app, cx, "launch"));
     assert!(shows(&app, cx, "instance-stop"));
-    assert!(model.read_with(cx, |m, _| m.is_busy(&a)));
+    assert!(model.read_with(cx, |m, cx| m.is_busy(&a, cx)));
     assert!(!model.update(cx, |m, cx| m.launch(&a, cx)));
     assert!(op_of(&model, cx, &a).is_none());
 
@@ -2831,7 +3058,9 @@ fn second_launch_is_busy_with_display_name(cx: &mut TestAppContext) {
     assert_eq!(message, "“Other Pack” is busy with another operation");
     assert!(!message.contains(&b), "{message}");
     // Looking for a game finds none; the failure stays, with retry.
-    settle_game(cx, |cx| model.read_with(cx, |m, _| !m.is_following(&b)));
+    settle_game(cx, |cx| {
+        model.read_with(cx, |m, cx| !m.is_following(&b, cx))
+    });
     assert!(run_state(&model, cx, &b).is_none());
     assert!(failed_message(&model, cx, &b).is_some());
     assert!(shows(&app, cx, "instance-op-retry"));
@@ -2975,7 +3204,7 @@ fn crash_shows_saved_log(cx: &mut TestAppContext) {
     let saved = exit.saved_log.clone().expect("the log is saved");
     assert!(std::fs::read_to_string(&saved).unwrap().contains("boom"));
     assert_eq!(
-        model.read_with(cx, |m, _| m.crash_log(&a).map(Path::to_owned)),
+        model.read_with(cx, |m, cx| m.crash_log(&a, cx).map(Path::to_owned)),
         Some(saved)
     );
     // The header says so, with the folder one click away.
@@ -3037,7 +3266,7 @@ fn force_stop_requires_confirmation_and_is_not_a_crash(cx: &mut TestAppContext) 
     dialog_click(&app, cx, "ok");
     settle_game(cx, |cx| run_state(&model, cx, &a).is_none());
     assert!(running_game(&inst).is_none());
-    assert!(model.read_with(cx, |m, _| m.crash_log(&a).is_none()));
+    assert!(model.read_with(cx, |m, cx| m.crash_log(&a, cx).is_none()));
     assert!(!shows(&app, cx, "instance-crash"));
     assert!(!shows(&app, cx, "instance-stop"));
     let logs = std::fs::read_dir(inst.dir.join("patina-logs")).unwrap();
@@ -3093,7 +3322,7 @@ fn reattach_on_startup_restores_running_state(cx: &mut TestAppContext) {
     dialog_click(&app, cx, "ok");
     settle_game(cx, |cx| run_state(&model, cx, &a).is_none());
     assert!(running_game(&inst).is_none());
-    assert!(model.read_with(cx, |m, _| m.crash_log(&a).is_none()));
+    assert!(model.read_with(cx, |m, cx| m.crash_log(&a, cx).is_none()));
     drop(app);
     drop(games);
 }
@@ -3840,12 +4069,20 @@ fn enter_in_the_switch_list_opens_the_confirmation(cx: &mut TestAppContext) {
 fn switching_loader_warns_about_mods(cx: &mut TestAppContext) {
     use patina_core::loader::ops::{LoaderNotice, OpOutcome};
     let tmp = tempfile::tempdir().unwrap();
-    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.20.1", "0.14.0");
+    let (app, model, ops) = versions_app(cx, tmp.path(), "1.20.1", "0.14.0");
     let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
     ops.then(Ok(OpOutcome {
         instance: store.load("Pack").unwrap(),
         notices: vec![LoaderNotice::ModsMayBeIncompatible],
     }));
+    // The notice comes as an event of the model; the page shows it.
+    let events: Rc<std::cell::RefCell<Vec<VersionsEvent>>> = Rc::default();
+    let _subscription = cx.update(|cx| {
+        let events = events.clone();
+        cx.subscribe(&model, move |_, event: &VersionsEvent, _| {
+            events.borrow_mut().push(event.clone())
+        })
+    });
     click(&app, cx, "versions-row-loader");
     click(&app, cx, "versions-switch-loader");
     click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
@@ -3857,6 +4094,12 @@ fn switching_loader_warns_about_mods(cx: &mut TestAppContext) {
     })
     .unwrap();
     settle(cx, |cx| notification_count(&app, cx) == 1);
+    assert_eq!(
+        *events.borrow(),
+        [VersionsEvent::Warn(vec![
+            LoaderNotice::ModsMayBeIncompatible.to_string()
+        ])]
+    );
 }
 
 #[gpui_kit::test]
@@ -4369,6 +4612,58 @@ fn delete_disabled_while_running(cx: &mut TestAppContext) {
     assert!(store.load("Alpha").is_err());
     assert!(store.load("Beta").is_ok());
     assert_eq!(changed.get(), 1, "the status bar is told");
+}
+
+/// Runs `task` to its end.
+fn finish<T: 'static>(cx: &mut TestAppContext, task: gpui_kit::Task<T>) -> T {
+    let slot = Rc::new(std::cell::RefCell::new(None));
+    let fill = slot.clone();
+    cx.update(|cx| {
+        cx.spawn(async move |_| *fill.borrow_mut() = Some(task.await))
+            .detach()
+    });
+    settle(cx, |_| slot.borrow().is_some());
+    slot.borrow_mut().take().unwrap()
+}
+
+#[gpui_kit::test]
+fn deleting_a_busy_instance_says_why(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = DataDirs::new(tmp.path());
+    let store = InstanceStore::new(data.instances());
+    let id = store.create("Alpha", "1.21.1").unwrap().id;
+    store.rename(&id, "My Pack").unwrap();
+    let broken = data.instances().join("Broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    break_config(&broken);
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = open_settings(&app, cx, vec![]);
+    assert_eq!(selected(&model, cx).as_deref(), Some(id.as_str()));
+    // Another operation (this test's) holds both.
+    let held = (store.lock(&id).unwrap(), store.lock("Broken").unwrap());
+
+    let deleted = model.update(cx, |m, cx| m.delete(&id, cx));
+    // The reason follows the name in the notice ("Couldn’t delete “My
+    // Pack”: …"), so it does not repeat it.
+    assert_eq!(
+        finish(cx, deleted).unwrap_err(),
+        "An operation is in progress"
+    );
+    let entry = model.read_with(cx, |m, _| m.broken()[0].clone());
+    let deleted = model.update(cx, |m, cx| m.delete_broken(entry, cx));
+    assert_eq!(
+        finish(cx, deleted).unwrap_err(),
+        "An operation is in progress"
+    );
+
+    // The settings tab's delete says so too, and the instance stays.
+    sclick(&app, cx, "settings-delete");
+    dialog_click(&app, cx, "ok");
+    settle(cx, |cx| notification_count(&app, cx) == 1);
+    list_settled(&model, cx);
+    assert!(store.load(&id).is_ok());
+    assert!(broken.exists());
+    drop(held);
 }
 
 #[gpui_kit::test]

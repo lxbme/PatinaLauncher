@@ -3,6 +3,7 @@
 
 use std::rc::Rc;
 
+use patina_core::instance::InstanceError;
 use patina_core::launch::SessionError;
 use patina_core::loader::LoaderError;
 use patina_core::locks::BusyKind;
@@ -142,11 +143,43 @@ pub fn busy_message(what: &BusyKind, name_of: impl Fn(&str) -> String) -> String
     }
 }
 
+/// The message for an instance store error: a busy lock (an operation
+/// holds the instance, its game runs) in the app's words with the instance
+/// by `display_name` (its id when that has none), everything else as the
+/// core words it.
+pub fn instance_error_message(
+    error: &InstanceError,
+    display_name: impl Fn(&str) -> Option<String>,
+) -> String {
+    match error {
+        InstanceError::Busy(busy) => busy_message(&busy.what, |id| {
+            display_name(id).unwrap_or_else(|| id.to_string())
+        }),
+        error => error.to_string(),
+    }
+}
+
+/// The reason an instance store error gives, for a text that names the
+/// instance already ("Couldn’t delete “X”: …"): a busy instance or its
+/// running game without the name (the versions tab's reasons), everything
+/// else as [`instance_error_message`] words it.
+pub fn instance_error_reason(error: &InstanceError) -> String {
+    match error {
+        InstanceError::Busy(busy) => match &busy.what {
+            BusyKind::Instance(_) => t!("versions.busy_operation").to_string(),
+            BusyKind::Running(_) => t!("versions.busy_running").to_string(),
+            _ => instance_error_message(error, |_| None),
+        },
+        error => error.to_string(),
+    }
+}
+
 impl OpError {
     /// The message to show for this error: busy locks in the app's words,
     /// everything else as the core words it.
-    pub fn message(&self, model: &InstancesModel) -> String {
-        let name_of = |id: &str| model.display_name(id).unwrap_or_else(|| id.to_string());
+    /// `display_name` maps an instance id to its display name, when listed.
+    pub fn message(&self, display_name: impl Fn(&str) -> Option<String>) -> String {
+        let name_of = |id: &str| display_name(id).unwrap_or_else(|| id.to_string());
         match self {
             OpError::Loader(LoaderError::Busy(busy)) => busy_message(&busy.what, name_of),
             OpError::Session(SessionError::Busy(busy)) => busy_message(&busy.what, name_of),
@@ -173,5 +206,50 @@ impl OpError {
             self,
             OpError::Session(SessionError::Busy(_) | SessionError::AlreadyRunning(_))
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use patina_core::locks::Busy;
+
+    use super::*;
+
+    #[test]
+    fn instance_errors_name_busy_instances_by_display_name() {
+        let _locale = crate::i18n::locale_lock();
+        crate::i18n::set_language(crate::i18n::Language::En);
+        let name = |id: &str| (id == "pack-1").then(|| "My Pack".to_string());
+        let busy = |what| InstanceError::Busy(Busy { what });
+        assert_eq!(
+            instance_error_message(&busy(BusyKind::Running("pack-1".into())), name),
+            "“My Pack” is running; stop the game first"
+        );
+        assert_eq!(
+            instance_error_message(&busy(BusyKind::Instance("pack-1".into())), name),
+            "“My Pack” is busy with another operation"
+        );
+        // Without a display name (a broken entry) the id stands in.
+        assert_eq!(
+            instance_error_message(&busy(BusyKind::Instance("Broken".into())), name),
+            "“Broken” is busy with another operation"
+        );
+        let other = InstanceError::NotFound("gone".into());
+        assert_eq!(instance_error_message(&other, name), other.to_string());
+
+        // As a reason after the name: the name is not repeated.
+        assert_eq!(
+            instance_error_reason(&busy(BusyKind::Running("pack-1".into()))),
+            "The game is running"
+        );
+        assert_eq!(
+            instance_error_reason(&busy(BusyKind::Instance("pack-1".into()))),
+            "An operation is in progress"
+        );
+        assert_eq!(
+            instance_error_reason(&busy(BusyKind::Version("1.21.1".into()))),
+            "Version 1.21.1 is in use by another operation"
+        );
+        assert_eq!(instance_error_reason(&other), other.to_string());
     }
 }

@@ -105,6 +105,7 @@ pub struct Core {
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
+    #[cfg(any(test, feature = "test-support"))]
     startup: Startup,
 }
 
@@ -113,6 +114,7 @@ impl Global for Core {}
 /// A client that cannot reach any host: every request goes through a
 /// proxy at a closed local port and fails at once. Whatever the download
 /// source or the original URLs, an offline core never touches the network.
+#[cfg(any(test, feature = "test-support"))]
 fn unreachable_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         // Port 1 is privileged, so nothing a user runs listens there.
@@ -128,6 +130,7 @@ pub(super) enum Startup {
     SpeedTest,
     /// Never touch the network (tests): no speed test, and a client that
     /// cannot reach any host.
+    #[cfg(any(test, feature = "test-support"))]
     Offline,
 }
 
@@ -165,6 +168,7 @@ impl Core {
             let _rt = rt.enter();
             let client = match startup {
                 Startup::SpeedTest => http_client(),
+                #[cfg(any(test, feature = "test-support"))]
                 Startup::Offline => unreachable_client(),
             };
             client.map_err(|e| InitError::HttpClient(e.to_string()))?
@@ -210,6 +214,7 @@ impl Core {
             config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),
+            #[cfg(any(test, feature = "test-support"))]
             startup,
         };
         core.load();
@@ -366,6 +371,7 @@ impl Core {
             return;
         }
         drop(config);
+        #[cfg(any(test, feature = "test-support"))]
         if self.startup == Startup::Offline {
             return;
         }
@@ -464,6 +470,24 @@ mod tests {
 
     use super::*;
     use crate::core_bridge::testing::{self, FakeCatalog};
+
+    /// The offline client is for tests only: a release build has no direct
+    /// `reqwest` dependency (the core brings its own).
+    #[test]
+    fn reqwest_is_a_test_support_dependency_only() {
+        let manifest: toml::Table = toml::from_str(include_str!("../../Cargo.toml")).unwrap();
+        let reqwest = &manifest["dependencies"]["reqwest"];
+        assert_eq!(
+            reqwest.get("optional").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        let test_support = manifest["features"]["test-support"].as_array().unwrap();
+        assert!(
+            test_support
+                .iter()
+                .any(|f| f.as_str() == Some("dep:reqwest"))
+        );
+    }
 
     fn offline_core(rt: &Handle, dir: &Path) -> Core {
         testing::core(

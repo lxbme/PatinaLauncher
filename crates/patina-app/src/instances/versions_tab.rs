@@ -31,9 +31,9 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyView, App, AppContext, Context, Entity, FocusHandle, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, div, rems,
+    AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, rems,
 };
 use patina_core::instance::InstanceConfig;
 use patina_core::loader::ops::{LoaderAction, OpOutcome};
@@ -43,6 +43,7 @@ use rust_i18n::t;
 
 use super::loader_color;
 use super::model::{Entry, InstancesModel};
+use super::observe_activity;
 use super::overview;
 use super::version_picker::{LoaderPicker, VersionPicker};
 use crate::core_bridge::{Core, Revision, VersionOps, run, run_blocking};
@@ -97,15 +98,23 @@ pub struct VersionsTab {
     tags_key: Option<(LoaderKind, String)>,
     tags_revision: Revision,
     tags_task: Task<()>,
-    _observe: Subscription,
+    _observe: [Subscription; 2],
 }
 
 impl VersionsTab {
     pub fn new(model: Entity<InstancesModel>, id: String, cx: &mut Context<Self>) -> Self {
-        let _observe = cx.observe(&model, |this, _, cx| {
-            this.sync(cx);
-            cx.notify();
-        });
+        let activity = model.read(cx).activity().clone();
+        let _observe = [
+            cx.observe(&model, |this, _, cx| {
+                this.sync(cx);
+                cx.notify();
+            }),
+            // Busy or not, and why.
+            {
+                let id = id.clone();
+                observe_activity(&activity, cx, move |a| a.busy_reason(&id))
+            },
+        ];
         let mut this = Self {
             model,
             id,
@@ -216,7 +225,7 @@ impl VersionsTab {
 
     /// Why the changes are disabled, or `None` when they are not.
     fn busy_reason(&self, cx: &App) -> Option<String> {
-        self.model.read(cx).busy_reason(&self.id)
+        self.model.read(cx).busy_reason(&self.id, cx)
     }
 
     fn tag(id: &'static str, text: String, primary: bool) -> gpui_kit::AnyElement {
@@ -554,20 +563,6 @@ enum Changed {
     },
 }
 
-/// Shows `text` as a warning once the model is not being updated.
-fn warn_later(texts: Vec<String>, cx: &mut Context<InstancesModel>) {
-    cx.spawn(async move |_, cx| {
-        cx.update(|cx| {
-            in_main_window(cx, move |window, cx| {
-                for text in texts {
-                    window.push_notification(Notification::warning(text), cx);
-                }
-            })
-        })
-    })
-    .detach();
-}
-
 /// Runs the change `call` as operation `kind` of `id`; `retry` starts it
 /// again. `on_done` runs with the outcome. A busy instance takes no change:
 /// the user is told why.
@@ -599,12 +594,10 @@ fn start(
     if !started {
         let name = model.display_name(id).unwrap_or_else(|| id.to_string());
         let reason = model
-            .busy_reason(id)
+            .busy_reason(id, cx)
             .unwrap_or_else(|| t!("versions.busy_operation").to_string());
-        warn_later(
-            vec![t!("versions.refused", name = name, reason = reason).to_string()],
-            cx,
-        );
+        let text = t!("versions.refused", name = name, reason = reason).to_string();
+        cx.emit(VersionsEvent::Warn(vec![text]));
     }
 }
 
@@ -730,47 +723,61 @@ fn finished(_: &mut InstancesModel, id: &str, changed: Changed, cx: &mut Context
             if notices.is_empty() {
                 return;
             }
-            warn_later(notices, cx);
+            cx.emit(VersionsEvent::Warn(notices));
         }
         Changed::Incompatible {
             mc,
             kind,
             version,
             can_replace,
-        } => {
-            let (model, id) = (cx.entity(), id.to_string());
-            // The model is being updated: open the dialog once it is not.
-            cx.spawn(async move |_, cx| {
-                cx.update(|cx| {
-                    in_main_window(cx, move |window, cx| {
-                        let ask = Incompatible {
-                            id,
-                            mc,
-                            kind,
-                            version,
-                            can_replace,
-                        };
-                        open_incompatible(model, ask, window, cx)
-                    })
-                })
-            })
-            .detach();
-        }
-    }
-}
-
-/// Runs `f` on the window that has the keyboard (else the first one).
-fn in_main_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut App) + 'static) {
-    let handle = cx.active_window().or_else(|| cx.windows().first().copied());
-    if let Some(handle) = handle {
-        handle.update(cx, |_, window, cx| f(window, cx)).ok();
+        } => cx.emit(VersionsEvent::Incompatible(Incompatible {
+            id: id.to_string(),
+            mc,
+            kind,
+            version,
+            can_replace,
+        })),
     }
 }
 
 // --- dialogs ------------------------------------------------------------
 
+/// What a version change asks of a window: it finishes on the model, which
+/// has none. Emitted by [`InstancesModel`]; the instances page shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionsEvent {
+    /// Show these warnings: the notices of a finished change, or why a
+    /// change was refused.
+    Warn(Vec<String>),
+    /// The loader does not support the Minecraft version the instance was
+    /// changed to: ask what to do about it.
+    Incompatible(Incompatible),
+}
+
+impl EventEmitter<VersionsEvent> for InstancesModel {}
+
+/// Shows `event` of `model` in `window` (the instances page subscribes).
+pub(crate) fn show_event(
+    model: &Entity<InstancesModel>,
+    event: &VersionsEvent,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match event {
+        VersionsEvent::Warn(texts) => {
+            for text in texts {
+                window.push_notification(Notification::warning(text.clone()), cx);
+            }
+        }
+        VersionsEvent::Incompatible(ask) => {
+            open_incompatible(model.clone(), ask.clone(), window, cx);
+        }
+    }
+}
+
 /// What `set_mc_version` found out about the loader.
-struct Incompatible {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incompatible {
     id: String,
     mc: String,
     kind: LoaderKind,
@@ -938,7 +945,8 @@ impl<T: 'static> PickerDialog<T> {
         } = self;
         let ready: Ready = {
             let (model, ready) = (model.clone(), ready);
-            Rc::new(move |cx| !model.read(cx).is_busy(&instance) && ready(cx))
+            let instance = instance.clone();
+            Rc::new(move |cx| !model.read(cx).is_busy(&instance, cx) && ready(cx))
         };
         let footer = {
             let (ready, commit) = (ready.clone(), commit.clone());
@@ -950,6 +958,9 @@ impl<T: 'static> PickerDialog<T> {
                 _watch: vec![
                     cx.observe(&picker, |_, _, cx| cx.notify()),
                     cx.observe(&model, |_, _, cx| cx.notify()),
+                    observe_activity(&model.read(cx).activity().clone(), cx, move |a| {
+                        a.is_busy(&instance)
+                    }),
                 ],
             })
         };

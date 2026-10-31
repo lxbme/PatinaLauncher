@@ -47,6 +47,7 @@ instances:
   running: "运行中"
   no_match: "没有匹配的实例"
   list_failed: "无法读取实例列表"
+  refresh_failed: "无法刷新实例列表：%{error}"
   filter:
     all: "全部"
     running: "运行中"

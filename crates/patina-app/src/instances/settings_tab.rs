@@ -47,7 +47,7 @@ use rust_i18n::t;
 use super::icon::IconChoice;
 use super::icon_picker::{IconPicked, IconPicker};
 use super::model::{Entry, InstancesChanged, InstancesModel};
-use super::{icon_for, instance_icon, overview};
+use super::{icon_for, instance_icon, observe_activity, overview};
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY, scroll_y};
@@ -288,6 +288,12 @@ impl SettingsForm {
                 this.stale = true;
                 cx.notify();
             }),
+            // Busy or not, and why: only what is enabled changes.
+            {
+                let id = id.clone();
+                let activity = model.read(cx).activity().clone();
+                observe_activity(&activity, cx, move |a| a.busy_reason(&id))
+            },
             cx.observe(&java_list, |this, _, cx| {
                 this.stale = true;
                 cx.notify();
@@ -374,7 +380,7 @@ impl SettingsForm {
 
     /// Why renaming and deleting are disabled now, or `None`.
     fn busy_reason(&self, cx: &App) -> Option<String> {
-        self.model.read(cx).busy_reason(&self.id)
+        self.model.read(cx).busy_reason(&self.id, cx)
     }
 
     // --- following the saved config ----------------------------------------
@@ -681,7 +687,9 @@ impl SettingsForm {
         .detach();
     }
 
-    /// Changes the saved config with `change`, read fresh from disk.
+    /// Changes the saved config with `change`, read fresh from disk under
+    /// the config lock (`InstanceStore::update`), so a loader operation's
+    /// commit in between is not overwritten.
     fn update_config(
         &mut self,
         field: Field,
@@ -690,9 +698,7 @@ impl SettingsForm {
         change: impl FnOnce(&mut InstanceConfig) + Send + 'static,
     ) {
         self.save(field, window, cx, move |store, id| {
-            let mut instance = store.load(id)?;
-            change(&mut instance.config);
-            store.save(&instance)
+            store.update(id, change).map(drop)
         });
     }
 
@@ -1048,16 +1054,9 @@ impl SettingsForm {
             .read(cx)
             .display_name(&self.id)
             .unwrap_or_else(|| self.id.clone());
-        let store = Core::global(cx).store.clone();
-        let id = self.id.clone();
-        let job = run_blocking(cx, move || store.delete(&id));
+        let job = model.update(cx, |m, cx| m.delete(&self.id, cx));
         cx.spawn_in(window, async move |this, cx| {
-            let result = match job.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            match result {
+            match job.await {
                 Ok(()) => {
                     let wait = cx.update(|_, cx| {
                         model.update(cx, |model, cx| {

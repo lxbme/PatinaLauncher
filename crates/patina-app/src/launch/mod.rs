@@ -18,6 +18,9 @@ pub use log_view::{
     LOG_VIEW_MAX_BYTES, LOG_VIEW_MAX_LINES, LevelFilter, LogBottom, LogBuffer, LogPageDown,
     LogPageUp, LogTop, LogView, forward_logs, visible_rows,
 };
-pub use op_runner::{OpError, OpFix, OpKind, OpState, RetryAction, busy_message};
+pub use op_runner::{
+    OpError, OpFix, OpKind, OpState, RetryAction, busy_message, instance_error_message,
+    instance_error_reason,
+};
 pub use progress::{ProgressTracker, ProgressView, view_of};
 pub use session::{AccountIssue, LaunchEvent, RunState};
