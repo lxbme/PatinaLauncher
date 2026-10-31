@@ -573,6 +573,7 @@ impl Launcher {
             logging_config: logging_config.as_deref(),
             env: &env,
             instance_marker: Some(inst.id.clone()),
+            window: inst.config.window,
         });
         Ok(Prepared { command, warnings })
     }

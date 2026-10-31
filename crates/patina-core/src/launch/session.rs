@@ -233,6 +233,59 @@ fn version_id(inst: &Instance) -> &str {
         .unwrap_or_else(|| inst.config.mc_version())
 }
 
+/// A game that is prepared but not yet started. Holds the instance lock and
+/// a shared lock on the version; dropping it cancels the launch, releases
+/// both and spawns nothing.
+pub struct PendingLaunch {
+    inst: Instance,
+    cmd: LaunchCommand,
+    warnings: Vec<PrepareWarning>,
+    instance_lock: InstanceGuard,
+    version_lock: VersionShared,
+}
+
+impl std::fmt::Debug for PendingLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLaunch")
+            .field("instance", &self.inst.id)
+            .field("cmd", &self.cmd)
+            .field("warnings", &self.warnings)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingLaunch {
+    /// Findings from preparing the game, available before it starts.
+    pub fn warnings(&self) -> &[PrepareWarning] {
+        &self.warnings
+    }
+
+    /// Starts the game. Must be called within a Tokio runtime (it spawns the
+    /// tailer).
+    pub async fn launch(self, progress: ProgressSink) -> Result<GameSession, SessionError> {
+        let session = self.spawn_now()?;
+        report(&progress, Phase::Launching, 1, 1, Unit::Items);
+        Ok(session)
+    }
+
+    fn spawn_now(self) -> Result<GameSession, SessionError> {
+        // Someone else may have started the game while the caller waited.
+        refuse_if_running(&self.inst)?;
+        let PendingLaunch {
+            inst,
+            cmd,
+            warnings,
+            instance_lock,
+            version_lock,
+        } = self;
+        let mut session = GameSession::spawn(&inst, cmd, instance_lock, version_lock)?;
+        session
+            .warnings
+            .splice(0..0, warnings.into_iter().map(SessionWarning::Prepare));
+        Ok(session)
+    }
+}
+
 impl GameSession {
     /// Prepares and starts the game for `inst`. Holds the instance lock and a
     /// shared lock on its version for as long as the session lives; both are
@@ -244,19 +297,70 @@ impl GameSession {
         account: &LaunchAccount,
         progress: ProgressSink,
     ) -> Result<GameSession, SessionError> {
+        Self::prepare_launch(launcher, inst, global, account, progress.clone())
+            .await?
+            .launch(progress)
+            .await
+    }
+
+    /// Takes the locks, refuses a running instance, then prepares the game
+    /// without starting it. Drop the result to cancel.
+    pub async fn prepare_launch(
+        launcher: &Launcher,
+        inst: &Instance,
+        global: &GlobalConfig,
+        account: &LaunchAccount,
+        progress: ProgressSink,
+    ) -> Result<PendingLaunch, SessionError> {
         let instance_lock = lock_instance(inst)?;
         let version_lock = launcher.data.lock_version_shared(version_id(inst))?;
         refuse_if_running(inst)?;
-        let prepared = launcher
-            .prepare(inst, global, account, progress.clone())
-            .await?;
-        let mut session = Self::spawn(inst, prepared.command, instance_lock, version_lock)?;
-        session.warnings.splice(
-            0..0,
-            prepared.warnings.into_iter().map(SessionWarning::Prepare),
-        );
-        report(&progress, Phase::Launching, 1, 1, Unit::Items);
-        Ok(session)
+        let prepared = launcher.prepare(inst, global, account, progress).await?;
+        Ok(PendingLaunch {
+            inst: inst.clone(),
+            cmd: prepared.command,
+            warnings: prepared.warnings,
+            instance_lock,
+            version_lock,
+        })
+    }
+
+    /// Like `prepare_launch` but with a ready-made command (no prepare). The
+    /// data dir is derived from the `<data>/instances/<id>` layout.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prepare_launch_with_command(
+        inst: &Instance,
+        cmd: LaunchCommand,
+        warnings: Vec<PrepareWarning>,
+    ) -> Result<PendingLaunch, SessionError> {
+        let root = inst
+            .dir
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| SessionError::Io {
+                path: inst.dir.clone(),
+                error: "instance directory is not inside <data>/instances".to_string(),
+            })?;
+        Self::pending_with_command(inst, &DataDirs::new(root.to_path_buf()), cmd, warnings)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn pending_with_command(
+        inst: &Instance,
+        data: &DataDirs,
+        cmd: LaunchCommand,
+        warnings: Vec<PrepareWarning>,
+    ) -> Result<PendingLaunch, SessionError> {
+        let instance_lock = lock_instance(inst)?;
+        let version_lock = data.lock_version_shared(version_id(inst))?;
+        refuse_if_running(inst)?;
+        Ok(PendingLaunch {
+            inst: inst.clone(),
+            cmd,
+            warnings,
+            instance_lock,
+            version_lock,
+        })
     }
 
     /// Test entry: like `start` but with a ready-made command (no prepare).
@@ -267,10 +371,7 @@ impl GameSession {
         data: &DataDirs,
         cmd: &LaunchCommand,
     ) -> Result<GameSession, SessionError> {
-        let instance_lock = lock_instance(inst)?;
-        let version_lock = data.lock_version_shared(version_id(inst))?;
-        refuse_if_running(inst)?;
-        Self::spawn(inst, cmd.clone(), instance_lock, version_lock)
+        Self::pending_with_command(inst, data, cmd.clone(), Vec::new())?.spawn_now()
     }
 
     fn spawn(
@@ -739,6 +840,97 @@ mod tests {
             assert!(Instant::now() < end, "timed out: {what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[test]
+    fn pending_launch_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PendingLaunch>();
+    }
+
+    #[tokio::test]
+    async fn pending_launch_holds_locks_until_dropped() {
+        let e = env("i1");
+        let store = InstanceStore::new(e.data.instances());
+        let pending = GameSession::prepare_launch_with_command(
+            &e.inst,
+            sh("i1", "exec sleep 60"),
+            Vec::new(),
+        )
+        .unwrap();
+        let busy = store.lock("i1").unwrap_err();
+        assert!(matches!(busy.what, BusyKind::Instance(_)));
+        drop(pending);
+        drop(store.lock("i1").expect("released after drop"));
+        // Nothing was spawned: no running record and no log file.
+        assert!(read_record(&e.inst).is_none());
+        assert!(!e.inst.dir.join(CURRENT_LOG).exists());
+    }
+
+    #[tokio::test]
+    async fn pending_launch_exposes_warnings_before_spawn() {
+        let e = env("i1");
+        let low = PrepareWarning::LowMemory {
+            requested_mib: 8192,
+            available_mib: 1024,
+        };
+        let pending = GameSession::prepare_launch_with_command(
+            &e.inst,
+            sh("i1", "exit 0"),
+            vec![low.clone()],
+        )
+        .unwrap();
+        assert_eq!(pending.warnings(), std::slice::from_ref(&low));
+        assert!(read_record(&e.inst).is_none());
+        let s = pending.launch(None).await.unwrap();
+        assert!(matches!(s.warnings().first(), Some(SessionWarning::Prepare(w)) if *w == low));
+        let _ = s.wait().await;
+    }
+
+    #[tokio::test]
+    async fn pending_launch_refuses_a_running_instance() {
+        let e = env("i1");
+        let s =
+            GameSession::start_with_command(&e.inst, &e.data, &sh("i1", "exec sleep 60")).unwrap();
+        let _k = Killer(s.killer());
+        drop(s);
+        assert!(matches!(
+            GameSession::prepare_launch_with_command(&e.inst, sh("i1", "exit 0"), Vec::new()),
+            Err(SessionError::AlreadyRunning(_) | SessionError::Busy(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn launch_rechecks_for_a_game_started_meanwhile() {
+        let e = env("i1");
+        let pending =
+            GameSession::prepare_launch_with_command(&e.inst, sh("i1", "exit 0"), Vec::new())
+                .unwrap();
+        // A game of this instance appears after prepare (a process this test spawns).
+        // The shell blocks on stdin and keeps the marker in its argv.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read x", "x", "-Dpatina.instance=i1"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start_time = platform::proc_info(pid).unwrap().start_time;
+        write_record(
+            &e.inst,
+            &RunningRecord {
+                pid,
+                start_time,
+                instance_id: "i1".into(),
+                started_at: 0,
+                log: CURRENT_LOG.into(),
+            },
+        )
+        .unwrap();
+        let r = pending.launch(None).await;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(matches!(r, Err(SessionError::AlreadyRunning(_))));
+        assert!(!e.inst.dir.join(CURRENT_LOG).exists());
     }
 
     #[test]

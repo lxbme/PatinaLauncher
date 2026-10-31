@@ -11,4 +11,6 @@ pub mod log;
 pub mod running;
 pub mod session;
 pub use log::{Log4jXmlParser, LogLevel, LogLine, Stream};
-pub use session::{GameSession, KillHandle, SessionError, SessionExit, SessionWarning};
+pub use session::{
+    GameSession, KillHandle, PendingLaunch, SessionError, SessionExit, SessionWarning,
+};

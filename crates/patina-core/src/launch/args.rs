@@ -32,6 +32,8 @@ pub struct LaunchSpec<'a> {
     /// Instance id; adds `-Dpatina.instance=<id>` so a running game can be
     /// recognised later by its command line.
     pub instance_marker: Option<String>,
+    /// Appends `--width <w> --height <h>` after the version's game arguments.
+    pub window: Option<crate::instance::WindowSize>,
 }
 
 #[derive(Clone)]
@@ -155,6 +157,21 @@ fn expand(list: &[ArgValue], env: &RuleEnv) -> Vec<String> {
     out
 }
 
+/// Removes `--width X` / `--height Y` (and `--width=X` forms) from `args[from..]`.
+fn strip_size_options(args: &mut Vec<String>, from: usize) {
+    let tail = args.split_off(from);
+    let mut it = tail.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--width" | "--height" => {
+                it.next();
+            }
+            _ if a.starts_with("--width=") || a.starts_with("--height=") => {}
+            _ => args.push(a),
+        }
+    }
+}
+
 pub fn build_command(spec: &LaunchSpec) -> LaunchCommand {
     let vars = variables(spec);
     let v = spec.version;
@@ -197,11 +214,22 @@ pub fn build_command(spec: &LaunchSpec) -> LaunchCommand {
         args.push(format!("{INSTANCE_MARKER_PROP}={id}"));
     }
     args.push(v.main_class.clone());
+    let game_start = args.len();
 
     match (&v.arguments, &v.minecraft_arguments) {
         (Some(a), _) => args.extend(expand(&a.game, spec.env).iter().map(|t| sub(t))),
         (None, Some(m)) => args.extend(m.split_ascii_whitespace().map(sub)),
         (None, None) => {}
+    }
+    if let Some(w) = spec.window {
+        // The game rejects a duplicated option, so drop the version's own.
+        strip_size_options(&mut args, game_start);
+        args.extend([
+            "--width".to_string(),
+            w.width.to_string(),
+            "--height".to_string(),
+            w.height.to_string(),
+        ]);
     }
 
     LaunchCommand {
@@ -255,6 +283,17 @@ mod tests {
         logging: Option<&Path>,
         layout: &AssetLayout,
     ) -> LaunchCommand {
+        build_window(json, root, cp, logging, layout, None)
+    }
+
+    fn build_window(
+        json: &str,
+        root: &str,
+        cp: &[&str],
+        logging: Option<&Path>,
+        layout: &AssetLayout,
+        window: Option<crate::instance::WindowSize>,
+    ) -> LaunchCommand {
         let version: VersionJson = serde_json::from_str(json).unwrap();
         let data = DataDirs::new(root);
         let classpath: Vec<PathBuf> = cp.iter().map(PathBuf::from).collect();
@@ -276,12 +315,62 @@ mod tests {
             logging_config: logging,
             env: &e,
             instance_marker: Some("inst-1".into()),
+            window,
         })
     }
 
     fn after<'a>(c: &'a LaunchCommand, flag: &str) -> &'a str {
         let i = c.args.iter().position(|a| a == flag).unwrap();
         &c.args[i + 1]
+    }
+
+    #[test]
+    fn window_args_appended() {
+        let w = crate::instance::WindowSize {
+            width: 1280,
+            height: 720,
+        };
+        let tail = ["--width", "1280", "--height", "720"];
+        for (json, layout) in [(MODERN, AssetLayout::Modern), (LEGACY, AssetLayout::Modern)] {
+            let c = build_window(json, "/d", &["/d/a.jar"], None, &layout, Some(w));
+            assert_eq!(&c.args[c.args.len() - 4..], &tail, "{json:.40}");
+            let plain = build(json, "/d", &["/d/a.jar"], None, &layout);
+            assert_eq!(&c.args[..c.args.len() - 4], &plain.args[..]);
+            assert!(!plain.args.iter().any(|a| a == "--width"));
+        }
+    }
+
+    #[test]
+    fn window_args_replace_existing_size_options() {
+        let w = crate::instance::WindowSize {
+            width: 1280,
+            height: 720,
+        };
+        let json = LEGACY.replace(
+            "--userType ${user_type}",
+            "--width 854 --userType ${user_type} --height=480 --height 480",
+        );
+        assert_ne!(json, LEGACY);
+        let c = build_window(
+            &json,
+            "/d",
+            &["/d/a.jar"],
+            None,
+            &AssetLayout::Modern,
+            Some(w),
+        );
+        assert_eq!(c.args.iter().filter(|a| *a == "--width").count(), 1);
+        assert_eq!(c.args.iter().filter(|a| *a == "--height").count(), 1);
+        assert!(
+            !c.args
+                .iter()
+                .any(|a| a == "854" || a.starts_with("--height="))
+        );
+        assert_eq!(
+            &c.args[c.args.len() - 4..],
+            &["--width", "1280", "--height", "720"]
+        );
+        assert_eq!(after(&c, "--userType"), "legacy");
     }
 
     #[test]

@@ -115,6 +115,24 @@ impl Component {
     }
 }
 
+/// Game window size in pixels, passed as `--width` / `--height`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl WindowSize {
+    pub const MIN_WIDTH: u32 = 320;
+    pub const MIN_HEIGHT: u32 = 240;
+    pub const MAX: u32 = 16384;
+
+    fn is_valid(&self) -> bool {
+        (Self::MIN_WIDTH..=Self::MAX).contains(&self.width)
+            && (Self::MIN_HEIGHT..=Self::MAX).contains(&self.height)
+    }
+}
+
 /// On-disk shape; `mc_version` is only read, for plan-1 files.
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -127,6 +145,7 @@ struct RawConfig {
     last_played: Option<u64>,
     /// Cosmetic: an unparseable value is dropped on load, not an error.
     icon: Option<String>,
+    window: Option<WindowSize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -141,6 +160,8 @@ pub struct InstanceConfig {
     /// Unix seconds.
     pub last_played: Option<u64>,
     pub icon: Option<InstanceIcon>,
+    /// `None` leaves the window size to the game.
+    pub window: Option<WindowSize>,
 }
 
 impl InstanceConfig {
@@ -162,6 +183,7 @@ impl InstanceConfig {
                 }
                 icon
             }),
+            window: raw.window,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -173,6 +195,17 @@ impl InstanceConfig {
             && !is_safe_name(n)
         {
             return bad(rust_i18n::t!("errors.instance.config_reason.bad_icon_name").to_string());
+        }
+        if let Some(w) = &self.window
+            && !w.is_valid()
+        {
+            return bad(rust_i18n::t!(
+                "errors.instance.config_reason.bad_window_size",
+                min_width = WindowSize::MIN_WIDTH,
+                min_height = WindowSize::MIN_HEIGHT,
+                max = WindowSize::MAX
+            )
+            .to_string());
         }
         match self.components.first() {
             Some(c) if c.uid == ComponentUid::Minecraft => {
@@ -451,6 +484,7 @@ impl InstanceStore {
                 created_at: now_secs(),
                 last_played: None,
                 icon: None,
+                window: None,
             },
         };
         std::fs::create_dir_all(inst.game_dir())?;
@@ -648,6 +682,42 @@ mod tests {
     fn write_raw(tmp: &std::path::Path, id: &str, body: &str) {
         std::fs::create_dir_all(tmp.join(id)).unwrap();
         std::fs::write(tmp.join(id).join("instance.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn window_size_round_trips_and_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let mut inst = store.create("W", "1.20.1").unwrap();
+        assert_eq!(store.load(&inst.id).unwrap().config.window, None);
+        let ok = WindowSize {
+            width: 1280,
+            height: 720,
+        };
+        inst.config.window = Some(ok);
+        store.save(&inst).unwrap();
+        assert_eq!(store.load(&inst.id).unwrap().config.window, Some(ok));
+        for (width, height) in [(0, 0), (20000, 100), (319, 240), (320, 239), (320, 16385)] {
+            inst.config.window = Some(WindowSize { width, height });
+            assert!(
+                matches!(store.save(&inst), Err(InstanceError::InvalidConfig(_))),
+                "{width}x{height}"
+            );
+        }
+        inst.config.window = Some(WindowSize {
+            width: 16384,
+            height: 240,
+        });
+        store.save(&inst).unwrap();
+        write_raw(
+            tmp.path(),
+            "raw",
+            "name = \"R\"\nmc_version = \"1.20.1\"\n[window]\nwidth = 0\nheight = 0\n",
+        );
+        assert!(matches!(
+            store.load("raw"),
+            Err(InstanceError::InvalidConfig(_))
+        ));
     }
 
     #[test]

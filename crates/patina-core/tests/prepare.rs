@@ -677,3 +677,52 @@ async fn missing_profile_requires_reinstall() {
         .unwrap_err();
     assert!(matches!(err, PrepareError::LoaderNeedsReinstall { .. }));
 }
+
+mod real_prepare_launch {
+    use super::*;
+    use patina_core::launch::GameSession;
+    use patina_core::prepare::PrepareWarning;
+
+    #[tokio::test]
+    async fn prepare_launch_carries_prepare_warnings_and_holds_locks() {
+        let fake = fake_mojang(8).await;
+        let mut s = setup();
+        // Far more than any machine has free, so prepare must warn.
+        s.global.java.max_mem_mib = Some(4_000_000);
+        s.global.java.low_mem_warning = true;
+        let l = launcher(&fake.server, &s.data);
+        let store = InstanceStore::new(l.data.instances());
+        let inst = store.create("w", "26.3").unwrap();
+        let pending = GameSession::prepare_launch(&l, &inst, &s.global, &account(), None)
+            .await
+            .unwrap();
+        assert!(
+            pending
+                .warnings()
+                .iter()
+                .any(|w| matches!(w, PrepareWarning::LowMemory { .. })),
+            "{:?}",
+            pending.warnings()
+        );
+        assert!(store.lock(&inst.id).is_err());
+        drop(pending);
+        assert!(store.lock(&inst.id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_prepare_launch_releases_locks() {
+        let fake = fake_mojang(21).await; // fake java is 8: too old
+        let s = setup();
+        let l = launcher(&fake.server, &s.data);
+        let store = InstanceStore::new(l.data.instances());
+        let inst = store.create("f", "26.3").unwrap();
+        let r = GameSession::prepare_launch(&l, &inst, &s.global, &account(), None).await;
+        assert!(matches!(
+            r,
+            Err(patina_core::launch::SessionError::Prepare(
+                PrepareError::JavaTooOld { .. }
+            ))
+        ));
+        assert!(store.lock(&inst.id).is_ok());
+    }
+}

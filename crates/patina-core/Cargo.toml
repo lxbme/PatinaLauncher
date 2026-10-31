@@ -9,6 +9,8 @@ workspace = true
 
 [features]
 dev-offline = []
+# Exposes launch entry points that skip prepare, for other crates' tests.
+test-support = []
 
 [dependencies]
 dirs = "7.0.0"
