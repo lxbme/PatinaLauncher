@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub mod error;
 mod http;
 pub mod login;
+mod msa;
 mod secret;
 
 pub use http::{DEFAULT_MSA_CLIENT_ID, msa_client_id};
@@ -21,10 +22,13 @@ pub use http::{DEFAULT_MSA_CLIENT_ID, msa_client_id};
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
     pub use super::http::AuthHttp;
+    pub use super::msa::{AuthClock, MsaClient};
 }
 
 #[cfg(test)]
 mod http_tests;
+#[cfg(test)]
+mod msa_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

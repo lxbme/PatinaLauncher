@@ -5395,6 +5395,7 @@ dependencies = [
 name = "patina-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs 7.0.0",
  "fastnbt",
  "flate2",

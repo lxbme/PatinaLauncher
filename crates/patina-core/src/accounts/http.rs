@@ -46,14 +46,12 @@ pub(crate) const MSA_SCOPE: &str = "XboxLive.signin offline_access";
 const MAX_BODY: usize = 1024 * 1024;
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "Closed requests are consumed by Task 2 MsaClient")]
 pub(crate) enum MicrosoftGrant {
     DeviceCode(SecretString),
     Refresh(SecretString),
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "Closed requests are consumed by Task 2 MsaClient")]
 pub(crate) enum AuthRequest {
     DeviceCode,
     MicrosoftToken(MicrosoftGrant),
@@ -90,14 +88,12 @@ impl AuthRequest {
 }
 
 // Deliberately no Debug: bounded response bytes may still contain credentials.
-#[allow(dead_code, reason = "Response parsing belongs to Task 2 MsaClient")]
 pub(crate) struct AuthResponse {
     status: u16,
     body: Zeroizing<Vec<u8>>,
     retry_after: Option<Duration>,
 }
 
-#[allow(dead_code, reason = "Response parsing belongs to Task 2 MsaClient")]
 impl AuthResponse {
     pub(crate) fn status(&self) -> u16 {
         self.status
@@ -118,10 +114,6 @@ pub struct AuthHttp {
 }
 
 impl AuthHttp {
-    #[allow(
-        dead_code,
-        reason = "Production construction is wired into Task 2 MsaClient"
-    )]
     pub(crate) fn production() -> Result<Self, AuthError> {
         if msa_client_id().trim().is_empty() {
             return Err(AuthError::InvalidResponse {
@@ -233,7 +225,6 @@ impl AuthHttp {
             .map_err(|_| AuthError::InvalidResponse { stage })
     }
 
-    #[allow(dead_code, reason = "Requests are sent by Task 2 MsaClient")]
     pub(crate) fn send(
         &self,
         request: AuthRequest,
@@ -248,7 +239,15 @@ impl AuthHttp {
                 _ = cancelled(&mut cancel) => Err(AuthError::Cancelled),
                 result = async {
                     let stage = request.stage();
-                    let network = |_| AuthError::Network { stage };
+                    // Preserve the one retry-relevant fact before dropping reqwest's
+                    // error (which can contain secret-bearing request details).
+                    let network = |error: reqwest::Error| {
+                        if error.is_timeout() {
+                            AuthError::Timeout { stage }
+                        } else {
+                            AuthError::Network { stage }
+                        }
+                    };
                     let mut response = http.client.execute(http.build_request(request)?).await.map_err(network)?;
                     let status = response.status().as_u16();
                     // Keep only the numeric protocol hint, never arbitrary header text.

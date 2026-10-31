@@ -202,6 +202,7 @@ async fn auth_requests_use_only_the_stage_contract() {
         assert_eq!(request.headers["content-type"], "application/json");
     }
     for (i, request) in received.iter().enumerate() {
+        assert_eq!(request.method.as_str(), if i < 6 { "POST" } else { "GET" });
         assert_eq!(
             request.url.path(),
             ["/0", "/1", "/1", "/2", "/3", "/4", "/5", "/6"][i]
@@ -466,7 +467,7 @@ async fn auth_request_timeout_covers_headers_and_streamed_body() {
         task.abort();
         assert!(matches!(
             result,
-            Ok(Err(AuthError::Network {
+            Ok(Err(AuthError::Timeout {
                 stage: AuthStage::DeviceCode
             }))
         ));

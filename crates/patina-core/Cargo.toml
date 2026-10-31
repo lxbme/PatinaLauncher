@@ -13,6 +13,7 @@ dev-offline = []
 test-support = []
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 dirs = "7.0.0"
 flate2 = "1.1"
 futures = "0.3.34"
@@ -39,6 +40,7 @@ zeroize = "1.9.1"
 zip = "9.1.3"
 
 [dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 fastnbt = "2.6.3"
 serde-saphyr = "2.0.0"
 tempfile = "3.27.0"

@@ -43,9 +43,20 @@ pub enum AuthError {
     Cancelled,
     Expired,
     Denied,
-    Network { stage: AuthStage },
-    Http { stage: AuthStage, status: u16 },
-    InvalidResponse { stage: AuthStage },
+    Network {
+        stage: AuthStage,
+    },
+    /// Sanitized transport timeout; polling alone applies bounded backoff.
+    Timeout {
+        stage: AuthStage,
+    },
+    Http {
+        stage: AuthStage,
+        status: u16,
+    },
+    InvalidResponse {
+        stage: AuthStage,
+    },
     XboxRestriction(XboxRestriction),
     NoEntitlement,
     ProfileMissing,
@@ -84,7 +95,7 @@ impl fmt::Display for AuthError {
             Self::OfflineConflict => rust_i18n::t!("errors.auth.offline_conflict"),
             Self::Busy => rust_i18n::t!("errors.auth.busy"),
             Self::SessionExpired => rust_i18n::t!("errors.auth.session_expired"),
-            Self::Network { stage } => {
+            Self::Network { stage } | Self::Timeout { stage } => {
                 rust_i18n::t!("errors.auth.network", stage = stage.display_name())
             }
             Self::Http { stage, status } => rust_i18n::t!(

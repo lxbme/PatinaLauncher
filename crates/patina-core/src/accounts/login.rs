@@ -1,6 +1,6 @@
-//! Microsoft device-code login interface. The real flow arrives with plan 3;
-//! until then [`UnavailableLogin`] reports that sign-in is not available.
-//! Persisting a finished login into the `AccountStore` is plan 3's job.
+//! Microsoft device-code login events and service interface. The private protocol
+//! returns verified results; [`UnavailableLogin`] remains the production adapter
+//! until AccountService owns persistence and terminal events.
 
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -177,6 +177,9 @@ mod tests {
             AuthError::Denied,
             AuthError::Network {
                 stage: AuthStage::DeviceCode,
+            },
+            AuthError::Timeout {
+                stage: AuthStage::MicrosoftToken,
             },
             AuthError::Http {
                 stage: AuthStage::MicrosoftToken,
