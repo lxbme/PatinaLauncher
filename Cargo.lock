@@ -5376,6 +5376,7 @@ dependencies = [
  "gpui-kit",
  "patina-app",
  "patina-core",
+ "reqwest",
  "rust-i18n",
  "serde",
  "serde-saphyr 2.0.0",

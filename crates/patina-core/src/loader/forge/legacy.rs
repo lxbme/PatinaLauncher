@@ -77,12 +77,16 @@ pub async fn install_legacy(
     download_libraries(dl, jobs, progress, legacy_jobs.len() as u64).await?;
     let tools = Unpack200::new(dl, data.runtimes());
     let mut done = plain_total;
-    let mut legacy = futures::stream::iter(&legacy_jobs)
+    // The futures are built first: a stream that maps borrowed jobs through
+    // a closure makes this future fail `Send` (rust-lang/rust#64552), and
+    // the app runs loader operations on a multi-threaded runtime.
+    let pending: Vec<_> = (legacy_jobs.iter())
         .map(|job| {
             let (name, checksums) = &checksummed[&job.dest];
             ensure_legacy_library(&tools, job, name, checksums)
         })
-        .buffer_unordered(LEGACY_CONCURRENCY);
+        .collect();
+    let mut legacy = futures::stream::iter(pending).buffer_unordered(LEGACY_CONCURRENCY);
     while legacy.try_next().await?.is_some() {
         done += 1;
         report(

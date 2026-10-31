@@ -7,6 +7,7 @@
 //! side is the empty state; a broken entry shows its error and lets the
 //! user open or delete its folder.
 
+mod add_dialog;
 mod broken;
 mod detail;
 mod empty;
@@ -15,6 +16,7 @@ mod icon_picker;
 mod list;
 mod model;
 mod overview;
+mod version_picker;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,6 +33,10 @@ use crate::fonts::Strong;
 use crate::layout::TEXT_PRIMARY;
 use crate::theme::ProductColors;
 
+pub use add_dialog::{
+    AddInstanceForm, FormChanged, NewInstance, create_instance, default_name,
+    open as open_add_instance_dialog,
+};
 pub use detail::{DetailTab, DetailView};
 pub use icon::{
     BUILTIN_ICONS, IconChoice, IconSource, asset_bytes, forget_cached_image, icon_for,
@@ -40,12 +46,17 @@ pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
 pub use model::{Entry, InstancesChanged, InstancesModel, RunState};
 pub use overview::OverviewStats;
+pub use version_picker::{
+    ChooseNext, ChoosePrev, KindFilter, LOADER_KINDS, LoaderChanged, LoaderPicker, VersionChosen,
+    VersionPicker, default_loader_version, loader_row_id, loader_segment_id, version_row_id,
+    visible_versions,
+};
 
 actions!(
     patina,
     [
-        /// Opens the add-instance dialog (plan 4b task 9). Dispatched by the
-        /// list's ＋ and the empty state's button.
+        /// Opens the add-instance dialog. Dispatched by the list's ＋ and the
+        /// empty state's button.
         AddInstance
     ]
 );
@@ -64,6 +75,7 @@ pub(crate) const HEADER_TITLE: Rems = Rems(1.375);
 pub fn init(cx: &mut gpui_kit::App) {
     list::init(cx);
     icon_picker::init(cx);
+    version_picker::init(cx);
 }
 
 /// Element id of the list row of entry `id` (healthy or broken).
@@ -108,10 +120,9 @@ impl InstancesPage {
         &self.detail
     }
 
-    /// Stub until the add-instance dialog exists (plan 4b task 9): nothing
-    /// opens yet, so the action goes on to app-level listeners.
-    fn add_instance(&mut self, _: &AddInstance, _: &mut Window, cx: &mut Context<Self>) {
-        cx.propagate();
+    /// Opens the add-instance dialog.
+    fn add_instance(&mut self, _: &AddInstance, window: &mut Window, cx: &mut Context<Self>) {
+        add_dialog::open(self.model.clone(), window, cx);
     }
 
     fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {

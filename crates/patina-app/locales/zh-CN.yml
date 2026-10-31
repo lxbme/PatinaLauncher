@@ -91,6 +91,36 @@ instances:
     delete_confirm: "删除"
     cancel: "取消"
     delete_failed: '无法删除"%{id}"：%{error}'
+add_instance:
+  title: "添加实例"
+  name: "名称"
+  icon: "图标"
+  game_version: "游戏版本"
+  release: "正式版"
+  snapshot: "快照"
+  search: "搜索版本"
+  kind:
+    snapshot: "快照"
+    old_beta: "远古 Beta"
+    old_alpha: "远古 Alpha"
+  latest: "最新"
+  recommended: "推荐"
+  loading: "正在加载版本列表"
+  load_failed: "无法加载版本列表：%{error}"
+  no_match: "没有匹配的版本"
+  retry: "重试"
+  loader: "加载器"
+  loader_none: "无"
+  loader_version: "加载器版本"
+  loader_unsupported: "灰色的加载器不支持 Minecraft %{mc}"
+  loader_loading: "正在加载 %{loader} 版本列表"
+  loader_failed: "无法加载 %{loader} 版本列表：%{error}"
+  create: "创建"
+  cancel: "取消"
+  create_failed: '无法创建"%{name}"：%{error}'
+  icon_failed: '"%{name}"已创建，但图标未能保存：%{error}'
+  refresh_failed: '已创建"%{name}"，但无法读取实例列表：%{error}'
+  refresh_failed_loader: '已创建"%{name}"，但未安装加载器：无法读取实例列表：%{error}'
 busy:
   instance: '"%{name}"正在执行其他操作'
   version: "版本 %{id} 正被其他操作使用"

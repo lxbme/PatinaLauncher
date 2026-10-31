@@ -12,9 +12,9 @@ use patina_app::core_bridge::testing::{self, FakeCatalog};
 use patina_app::core_bridge::{AccountsChanged, Core, LoadError};
 use patina_app::i18n::Language;
 use patina_app::instances::{
-    AddInstance, Filter, IconChoice, IconPicked, IconPicker, IconSource, InstanceList,
-    InstancesChanged, InstancesModel, RunState, forget_cached_image, icon_for, instance_icon,
-    pick_id, row_id, save_icon,
+    Filter, IconChoice, IconPicked, IconPicker, IconSource, InstanceList, InstancesChanged,
+    InstancesModel, RunState, forget_cached_image, icon_for, instance_icon, pick_id, row_id,
+    save_icon,
 };
 use patina_app::launch::{OpError, OpKind, OpState};
 use patina_app::settings::{self, AppSettings, SettingsStore};
@@ -51,14 +51,20 @@ static LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Boots the app as `main` does, with its data dir and settings in `dir`
 /// and an offline core, and opens the main window.
 fn boot(cx: &mut TestAppContext, dir: &Path, start: AppSettings) -> Booted {
+    boot_with(cx, dir, start, Arc::new(FakeCatalog::new()))
+}
+
+/// [`boot`] with the version lists of `catalog`.
+fn boot_with(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    start: AppSettings,
+    catalog: Arc<FakeCatalog>,
+) -> Booted {
     let language = LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
     patina_app::i18n::set_language(Language::En);
     let rt = patina_app::runtime::start();
-    let core = testing::core(
-        rt.handle().clone(),
-        DataDirs::new(dir),
-        Arc::new(FakeCatalog::new()),
-    );
+    let core = testing::core(rt.handle().clone(), DataDirs::new(dir), catalog);
     // Core work finishes on the runtime's threads, not the test's.
     cx.executor().allow_parking();
     cx.update(gpui_kit::init);
@@ -692,30 +698,42 @@ fn external_damage_shows_broken_entry(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn empty_state_and_plus_dispatch_add_instance(cx: &mut TestAppContext) {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
+fn add_instance_action_opens_dialog(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let app = boot(cx, tmp.path(), AppSettings::default());
     let model = instances_model(&app, cx);
     list_settled(&model, cx);
-    // The dialog arrives with plan 4b task 9; until then the action reaches
-    // app-level listeners.
-    let dispatched = Rc::new(Cell::new(0));
-    cx.update(|cx| {
-        let dispatched = dispatched.clone();
-        cx.on_action(move |_: &AddInstance, _| dispatched.set(dispatched.get() + 1));
-    });
+    let title = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            (window.within("dialog"))
+                .try_find("add-instance-title")
+                .and_then(|t| t.label().map(str::to_owned))
+        })
+        .unwrap()
+    };
 
     assert!(shows(&app, cx, "add-instance-empty"));
     assert!(!shows(&app, cx, "instance-detail"));
+    assert!(!shows(&app, cx, "dialog"));
     click(&app, cx, "add-instance-empty");
-    assert_eq!(dispatched.get(), 1, "the empty state's button");
-    click(&app, cx, "instances-add");
-    assert_eq!(dispatched.get(), 2, "the list's ＋");
+    assert_eq!(
+        title(cx).as_deref(),
+        Some("Add instance"),
+        "the empty state's button"
+    );
+    // Escape leaves without creating anything.
+    cx.update_window(app.handle, |_, window, cx| window.press("escape", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!shows(&app, cx, "dialog"));
 
-    // With an instance the detail replaces the empty state.
+    click(&app, cx, "instances-add");
+    assert_eq!(title(cx).as_deref(), Some("Add instance"), "the list's ＋");
+    click(&app, cx, "add-instance-cancel");
+    assert!(!shows(&app, cx, "dialog"));
+
+    // With an instance the detail replaces the empty state; ＋ still opens it.
     InstanceStore::new(DataDirs::new(tmp.path()).instances())
         .create("Alpha", "1.21.1")
         .unwrap();
@@ -723,7 +741,12 @@ fn empty_state_and_plus_dispatch_add_instance(cx: &mut TestAppContext) {
     assert!(!shows(&app, cx, "add-instance-empty"));
     assert!(shows(&app, cx, "instance-detail"));
     click(&app, cx, "instances-add");
-    assert_eq!(dispatched.get(), 3);
+    assert!(title(cx).is_some());
+    assert_eq!(
+        model.read_with(cx, |m, _| m.instances().len()),
+        1,
+        "nothing created by opening and closing"
+    );
 }
 
 #[gpui_kit::test]
@@ -1529,4 +1552,584 @@ fn panicking_op_fails_with_a_message(cx: &mut TestAppContext) {
         panic!("failed");
     };
     assert!(!message.trim().is_empty());
+}
+
+// ---- Add-instance dialog ----
+
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::ElementSnapshot;
+use patina_app::instances::{loader_row_id, loader_segment_id, version_row_id};
+use patina_core::loader::{LoaderKind, LoaderVersion};
+use patina_core::meta::{Latest, ManifestEntry, VersionKind, VersionManifest};
+
+fn manifest_entry(id: &str, kind: VersionKind) -> ManifestEntry {
+    ManifestEntry {
+        id: id.into(),
+        kind,
+        url: String::new(),
+        sha1: String::new(),
+        release_time: String::new(),
+    }
+}
+
+fn loader_version(
+    kind: LoaderKind,
+    mc: &str,
+    version: &str,
+    recommended: bool,
+    latest: bool,
+) -> LoaderVersion {
+    LoaderVersion {
+        kind,
+        mc: mc.into(),
+        version: version.into(),
+        maven_version: version.into(),
+        stable: true,
+        recommended,
+        latest,
+    }
+}
+
+/// Releases 1.21.1 (latest), 1.21 and 1.20.1, two snapshots and an old
+/// beta. Fabric has versions for 1.21.1 (0.16.9 latest, 0.16.5
+/// recommended) and 1.20.1 (0.14.0, then 0.15.0 latest, none recommended);
+/// Forge for 1.20.1 only; NeoForge for none.
+fn catalog() -> Arc<FakeCatalog> {
+    use LoaderKind::{Fabric, Forge};
+    let manifest = VersionManifest {
+        latest: Latest {
+            release: "1.21.1".into(),
+            snapshot: "24w45a".into(),
+        },
+        versions: vec![
+            manifest_entry("24w45a", VersionKind::Snapshot),
+            manifest_entry("1.21.1", VersionKind::Release),
+            manifest_entry("1.21", VersionKind::Release),
+            manifest_entry("24w14a", VersionKind::Snapshot),
+            manifest_entry("1.20.1", VersionKind::Release),
+            manifest_entry("b1.7.3", VersionKind::OldBeta),
+        ],
+    };
+    Arc::new(
+        FakeCatalog::new()
+            .with_manifest(manifest)
+            .with_loader_versions([
+                loader_version(Fabric, "1.21.1", "0.16.9", false, true),
+                loader_version(Fabric, "1.21.1", "0.16.5", true, false),
+                loader_version(Fabric, "1.20.1", "0.14.0", false, false),
+                loader_version(Fabric, "1.20.1", "0.15.0", false, true),
+                loader_version(Forge, "1.20.1", "47.3.0", true, false),
+                loader_version(Forge, "1.20.1", "47.4.0", false, true),
+            ]),
+    )
+}
+
+/// The element `id` of the last frame, if drawn.
+fn element(
+    app: &Booted,
+    cx: &mut TestAppContext,
+    id: impl Into<gpui_kit::ElementId>,
+) -> Option<ElementSnapshot> {
+    let id = id.into();
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id)
+    })
+    .unwrap()
+}
+
+fn name_value(app: &Booted, cx: &mut TestAppContext) -> String {
+    element(app, cx, "add-instance-name")
+        .and_then(|e| e.value().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn wait_name(app: &Booted, cx: &mut TestAppContext, expected: &str) {
+    settle(cx, |cx| name_value(app, cx) == expected);
+}
+
+/// Whether row `id` is marked as the chosen one.
+fn chosen(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> bool {
+    element(app, cx, id).and_then(|e| e.selected()) == Some(true)
+}
+
+/// Whether control `id` is drawn disabled (an enabled one reports no flag).
+fn disabled(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> bool {
+    let control = element(app, cx, id).expect("the control is drawn");
+    control.disabled() == Some(true)
+}
+
+fn press(app: &Booted, cx: &mut TestAppContext, key: &str) {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press(key, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn type_text(app: &Booted, cx: &mut TestAppContext, text: &str) {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.input(text, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// Boots over an empty data dir with [`catalog`] and opens the dialog from
+/// the empty state; returns once the list has loaded and the latest
+/// release is chosen.
+fn open_dialog(cx: &mut TestAppContext, dir: &Path) -> Booted {
+    let app = boot_with(cx, dir, AppSettings::default(), catalog());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "add-instance-empty");
+    assert!(shows(&app, cx, "dialog"));
+    wait_name(&app, cx, "1.21.1");
+    app
+}
+
+#[gpui_kit::test]
+fn default_name_follows_choices_until_edited(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    assert!(
+        chosen(&app, cx, version_row_id("1.21.1")),
+        "the latest release"
+    );
+
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    wait_name(&app, cx, "Fabric 1.21.1");
+    click(&app, cx, version_row_id("1.20.1"));
+    wait_name(&app, cx, "Fabric 1.20.1");
+    click(&app, cx, loader_segment_id(None));
+    wait_name(&app, cx, "1.20.1");
+
+    // Once the user has typed a name, it stays.
+    click(&app, cx, "add-instance-name");
+    press(&app, cx, "ctrl-a");
+    type_text(&app, cx, "My pack");
+    assert_eq!(name_value(&app, cx), "My pack");
+    click(&app, cx, version_row_id("1.21.1"));
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("0.16.5")));
+    assert_eq!(name_value(&app, cx), "My pack");
+}
+
+#[gpui_kit::test]
+fn release_filter_and_search(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    let rows = |cx: &mut TestAppContext| -> Vec<&'static str> {
+        ["24w45a", "1.21.1", "1.21", "24w14a", "1.20.1", "b1.7.3"]
+            .into_iter()
+            .filter(|id| shows(&app, cx, version_row_id(id)))
+            .collect()
+    };
+    assert_eq!(rows(cx), ["1.21.1", "1.21", "1.20.1"], "releases only");
+    let tag = element(&app, cx, version_row_id("1.21.1")).unwrap();
+    assert_eq!(tag.label(), Some("1.21.1"));
+
+    click(&app, cx, "version-filter-snapshot");
+    assert_eq!(
+        rows(cx),
+        ["24w45a", "1.21.1", "1.21", "24w14a", "1.20.1", "b1.7.3"]
+    );
+    click(&app, cx, "version-filter-release");
+    assert_eq!(rows(cx), ["24w45a", "24w14a", "b1.7.3"]);
+
+    click(&app, cx, "version-search");
+    type_text(&app, cx, "24W4");
+    assert_eq!(rows(cx), ["24w45a"], "a case-insensitive substring");
+    // Filtering does not change the choice.
+    assert_eq!(name_value(&app, cx), "1.21.1");
+}
+
+#[gpui_kit::test]
+fn loader_without_versions_is_disabled(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    let fabric = loader_segment_id(Some(LoaderKind::Fabric));
+    let forge = loader_segment_id(Some(LoaderKind::Forge));
+    let neoforge = loader_segment_id(Some(LoaderKind::Neoforge));
+    let hint = |cx: &mut TestAppContext| {
+        element(&app, cx, "loader-unsupported").and_then(|e| e.label().map(str::to_owned))
+    };
+
+    settle(cx, |cx| disabled(&app, cx, forge));
+    assert!(disabled(&app, cx, neoforge));
+    assert!(!disabled(&app, cx, fabric));
+    assert!(!disabled(&app, cx, loader_segment_id(None)));
+    assert_eq!(
+        hint(cx).as_deref(),
+        Some("Greyed-out loaders don’t support Minecraft 1.21.1")
+    );
+    click(&app, cx, forge);
+    assert_eq!(
+        name_value(&app, cx),
+        "1.21.1",
+        "a greyed-out loader is not chosen"
+    );
+    assert!(!shows(&app, cx, "loader-version-list"));
+
+    click(&app, cx, version_row_id("1.20.1"));
+    settle(cx, |cx| !disabled(&app, cx, forge));
+    assert!(disabled(&app, cx, neoforge));
+    assert_eq!(
+        hint(cx).as_deref(),
+        Some("Greyed-out loaders don’t support Minecraft 1.20.1")
+    );
+    click(&app, cx, forge);
+    wait_name(&app, cx, "Forge 1.20.1");
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("47.3.0")));
+
+    // A version no loader supports takes the choice back to "None".
+    click(&app, cx, version_row_id("1.21"));
+    wait_name(&app, cx, "1.21");
+    assert!(disabled(&app, cx, fabric));
+    assert!(disabled(&app, cx, forge));
+    assert!(!shows(&app, cx, "loader-version-list"));
+    assert!(!disabled(&app, cx, "add-instance-create"));
+}
+
+#[gpui_kit::test]
+fn recommended_is_preselected(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("0.16.5")));
+    assert!(shows(&app, cx, loader_row_id("0.16.9")));
+    assert!(!chosen(&app, cx, loader_row_id("0.16.9")), "not the latest");
+    assert!(!disabled(&app, cx, "add-instance-create"));
+
+    // Without a recommended version, the latest.
+    click(&app, cx, version_row_id("1.20.1"));
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("0.15.0")));
+    assert!(!chosen(&app, cx, loader_row_id("0.14.0")));
+
+    // The user's pick, by pointer and by keyboard.
+    click(&app, cx, loader_row_id("0.14.0"));
+    assert!(chosen(&app, cx, loader_row_id("0.14.0")));
+    press(&app, cx, "down");
+    assert!(chosen(&app, cx, loader_row_id("0.15.0")));
+}
+
+#[gpui_kit::test]
+fn create_closes_dialog_and_selects_new_instance(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    let status = cx.update(|cx| app.root.read(cx).status_bar().clone());
+
+    click(&app, cx, "add-instance-create");
+    assert!(!shows(&app, cx, "dialog"), "closes at once");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
+    let created = store.load("1.21.1").unwrap();
+    assert_eq!(created.config.name, "1.21.1");
+    assert_eq!(created.config.mc_version(), "1.21.1");
+    assert!(created.config.loader().is_none());
+    assert_eq!(created.config.icon, None);
+    assert!(shows(&app, cx, "instance-detail"));
+    assert!(
+        model.read_with(cx, |m, _| m.op("1.21.1").is_none()),
+        "nothing to install"
+    );
+    settle(cx, |cx| usage_count(&status, cx) == Some(1));
+
+    // Enter is "Create": the name has the keyboard when the dialog opens.
+    click(&app, cx, "instances-add");
+    wait_name(&app, cx, "1.21.1");
+    press(&app, cx, "enter");
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| {
+        selected(&model, cx).as_deref() == Some("1.21.1 (2)")
+    });
+    assert_eq!(store.load("1.21.1 (2)").unwrap().config.name, "1.21.1");
+}
+
+#[gpui_kit::test]
+fn failed_install_leaves_vanilla_instance_with_retry(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    let id = "Fabric 1.21.1";
+    // Holding the lock the install takes makes it fail at once, before it
+    // would reach the network.
+    let held = store.lock(id).unwrap();
+
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    wait_name(&app, cx, id);
+    settle(cx, |cx| chosen(&app, cx, loader_row_id("0.16.5")));
+    click(&app, cx, "add-instance-create");
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| {
+        matches!(
+            op_of(&model, cx, id),
+            Some(OpState::Failed {
+                kind: OpKind::InstallLoader,
+                ..
+            })
+        )
+    });
+    assert_eq!(selected(&model, cx).as_deref(), Some(id));
+    assert!(
+        store.load(id).unwrap().config.loader().is_none(),
+        "still vanilla"
+    );
+    let error = element(&app, cx, "instance-op-error").and_then(|e| e.label().map(str::to_owned));
+    assert_eq!(
+        error.as_deref(),
+        Some("“Fabric 1.21.1” is busy with another operation")
+    );
+    assert!(shows(&app, cx, "instance-op-retry"));
+
+    // Retry installs again.
+    let state = cx
+        .update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("instance-op-retry", cx);
+            let model = model.read(cx);
+            model.op(id).cloned()
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            state,
+            Some(OpState::Running {
+                kind: OpKind::InstallLoader,
+                ..
+            })
+        ),
+        "{state:?}"
+    );
+    settle(cx, |cx| {
+        matches!(op_of(&model, cx, id), Some(OpState::Failed { .. }))
+    });
+    assert!(store.load(id).unwrap().config.loader().is_none());
+    drop(held);
+}
+
+#[gpui_kit::test]
+fn tab_reaches_icon_grid_and_enter_there_picks_without_creating(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    let grid_focused = |cx: &mut TestAppContext| {
+        element(&app, cx, "icon-grid").and_then(|e| e.focused()) == Some(true)
+    };
+
+    // The name has the keyboard; Tab (bound by the window's root) moves on
+    // through the dialog to the grid.
+    assert_eq!(
+        element(&app, cx, "add-instance-name").and_then(|e| e.focused()),
+        Some(true)
+    );
+    let mut reached = false;
+    for _ in 0..4 {
+        press(&app, cx, "tab");
+        if grid_focused(cx) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab reaches the icon grid");
+
+    // Enter picks the icon under the cursor and does not create.
+    press(&app, cx, "right");
+    press(&app, cx, "enter");
+    assert!(shows(&app, cx, "dialog"));
+    std::thread::sleep(Duration::from_millis(50));
+    cx.run_until_parked();
+    assert!(
+        store.list().unwrap().instances.is_empty(),
+        "nothing created"
+    );
+
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
+    assert_eq!(
+        store.load("1.21.1").unwrap().config.icon,
+        Some(InstanceIcon::Builtin("dirt".into()))
+    );
+}
+
+#[gpui_kit::test]
+fn icon_save_failure_is_reported_and_the_instance_kept(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let junk = tmp.path().join("junk.png");
+    std::fs::write(&junk, b"definitely not a png").unwrap();
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    let notifications = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| window.notifications(cx).len())
+            .unwrap()
+    };
+
+    click(&app, cx, "icon-upload");
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(move |_| Some(vec![junk]));
+    cx.run_until_parked();
+    assert_eq!(notifications(cx), 0);
+
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
+    settle(cx, |cx| notifications(cx) == 1);
+    let created = store.load("1.21.1").unwrap();
+    assert_eq!(created.config.icon, None, "the letter tile, as before");
+    assert!(created.icon_path().is_none());
+}
+
+#[gpui_kit::test]
+fn version_list_failure_offers_retry(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(FakeCatalog::new().with_manifest_error("no network here"));
+    let app = boot_with(cx, tmp.path(), AppSettings::default(), catalog.clone());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "add-instance-empty");
+    settle(cx, |cx| shows(&app, cx, "version-error"));
+    let error = element(&app, cx, "version-error").and_then(|e| e.label().map(str::to_owned));
+    assert_eq!(
+        error.as_deref(),
+        Some("Couldn’t load the version list: no network here")
+    );
+    assert!(disabled(&app, cx, "add-instance-create"));
+    assert!(
+        disabled(&app, cx, loader_segment_id(Some(LoaderKind::Fabric))),
+        "no loader before a game version"
+    );
+    // Enter does not create from an incomplete form.
+    press(&app, cx, "enter");
+    assert!(shows(&app, cx, "dialog"));
+
+    let before = catalog.manifest_requests();
+    click(&app, cx, "version-retry");
+    settle(cx, |_| catalog.manifest_requests() == before + 1);
+    settle(cx, |cx| shows(&app, cx, "version-error"));
+    assert!(model.read_with(cx, |m, _| m.instances().is_empty()));
+}
+
+/// Presses Tab until `id` has the keyboard (at most 20 times).
+fn tab_to(app: &Booted, cx: &mut TestAppContext, id: &'static str) {
+    for _ in 0..20 {
+        press(app, cx, "tab");
+        if element(app, cx, id).and_then(|e| e.focused()) == Some(true) {
+            return;
+        }
+    }
+    panic!("Tab never reached {id}");
+}
+
+/// Gives background work a moment, then checks nothing was created.
+fn nothing_created(store: &InstanceStore, cx: &mut TestAppContext) {
+    std::thread::sleep(Duration::from_millis(50));
+    cx.run_until_parked();
+    assert!(
+        store.list().unwrap().instances.is_empty(),
+        "nothing created"
+    );
+}
+
+#[gpui_kit::test]
+fn enter_commits_only_from_the_name_and_the_lists(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+
+    // Enter in the search box searches nothing and creates nothing.
+    click(&app, cx, "version-search");
+    press(&app, cx, "enter");
+    assert!(shows(&app, cx, "dialog"));
+    nothing_created(&store, cx);
+
+    // Enter on a loader segment chooses that loader.
+    let fabric = loader_segment_id(Some(LoaderKind::Fabric));
+    tab_to(&app, cx, fabric);
+    press(&app, cx, "enter");
+    wait_name(&app, cx, "Fabric 1.21.1");
+    assert!(shows(&app, cx, "dialog"));
+    nothing_created(&store, cx);
+    // Space too.
+    let none = loader_segment_id(None);
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("shift-tab", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        element(&app, cx, none).and_then(|e| e.focused()),
+        Some(true)
+    );
+    press(&app, cx, "space");
+    wait_name(&app, cx, "1.21.1");
+    nothing_created(&store, cx);
+
+    // Enter on 取消 cancels.
+    tab_to(&app, cx, "add-instance-cancel");
+    press(&app, cx, "enter");
+    assert!(!shows(&app, cx, "dialog"));
+    nothing_created(&store, cx);
+
+    // Enter in the version list creates.
+    click(&app, cx, "instances-add");
+    wait_name(&app, cx, "1.21.1");
+    click(&app, cx, version_row_id("1.20.1"));
+    wait_name(&app, cx, "1.20.1");
+    press(&app, cx, "enter");
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.20.1"));
+}
+
+#[gpui_kit::test]
+fn create_failure_is_reported(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    // A file where the instances directory belongs: nothing can be created.
+    let instances = DataDirs::new(tmp.path()).instances();
+    std::fs::create_dir_all(instances.parent().unwrap()).unwrap();
+    std::fs::write(&instances, b"not a directory").unwrap();
+    let app = boot_with(cx, tmp.path(), AppSettings::default(), catalog());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let notifications = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| window.notifications(cx).len())
+            .unwrap()
+    };
+
+    click(&app, cx, "instances-add");
+    wait_name(&app, cx, "1.21.1");
+    click(&app, cx, "add-instance-create");
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| notifications(cx) == 1);
+    assert!(instances.is_file());
+    assert!(model.read_with(cx, |m, _| m.instances().is_empty()));
+}
+
+#[gpui_kit::test]
+fn the_list_scrolls_to_the_new_instance(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    for n in 0..40 {
+        store.create(&format!("A {n:02}"), "1.21.1").unwrap();
+    }
+    let app = boot_with(cx, tmp.path(), AppSettings::default(), catalog());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    assert!(!shows(&app, cx, row_id("A 39")), "the list overflows");
+
+    click(&app, cx, "instances-add");
+    wait_name(&app, cx, "1.21.1");
+    click(&app, cx, "add-instance-name");
+    press(&app, cx, "ctrl-a");
+    type_text(&app, cx, "Zed");
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("Zed"));
+    // Sorted last (never played, by name); scrolled into view.
+    assert!(shows(&app, cx, row_id("Zed")));
 }

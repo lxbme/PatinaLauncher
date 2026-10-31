@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use gpui_kit::{Context, EventEmitter, SharedString, Subscription, Task, Window};
 use patina_core::instance::{BrokenInstance, Instance, ListOutcome};
@@ -91,6 +92,8 @@ pub struct InstancesModel {
     deleting: HashSet<String>,
     revision: Revision,
     task: Task<()>,
+    /// Told when the next refresh lands ([`InstancesModel::refresh_and_wait`]).
+    refresh_waiters: Vec<oneshot::Sender<()>>,
     _activation: Subscription,
 }
 
@@ -118,6 +121,7 @@ impl InstancesModel {
             deleting: HashSet::new(),
             revision: Revision::default(),
             task: Task::ready(()),
+            refresh_waiters: Vec::new(),
             _activation,
         };
         this.refresh(cx);
@@ -419,10 +423,25 @@ impl InstancesModel {
                 }
                 this.refreshing = false;
                 this.loaded = true;
+                for waiter in this.refresh_waiters.drain(..) {
+                    waiter.send(()).ok();
+                }
                 cx.notify();
             })
             .ok();
         });
+    }
+
+    /// Refreshes as [`InstancesModel::refresh`] does; the returned future
+    /// resolves once a refresh started no earlier than this call has landed
+    /// (successfully or not), or the model is gone.
+    pub fn refresh_and_wait(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
+        let (tx, rx) = oneshot::channel();
+        self.refresh_waiters.push(tx);
+        self.refresh(cx);
+        async move {
+            rx.await.ok();
+        }
     }
 
     fn apply(&mut self, outcome: ListOutcome) {

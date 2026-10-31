@@ -104,13 +104,24 @@ pub struct Core {
 
 impl Global for Core {}
 
+/// A client that cannot reach any host: every request goes through a
+/// proxy at a closed local port and fails at once. Whatever the download
+/// source or the original URLs, an offline core never touches the network.
+fn unreachable_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        // Port 1 is privileged, so nothing a user runs listens there.
+        .proxy(reqwest::Proxy::all("http://127.0.0.1:1")?)
+        .build()
+}
+
 /// Whether the core may speed-test the download sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Startup {
     /// With `Auto` and no stored pick, speed-test the mirrors in the
     /// background and store the winner.
     SpeedTest,
-    /// Never touch the network (tests).
+    /// Never touch the network (tests): no speed test, and a client that
+    /// cannot reach any host.
     Offline,
 }
 
@@ -133,7 +144,11 @@ impl Core {
     ) -> Result<Core, InitError> {
         let client = {
             let _rt = rt.enter();
-            http_client().map_err(|e| InitError::HttpClient(e.to_string()))?
+            let client = match startup {
+                Startup::SpeedTest => http_client(),
+                Startup::Offline => unreachable_client(),
+            };
+            client.map_err(|e| InitError::HttpClient(e.to_string()))?
         };
         let initial = ResolvedSource {
             mirror: Mirror::bmclapi(),
@@ -453,6 +468,32 @@ mod tests {
         assert!(config.load_error.is_none());
         assert_eq!(config.config.download.source, SourceChoice::Official);
         assert_eq!(sources(&core), ("official".into(), Some("bmclapi".into())));
+    }
+
+    #[test]
+    fn offline_core_reaches_no_host() {
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[download]\nsource = \"official\"\n",
+        )
+        .unwrap();
+        let core = offline_core(rt.handle(), dir.path());
+        // Also after the configured source replaced the launcher.
+        loaded(&rt, &core);
+        assert_eq!(sources(&core).0, "official");
+        let client = core.launcher().downloader.client().clone();
+        let started = std::time::Instant::now();
+        let result = rt.block_on(async move {
+            client
+                .get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+                .send()
+                .await
+        });
+        let error = result.expect_err("an offline core cannot download");
+        assert!(error.is_connect(), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

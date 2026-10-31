@@ -157,6 +157,9 @@ pub struct InstanceList {
     /// The rows region: a Tab stop that takes Up / Down.
     focus: FocusHandle,
     scroll: VirtualListScrollHandle,
+    /// The selection the list last scrolled to; a new one (a created
+    /// instance, a keyboard step) is scrolled into view.
+    scrolled_to: Option<String>,
     _observe: Subscription,
 }
 
@@ -174,6 +177,7 @@ impl InstanceList {
             page_focus,
             focus: cx.focus_handle().tab_stop(true),
             scroll: VirtualListScrollHandle::new(),
+            scrolled_to: None,
             _observe,
         };
         this.rebuild_rows(cx);
@@ -223,9 +227,19 @@ impl InstanceList {
     }
 
     fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
-        let rows = visible_ids(self.model.read(cx), self.filter);
+        let model = self.model.read(cx);
+        let rows = visible_ids(model, self.filter);
+        let selected = model.selected().map(str::to_owned);
         if *self.rows != rows {
             self.rows = Rc::new(rows);
+        }
+        if selected != self.scrolled_to {
+            if let Some(ix) =
+                (selected.as_ref()).and_then(|id| self.rows.iter().position(|r| r == id))
+            {
+                self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+            }
+            self.scrolled_to = selected;
         }
         cx.notify();
     }
@@ -272,7 +286,6 @@ impl InstanceList {
     }
 
     fn render_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let this = cx.weak_entity();
         h_flex()
             .id("instance-filters")
@@ -285,37 +298,12 @@ impl InstanceList {
             // sideways rather than wrap.
             .overflow_x_scroll()
             .children(Filter::CHIPS.into_iter().map(|filter| {
-                let selected = filter == self.filter;
-                let variant = ButtonCustomVariant::new(cx)
-                    .color(theme.transparent)
-                    .foreground(theme.muted_foreground)
-                    .hover(theme.muted)
-                    .active(theme.list_active);
-                let label = filter.label();
                 let this = this.clone();
-                Button::new(filter.chip_id())
-                    .custom(variant)
-                    .xsmall()
-                    .label(label)
-                    .toggled(selected)
-                    .flex_none()
-                    .h(rems(1.5))
-                    .px(rems(0.375))
-                    .rounded_full()
-                    .border_1()
-                    .text_size(TEXT_SECONDARY)
-                    .map(|b| {
-                        if selected {
-                            b.border_color(theme.primary)
-                                .text_color(theme.primary)
-                                .strong(FontWeight::MEDIUM, cx)
-                        } else {
-                            b.border_color(theme.border)
-                        }
-                    })
-                    .on_click(move |_, _, cx| {
+                filter_chip(filter.chip_id(), filter.label(), filter == self.filter, cx).on_click(
+                    move |_, _, cx| {
                         this.update(cx, |list, cx| list.set_filter(filter, cx)).ok();
-                    })
+                    },
+                )
             }))
     }
 
@@ -366,6 +354,37 @@ impl InstanceList {
             .test_support()
             .into_any_element()
     }
+}
+
+/// A filter chip (a pill that toggles), as the list's chips and the
+/// add-instance dialog's version filters draw it.
+pub(crate) fn filter_chip(id: &'static str, label: String, selected: bool, cx: &App) -> Button {
+    let theme = cx.theme();
+    let variant = ButtonCustomVariant::new(cx)
+        .color(theme.transparent)
+        .foreground(theme.muted_foreground)
+        .hover(theme.muted)
+        .active(theme.list_active);
+    Button::new(id)
+        .custom(variant)
+        .xsmall()
+        .label(label)
+        .toggled(selected)
+        .flex_none()
+        .h(rems(1.5))
+        .px(rems(0.375))
+        .rounded_full()
+        .border_1()
+        .text_size(TEXT_SECONDARY)
+        .map(|b| {
+            if selected {
+                b.border_color(theme.primary)
+                    .text_color(theme.primary)
+                    .strong(FontWeight::MEDIUM, cx)
+            } else {
+                b.border_color(theme.border)
+            }
+        })
 }
 
 /// Two lines of a healthy instance: name and last played, then its loader
