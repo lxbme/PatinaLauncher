@@ -4988,3 +4988,764 @@ fn a_failed_icon_save_shows_in_the_picker(cx: &mut TestAppContext) {
     settle(cx, |cx| sshows(&app, cx, "icon-error"));
     assert_eq!(saved(&store, "Alpha").icon, None);
 }
+
+// ---- Mods tab ----
+
+use patina_app::content::{
+    HIGHLIGHT_FOR, ModsChanged, ModsEvents, ModsTab, mod_delete_id, mod_disabled_id, mod_row_id,
+    mod_switch_id,
+};
+
+/// Writes a Fabric mod jar `file` (mod `name`, version 1.0, by Alice and
+/// Bob) into `dir`.
+fn fabric_jar(dir: &Path, file: &str, name: &str) {
+    use std::io::Write as _;
+    let mut w = zip::ZipWriter::new(std::fs::File::create(dir.join(file)).unwrap());
+    w.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    let id = name.to_lowercase().replace(' ', "_");
+    write!(
+        w,
+        r#"{{"schemaVersion":1,"id":"{id}","version":"1.0","name":"{name}","authors":["Alice","Bob"]}}"#
+    )
+    .unwrap();
+    w.finish().unwrap();
+}
+
+/// A file named like a mod that is no zip at all.
+fn broken_jar(dir: &Path, file: &str) {
+    std::fs::write(dir.join(file), b"not a zip, just bytes").unwrap();
+}
+
+/// Instance "Alpha" with its mods folder filled by `fill`; the app booted,
+/// Alpha selected and its Mods tab shown with the listing landed. Returns
+/// the app, the tab and the mods folder.
+fn mods_app(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    fill: impl FnOnce(&Path),
+) -> (Booted, Entity<ModsTab>, std::path::PathBuf) {
+    let store = InstanceStore::new(DataDirs::new(dir).instances());
+    let alpha = store.create("Alpha", "1.21.1").unwrap();
+    let mods = alpha.game_dir().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fill(&mods);
+    let app = boot(cx, dir, AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, row_id("Alpha"));
+    click(&app, cx, "tab-mods");
+    let tab = mods_tab(&app, cx);
+    mods_settled(&tab, cx);
+    (app, tab, mods)
+}
+
+fn mods_tab(app: &Booted, cx: &mut TestAppContext) -> Entity<ModsTab> {
+    cx.update(|cx| {
+        let detail = app.root.read(cx).instances().read(cx).detail().clone();
+        detail
+            .read(cx)
+            .mods_view()
+            .cloned()
+            .expect("the Mods tab was shown")
+    })
+}
+
+/// Waits until the tab's listing has landed and none is in flight.
+fn mods_settled(tab: &Entity<ModsTab>, cx: &mut TestAppContext) {
+    settle(cx, |cx| {
+        tab.read_with(cx, |t, cx| {
+            let list = t.list().read(cx);
+            !list.is_reloading() && *list.state() == patina_app::content::LoadState::Loaded
+        })
+    });
+}
+
+fn mod_files(tab: &Entity<ModsTab>, cx: &mut TestAppContext) -> Vec<String> {
+    tab.read_with(cx, |t, cx| {
+        (t.list().read(cx).items().iter())
+            .map(|m| m.file_name.clone())
+            .collect()
+    })
+}
+
+/// Counts the listings of `tab` that land.
+fn count_listings(
+    tab: &Entity<ModsTab>,
+    cx: &mut TestAppContext,
+) -> (Rc<std::cell::Cell<usize>>, gpui_kit::Subscription) {
+    let count = Rc::new(std::cell::Cell::new(0));
+    let list = tab.read_with(cx, |t, _| t.list().clone());
+    let subscription = cx.update(|cx| {
+        let count = count.clone();
+        cx.subscribe(&list, move |_, _: &patina_app::content::Reloaded, _| {
+            count.set(count.get() + 1)
+        })
+    });
+    (count, subscription)
+}
+
+/// Counts the [`ModsChanged`] events.
+fn count_mods_changed(
+    cx: &mut TestAppContext,
+) -> (Rc<std::cell::Cell<usize>>, gpui_kit::Subscription) {
+    let count = Rc::new(std::cell::Cell::new(0));
+    let subscription = cx.update(|cx| {
+        let count = count.clone();
+        cx.subscribe(&ModsEvents::entity(cx), move |_, event: &ModsChanged, _| {
+            assert_eq!(event.instance_id, "Alpha");
+            count.set(count.get() + 1)
+        })
+    });
+    (count, subscription)
+}
+
+#[gpui_kit::test]
+fn large_mod_folder_stays_responsive(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let mods = store
+        .create("Alpha", "1.21.1")
+        .unwrap()
+        .game_dir()
+        .join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    // 500 jars, every 25th of them (20) broken.
+    for i in 0..500 {
+        let file = format!("mod-{i:03}.jar");
+        if i % 25 == 0 {
+            broken_jar(&mods, &file);
+        } else {
+            fabric_jar(&mods, &file, &format!("Mod {i:03}"));
+        }
+    }
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, row_id("Alpha"));
+    click(&app, cx, "tab-mods");
+    let tab = mods_tab(&app, cx);
+    mods_settled(&tab, cx);
+
+    // A reload returns at once: the listing runs in the background while
+    // the main thread goes on drawing and the clock moves.
+    let list = tab.read_with(cx, |t, _| t.list().clone());
+    list.update(cx, |l, cx| l.reload(cx));
+    assert!(list.read_with(cx, |l, _| l.is_reloading()));
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.update_window(app.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    // The old listing stays on show meanwhile.
+    assert_eq!(mod_files(&tab, cx).len(), 500);
+    mods_settled(&tab, cx);
+
+    let unreadable = tab.read_with(cx, |t, cx| {
+        (t.list().read(cx).items().iter())
+            .filter(|m| m.info.is_none())
+            .count()
+    });
+    assert_eq!(mod_files(&tab, cx).len(), 500);
+    assert_eq!(unreadable, 20);
+    // Only the rows in view are drawn.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(mod_row_id("mod-000.jar")).visible());
+        assert!(window.try_find(mod_row_id("mod-499.jar")).is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn toggle_updates_row_and_suffix(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+        fabric_jar(dir, "b.jar", "Beta Mod");
+    });
+    let (listings, _l) = count_listings(&tab, cx);
+    let (changed, _c) = count_mods_changed(cx);
+    assert_eq!(
+        element(&app, cx, mod_switch_id("a.jar")).and_then(|s| s.checked()),
+        Some(true)
+    );
+
+    click(&app, cx, mod_switch_id("a.jar"));
+    settle(cx, |cx| {
+        mod_files(&tab, cx).contains(&"a.jar.disabled".into())
+    });
+    assert!(!mods.join("a.jar").exists());
+    assert!(mods.join("a.jar.disabled").exists());
+    // The row says so in words, not only by its colour.
+    assert_eq!(
+        label_of(&app, cx, mod_disabled_id("a.jar.disabled")).as_deref(),
+        Some("Disabled")
+    );
+    assert_eq!(
+        element(&app, cx, mod_switch_id("a.jar.disabled")).and_then(|s| s.checked()),
+        Some(false)
+    );
+    assert!(element(&app, cx, mod_disabled_id("b.jar")).is_none());
+    // Only the row changed: no listing ran; the search index is told.
+    cx.run_until_parked();
+    assert_eq!(listings.get(), 0);
+    assert_eq!(changed.get(), 1);
+
+    // And back.
+    click(&app, cx, mod_switch_id("a.jar.disabled"));
+    settle(cx, |cx| mod_files(&tab, cx).contains(&"a.jar".into()));
+    assert!(mods.join("a.jar").exists());
+    assert!(!mods.join("a.jar.disabled").exists());
+    assert!(element(&app, cx, mod_disabled_id("a.jar")).is_none());
+    assert_eq!(changed.get(), 2);
+}
+
+#[gpui_kit::test]
+fn toggle_after_external_change_refreshes(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+        fabric_jar(dir, "b.jar", "Beta Mod");
+        fabric_jar(dir, "c.jar", "Gamma Mod");
+    });
+    let (changed, _c) = count_mods_changed(cx);
+    // Another program removes a.jar after the listing.
+    std::fs::remove_file(mods.join("a.jar")).unwrap();
+    click(&app, cx, mod_switch_id("a.jar"));
+    settle(cx, |cx| label_of(&app, cx, NOTICE_TEXT).is_some());
+    assert_eq!(
+        label_of(&app, cx, NOTICE_TEXT).as_deref(),
+        Some("The file was changed outside Patina")
+    );
+    mods_settled(&tab, cx);
+    assert_eq!(mod_files(&tab, cx), ["b.jar", "c.jar"]);
+    assert!(!mods.join("a.jar.disabled").exists());
+    // The listing found the folder changed: the search index is told.
+    assert_eq!(changed.get(), 1);
+
+    // The same for a deletion.
+    std::fs::remove_file(mods.join("b.jar")).unwrap();
+    click(&app, cx, mod_delete_id("b.jar"));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    settle(cx, |cx| mod_files(&tab, cx) == ["c.jar"]);
+    assert_eq!(notification_count(&app, cx), 2);
+}
+
+#[gpui_kit::test]
+fn delete_requires_confirmation(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+        fabric_jar(dir, "b.jar", "Beta Mod");
+    });
+    app.language(Language::ZhCn);
+    let (changed, _c) = count_mods_changed(cx);
+
+    click(&app, cx, mod_delete_id("a.jar"));
+    assert!(shows(&app, cx, "dialog"), "asks first");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let title = window.within("dialog").find("mods-delete-title");
+        assert_eq!(title.label(), Some("删除\"Alpha Mod\"？"));
+        let body = window.within("dialog").find("mods-delete-body");
+        assert_eq!(body.label(), Some("文件会被永久删除。"));
+    })
+    .unwrap();
+    assert!(
+        mods.join("a.jar").exists(),
+        "nothing deleted before the answer"
+    );
+
+    // 取消 keeps the file.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("cancel", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!shows(&app, cx, "dialog"));
+    // A deletion starts (synchronously) only from 删除: none is in flight.
+    assert_eq!(tab.read_with(cx, |t, _| t.changes_in_flight()), 0);
+    assert!(mods.join("a.jar").exists());
+    assert_eq!(changed.get(), 0);
+
+    // Enter on the focused 取消 cancels too.
+    click(&app, cx, mod_delete_id("a.jar"));
+    tab_to(&app, cx, "cancel");
+    press(&app, cx, "enter");
+    assert!(!shows(&app, cx, "dialog"));
+    assert_eq!(tab.read_with(cx, |t, _| t.changes_in_flight()), 0);
+    assert!(mods.join("a.jar").exists());
+
+    // 删除 deletes it and drops its row.
+    click(&app, cx, mod_delete_id("a.jar"));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("ok", cx);
+    })
+    .unwrap();
+    settle(cx, |cx| mod_files(&tab, cx) == ["b.jar"]);
+    assert!(!mods.join("a.jar").exists());
+    assert!(!shows(&app, cx, mod_row_id("a.jar")));
+    assert!(!shows(&app, cx, "dialog"));
+    assert_eq!(changed.get(), 1);
+    assert!(mods.join("b.jar").exists());
+}
+
+#[gpui_kit::test]
+fn mutations_disabled_while_running(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+    });
+    let model = instances_model(&app, cx);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    cx.run_until_parked();
+
+    assert!(disabled(&app, cx, mod_switch_id("a.jar")));
+    assert!(disabled(&app, cx, mod_delete_id("a.jar")));
+    // The reason is on show, not only implied by the disabled controls.
+    assert_eq!(
+        label_of(&app, cx, "mods-busy").as_deref(),
+        Some("The game is running, so mods can’t be changed now")
+    );
+    // The keyboard is refused too, with the reason.
+    click(&app, cx, mod_row_id("a.jar"));
+    press(&app, cx, "space");
+    press(&app, cx, "delete");
+    assert!(!shows(&app, cx, "dialog"));
+    // Refused on the spot: nothing started.
+    assert_eq!(tab.read_with(cx, |t, _| t.changes_in_flight()), 0);
+    assert!(mods.join("a.jar").exists());
+    // Both keys said why.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let notices = window.find_all(NOTICE_TEXT);
+        assert_eq!(notices.len(), 2);
+        for notice in notices {
+            assert_eq!(
+                notice.label(),
+                Some("The game is running, so mods can’t be changed now")
+            );
+        }
+    })
+    .unwrap();
+
+    // The game wrote a mod meanwhile; when it ends the tab lists again.
+    fabric_jar(&mods, "c.jar", "Gamma Mod");
+    model.update(cx, |m, cx| m.set_run_state("Alpha", None, cx));
+    settle(cx, |cx| mod_files(&tab, cx) == ["a.jar", "c.jar"]);
+    assert!(!disabled(&app, cx, mod_switch_id("a.jar")));
+    assert!(!shows(&app, cx, "mods-busy"));
+}
+
+#[gpui_kit::test]
+fn focus_file_scrolls_and_highlights(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let mods = store
+        .create("Alpha", "1.21.1")
+        .unwrap()
+        .game_dir()
+        .join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    for i in 0..100 {
+        fabric_jar(&mods, &format!("mod-{i:03}.jar"), &format!("Mod {i:03}"));
+    }
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, row_id("Alpha"));
+    let detail = cx.update(|cx| app.root.read(cx).instances().read(cx).detail().clone());
+
+    // From another tab, before the Mods tab has listed anything: the
+    // search's jump waits for the listing.
+    cx.update_window(app.handle, |_, window, cx| {
+        detail.update(cx, |d, cx| d.show_mod("mod-090.jar", window, cx));
+    })
+    .unwrap();
+    let tab = mods_tab(&app, cx);
+    settle(cx, |cx| {
+        tab.read_with(cx, |t, _| t.highlighted() == Some("mod-090.jar"))
+    });
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let region = window.find("mod-rows-region").bounds();
+        let row = window.find(mod_row_id("mod-090.jar"));
+        assert!(row.visible());
+        assert!(row.bounds().top() >= region.top());
+        assert!(row.bounds().bottom() <= region.bottom() + px(1.));
+        assert_eq!(row.selected(), Some(true));
+        assert!(window.try_find(mod_row_id("mod-000.jar")).is_none());
+    })
+    .unwrap();
+
+    // The highlight goes after two seconds; the selection stays.
+    cx.executor().advance_clock(HIGHLIGHT_FOR);
+    cx.run_until_parked();
+    assert_eq!(
+        tab.read_with(cx, |t, _| t.highlighted().map(str::to_owned)),
+        None
+    );
+    assert_eq!(
+        tab.read_with(cx, |t, _| t.selected().map(str::to_owned))
+            .as_deref(),
+        Some("mod-090.jar")
+    );
+
+    // A filter that hides the file is cleared for it.
+    tab.update(cx, |t, cx| {
+        t.list().update(cx, |l, cx| l.set_filter("mod-00", cx))
+    });
+    cx.update_window(app.handle, |_, window, cx| {
+        detail.update(cx, |d, cx| d.show_mod("mod-042.jar", window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        tab.read_with(cx, |t, _| t.highlighted().map(str::to_owned))
+            .as_deref(),
+        Some("mod-042.jar")
+    );
+    assert!(shows(&app, cx, mod_row_id("mod-042.jar")));
+}
+
+#[gpui_kit::test]
+fn mod_rows_are_keyboard_reachable(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+        fabric_jar(dir, "b.jar", "Beta Mod");
+        fabric_jar(dir, "c.jar", "Gamma Mod");
+    });
+    // A click hands the keyboard to the rows.
+    click(&app, cx, mod_row_id("a.jar"));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("mod-rows-region").focused(), Some(true));
+    })
+    .unwrap();
+    let selected =
+        |cx: &mut TestAppContext| tab.read_with(cx, |t, _| t.selected().map(str::to_owned));
+    assert_eq!(selected(cx).as_deref(), Some("a.jar"));
+    press(&app, cx, "up");
+    assert_eq!(selected(cx).as_deref(), Some("a.jar"), "top stays");
+    press(&app, cx, "down");
+    assert_eq!(selected(cx).as_deref(), Some("b.jar"));
+
+    // Space toggles the selected mod; the selection follows its new name.
+    press(&app, cx, "space");
+    settle(cx, |cx| {
+        mods.join("b.jar.disabled").exists() && selected(cx).as_deref() == Some("b.jar.disabled")
+    });
+
+    // Delete asks first; Escape leaves it.
+    press(&app, cx, "delete");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("dialog").find("mods-delete-title").label(),
+            Some("Delete “Beta Mod”?")
+        );
+    })
+    .unwrap();
+    press(&app, cx, "escape");
+    assert!(!shows(&app, cx, "dialog"));
+    assert!(mods.join("b.jar.disabled").exists());
+
+    press(&app, cx, "end");
+    assert_eq!(selected(cx).as_deref(), Some("c.jar"));
+    press(&app, cx, "home");
+    assert_eq!(selected(cx).as_deref(), Some("a.jar"));
+
+    // Enter in the confirmation (no button chosen) deletes.
+    press(&app, cx, "delete");
+    assert!(shows(&app, cx, "dialog"));
+    press(&app, cx, "enter");
+    settle(cx, |_| !mods.join("a.jar").exists());
+    assert!(!shows(&app, cx, "dialog"));
+    settle(cx, |cx| !mod_files(&tab, cx).contains(&"a.jar".to_string()));
+}
+
+#[gpui_kit::test]
+fn mods_toolbar_and_empty_states(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    // No mods folder at all yet.
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        std::fs::remove_dir(dir).unwrap();
+    });
+    for id in [
+        "content-filter",
+        "content-open-folder",
+        "content-refresh",
+        "mods-online",
+    ] {
+        assert!(shows(&app, cx, id), "{id} is on the toolbar");
+    }
+    assert_eq!(
+        label_of(&app, cx, "content-empty").as_deref(),
+        Some("No mods yet. Put jar files in the folder, or get some from Downloads.")
+    );
+
+    // A mod put in by hand shows after a refresh.
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "a.jar", "Alpha Mod");
+    click(&app, cx, "content-refresh");
+    mods_settled(&tab, cx);
+    assert!(shows(&app, cx, mod_row_id("a.jar")));
+    assert!(!shows(&app, cx, "content-empty"));
+
+    // Refresh is disabled while a listing runs.
+    let list = tab.read_with(cx, |t, _| t.list().clone());
+    cx.update_window(app.handle, |_, window, cx| {
+        list.update(cx, |l, cx| l.reload(cx));
+        window.render_frame(cx);
+        assert_eq!(window.find("content-refresh").disabled(), Some(true));
+    })
+    .unwrap();
+    mods_settled(&tab, cx);
+    assert!(!disabled(&app, cx, "content-refresh"));
+
+    // A filter that matches nothing says so.
+    click(&app, cx, "content-filter");
+    type_text(&app, cx, "zzz");
+    assert_eq!(
+        label_of(&app, cx, "content-empty").as_deref(),
+        Some("Nothing matches “zzz”.")
+    );
+    assert!(!shows(&app, cx, mod_row_id("a.jar")));
+
+    // "Get online" goes to the downloads page.
+    click(&app, cx, "mods-online");
+    let nav = cx.update(|cx| app.root.read(cx).shell().read(cx).nav());
+    assert_eq!(nav, Nav::Downloads);
+}
+
+/// Writes a jar `file` with `entries` into `dir`.
+fn jar_with(dir: &Path, file: &str, entries: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    let mut w = zip::ZipWriter::new(std::fs::File::create(dir.join(file)).unwrap());
+    for (name, body) in entries {
+        w.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(body).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+#[gpui_kit::test]
+fn a_toggle_during_a_listing_keeps_its_row(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        for i in 0..200 {
+            fabric_jar(dir, &format!("mod-{i:03}.jar"), &format!("Mod {i:03}"));
+        }
+    });
+    let (changed, _c) = count_mods_changed(cx);
+    // A listing is in flight when the toggle lands, whichever finishes
+    // first.
+    let list = tab.read_with(cx, |t, _| t.list().clone());
+    list.update(cx, |l, cx| l.reload(cx));
+    click(&app, cx, mod_switch_id("mod-000.jar"));
+    settle(cx, |cx| {
+        let listing = list.read_with(cx, |l, _| l.is_reloading());
+        !listing && tab.read_with(cx, |t, _| t.changes_in_flight()) == 0
+    });
+    mods_settled(&tab, cx);
+    assert!(mods.join("mod-000.jar.disabled").exists());
+    let files = mod_files(&tab, cx);
+    assert_eq!(files[0], "mod-000.jar.disabled");
+    assert_eq!(files.len(), 200);
+    assert_eq!(
+        tab.read_with(cx, |t, _| t.selected().map(str::to_owned))
+            .as_deref(),
+        Some("mod-000.jar.disabled")
+    );
+    // The toggle told the search once; the listings found nothing else.
+    assert_eq!(changed.get(), 1);
+}
+
+#[gpui_kit::test]
+fn icons_load_only_for_rows_on_show(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/instance-icons/sword.png"),
+    )
+    .unwrap();
+    let (app, tab, _mods) = mods_app(cx, tmp.path(), |dir| {
+        for i in 0..150 {
+            let json = format!(r#"{{"id":"m{i}","name":"Mod {i:03}","icon":"icon.png"}}"#);
+            jar_with(
+                dir,
+                &format!("mod-{i:03}.jar"),
+                &[("fabric.mod.json", json.as_bytes()), ("icon.png", &png)],
+            );
+        }
+    });
+    let cached = |cx: &mut TestAppContext| {
+        cx.update(|cx| cx.global::<patina_app::content::ImageCache>().len())
+    };
+    let drawn = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            (0..150)
+                .filter(|i| {
+                    let id = mod_row_id(&format!("mod-{i:03}.jar"));
+                    window.try_find(id).is_some()
+                })
+                .count()
+        })
+        .unwrap()
+    };
+    // The rows on show load their icons, read from their jars again.
+    settle(cx, |cx| {
+        let drawn = drawn(cx);
+        drawn > 0 && cached(cx) == drawn
+    });
+    let shown = drawn(cx);
+    assert!(shown < 50, "{shown} rows drawn");
+    // Every item knows it has an icon, but only the drawn rows' icons are
+    // held (in the capped image cache); the items keep no icon bytes.
+    let with_icon = tab.read_with(cx, |t, cx| {
+        (t.list().read(cx).items().iter())
+            .filter(|m| m.info.as_ref().is_some_and(|i| i.has_icon))
+            .count()
+    });
+    assert_eq!(with_icon, 150);
+    assert_eq!(cached(cx), shown);
+}
+
+#[gpui_kit::test]
+fn a_hidden_mods_tab_does_not_list(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, _mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+    });
+    let (listings, _l) = count_listings(&tab, cx);
+    let refocus = |cx: &mut TestAppContext| {
+        gpui_kit::VisualTestContext::from_window(app.handle, cx).deactivate_window();
+        activate(&app, cx);
+    };
+    // In view, coming back to the window lists the folder again.
+    refocus(cx);
+    mods_settled(&tab, cx);
+    assert_eq!(listings.get(), 1);
+
+    // On another page, neither the window nor the instance coming free
+    // lists it.
+    click(&app, cx, "rail-downloads");
+    refocus(cx);
+    let model = instances_model(&app, cx);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    model.update(cx, |m, cx| m.set_run_state("Alpha", None, cx));
+    cx.run_until_parked();
+    assert!(!tab.read_with(cx, |t, cx| t.list().read(cx).is_reloading()));
+    assert_eq!(listings.get(), 1);
+
+    // Back on the page it lists at once.
+    click(&app, cx, "rail-instances");
+    mods_settled(&tab, cx);
+    assert_eq!(listings.get(), 2);
+
+    // On another tab of the detail, the same.
+    click(&app, cx, "tab-overview");
+    refocus(cx);
+    assert!(!tab.read_with(cx, |t, cx| t.list().read(cx).is_reloading()));
+    assert_eq!(listings.get(), 2);
+}
+
+#[gpui_kit::test]
+fn a_loader_change_reads_the_metadata_again(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let mods = store
+        .create("Alpha", "1.21.1")
+        .unwrap()
+        .game_dir()
+        .join("mods");
+    set_loader(&store, "Alpha", ComponentUid::Fabric);
+    std::fs::create_dir_all(&mods).unwrap();
+    // One jar for both loaders, named differently by each.
+    jar_with(
+        &mods,
+        "both.jar",
+        &[
+            (
+                "fabric.mod.json",
+                br#"{"id":"both","name":"Fabric Side","version":"1"}"#,
+            ),
+            (
+                "META-INF/neoforge.mods.toml",
+                b"modLoader=\"javafml\"\n[[mods]]\nmodId=\"both\"\ndisplayName=\"Neo Side\"\nversion=\"1\"\n",
+            ),
+        ],
+    );
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, row_id("Alpha"));
+    click(&app, cx, "tab-mods");
+    let tab = mods_tab(&app, cx);
+    mods_settled(&tab, cx);
+    let name = |cx: &mut TestAppContext| {
+        tab.read_with(cx, |t, cx| t.list().read(cx).items()[0].name().to_string())
+    };
+    assert_eq!(name(cx), "Fabric Side");
+
+    set_loader(&store, "Alpha", ComponentUid::Neoforge);
+    refresh(&model, cx);
+    settle(cx, |cx| name(cx) == "Neo Side");
+    mods_settled(&tab, cx);
+    assert_eq!(name(cx), "Neo Side");
+}
+
+#[gpui_kit::test]
+fn a_taken_name_has_its_own_message(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
+        fabric_jar(dir, "a.jar", "Alpha Mod");
+        fabric_jar(dir, "a.jar.disabled", "Alpha Mod");
+    });
+    app.language(Language::ZhCn);
+    // Disabling a.jar would take a.jar.disabled's name.
+    click(&app, cx, mod_switch_id("a.jar"));
+    settle(cx, |cx| label_of(&app, cx, NOTICE_TEXT).is_some());
+    assert_eq!(
+        label_of(&app, cx, NOTICE_TEXT).as_deref(),
+        Some("同名文件已存在")
+    );
+    mods_settled(&tab, cx);
+    assert_eq!(mod_files(&tab, cx), ["a.jar", "a.jar.disabled"]);
+    assert!(mods.join("a.jar").exists());
+}
+
+#[gpui_kit::test]
+fn the_first_listing_tells_no_one(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let mods = store
+        .create("Alpha", "1.21.1")
+        .unwrap()
+        .game_dir()
+        .join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    fabric_jar(&mods, "a.jar", "Alpha Mod");
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let (changed, _c) = count_mods_changed(cx);
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, row_id("Alpha"));
+    click(&app, cx, "tab-mods");
+    let tab = mods_tab(&app, cx);
+    mods_settled(&tab, cx);
+    assert_eq!(mod_files(&tab, cx), ["a.jar"]);
+    assert_eq!(changed.get(), 0, "nothing changed since the search read it");
+
+    // A listing that finds the same folder tells no one either.
+    click(&app, cx, "content-refresh");
+    mods_settled(&tab, cx);
+    assert_eq!(changed.get(), 0);
+}

@@ -14,7 +14,7 @@ use gpui_kit::{
 };
 
 use super::placeholder;
-use super::{Nav, Rail, ShellState, StatusBar, TitleBarView};
+use super::{Nav, OpenDownloads, Rail, ShellState, StatusBar, TitleBarView};
 use crate::fonts;
 use crate::instances::{InstancesChanged, InstancesPage};
 use gpui_kit::component::WindowExt as _;
@@ -67,7 +67,12 @@ impl RootView {
             rail: cx.new(|cx| Rail::new(shell.clone(), cx)),
             status_bar: cx.new(|cx| StatusBar::new(window, cx)),
             instances,
-            _observe: cx.observe(&shell, |_, _, cx| cx.notify()),
+            _observe: cx.observe(&shell, |this, shell, cx| {
+                let shown = shell.read(cx).nav() == Nav::Instances;
+                this.instances
+                    .update(cx, |page, cx| page.set_shown(shown, cx));
+                cx.notify();
+            }),
             _instances_changed,
             _launch_events,
             shell,
@@ -127,6 +132,13 @@ impl RootView {
             }
             LaunchEvent::ConfirmWarnings { .. } => {}
         }
+    }
+
+    /// Shows the downloads page. Its target and query are not used yet: the
+    /// downloads page takes them over once it exists (plan 4c, Task 6).
+    fn open_downloads(&mut self, _: &OpenDownloads, _: &mut Window, cx: &mut Context<Self>) {
+        self.shell
+            .update(cx, |s, cx| s.navigate(Nav::Downloads, cx));
     }
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -203,6 +215,7 @@ impl Render for RootView {
             .key_context(ROOT_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::focus_search))
+            .on_action(cx.listener(Self::open_downloads))
             .size_full()
             .bg(bg)
             .text_color(fg)

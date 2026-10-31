@@ -10,8 +10,9 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
-    RenderOnce, SharedString, Styled as _, Subscription, Task, Window, div, rems,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _,
+    IntoElement, ParentElement as _, RenderOnce, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, rems,
 };
 use patina_core::instance::Instance;
 use rust_i18n::t;
@@ -67,6 +68,9 @@ pub struct ContentTab<T: Send + 'static> {
     reloading: bool,
     /// A reload was asked for while one ran: one more follows it.
     rerun: bool,
+    /// Bumped by [`ContentTab::update_items`]: a listing started before an
+    /// edit is superseded by it.
+    edits: u64,
     filter: String,
     revision: Revision,
     task: Task<()>,
@@ -88,6 +92,7 @@ impl<T: Send + 'static> ContentTab<T> {
             state: LoadState::Loading,
             reloading: false,
             rerun: false,
+            edits: 0,
             filter: String::new(),
             revision: Revision::default(),
             task: Task::ready(()),
@@ -162,11 +167,22 @@ impl<T: Send + 'static> ContentTab<T> {
         let instance = self.instance.clone();
         let loader = self.loader.clone();
         let load = run_blocking(cx, move || loader(&instance));
+        let edits = self.edits;
         self.reloading = true;
         self.task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
                 if !this.revision.is_current(id) {
+                    return;
+                }
+                if this.edits != edits {
+                    // The directory was read before an edit of the items
+                    // (which queued a rerun): the rerun brings the truth;
+                    // this result would undo the edit.
+                    this.reloading = false;
+                    this.rerun = false;
+                    this.start_load(cx);
+                    cx.notify();
                     return;
                 }
                 match result {
@@ -186,6 +202,19 @@ impl<T: Send + 'static> ContentTab<T> {
             })
             .ok();
         });
+    }
+
+    /// Changes the loaded items in place, for a mutation whose result is
+    /// known (a toggled mod), without listing the directory again. A
+    /// listing in flight may have read the directory before the change: its
+    /// result is dropped (no [`Reloaded`]) and one more listing follows.
+    pub fn update_items(&mut self, update: impl FnOnce(&mut Vec<T>), cx: &mut Context<Self>) {
+        update(&mut self.items);
+        self.edits += 1;
+        if self.reloading {
+            self.rerun = true;
+        }
+        cx.notify();
     }
 
     /// The tab was shown: reload.
@@ -249,6 +278,9 @@ type ToolbarAction = Box<dyn Fn(&mut Window, &mut App)>;
 pub struct ContentToolbar {
     filter: Entity<InputState>,
     refreshing: bool,
+    /// A tab's own command, before "Open folder" (the Mods tab's "Get
+    /// online").
+    action: Option<AnyElement>,
     on_open: ToolbarAction,
     on_refresh: ToolbarAction,
 }
@@ -262,9 +294,16 @@ impl ContentToolbar {
         Self {
             filter: filter.clone(),
             refreshing: false,
+            action: None,
             on_open: Box::new(on_open),
             on_refresh: Box::new(on_refresh),
         }
+    }
+
+    /// Adds a tab's own command (a button) before "Open folder".
+    pub fn action(mut self, action: impl IntoElement) -> Self {
+        self.action = Some(action.into_any_element());
+        self
     }
 
     /// Disables the refresh button while a reload runs.
@@ -301,6 +340,7 @@ impl RenderOnce for ContentToolbar {
                 ),
             )
             .child(div().flex_1())
+            .children(self.action)
             .child(
                 Button::new("content-open-folder")
                     .outline()
@@ -385,6 +425,9 @@ impl RenderOnce for EmptyState {
             .pb(rems(3.))
             .child(
                 div()
+                    .id("content-empty")
+                    .aria_label(self.text.clone())
+                    .test_support()
                     .text_size(TEXT_PRIMARY)
                     .text_color(cx.theme().muted_foreground)
                     .child(self.text),
@@ -587,6 +630,64 @@ mod tests {
             tab.read_with(cx, |t, _| t.state().clone()),
             LoadState::Loaded
         );
+    }
+
+    #[gpui_kit::test]
+    async fn an_edit_supersedes_a_listing_in_flight(cx: &mut TestAppContext) {
+        let (_rt, dir) = boot(cx);
+        // Each listing waits for a message, then returns its number.
+        let (tx, rx) = mpsc::channel::<()>();
+        let rx = Mutex::new(rx);
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = calls.clone();
+        let tab = cx.new(|_| {
+            ContentTab::new(instance(dir.path().into()), move |_| {
+                let n = {
+                    let mut c = seen.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                rx.lock().unwrap().recv().ok();
+                Ok(vec![n])
+            })
+        });
+        let mut landed = Landed::watch(&tab, cx);
+        tab.update(cx, |t, cx| t.reload(cx));
+        tx.send(()).unwrap();
+        landed.next().await;
+        assert_eq!(items(&tab, cx), vec![1]);
+
+        // A listing starts, then the app edits the items (a toggle).
+        tab.update(cx, |t, cx| t.reload(cx));
+        tab.update(cx, |t, cx| t.update_items(|items| items[0] = 99, cx));
+        // The listing that read the folder before the edit finishes: it
+        // lands nothing and the edit stays.
+        tx.send(()).unwrap();
+        settle_calls(&calls, 3, cx);
+        assert_eq!(items(&tab, cx), vec![99]);
+        assert!(
+            landed.0.try_recv().is_err(),
+            "the stale listing did not land"
+        );
+        assert!(tab.read_with(cx, |t, _| t.is_reloading()));
+        // The listing after the edit lands.
+        tx.send(()).unwrap();
+        landed.next().await;
+        assert_eq!(items(&tab, cx), vec![3]);
+        assert!(!tab.read_with(cx, |t, _| t.is_reloading()));
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    /// Runs gpui until the loader has been called `n` times (at most 5 s).
+    fn settle_calls(calls: &Mutex<usize>, n: usize, cx: &mut TestAppContext) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if *calls.lock().unwrap() >= n {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the loader was not called {n} times");
     }
 
     #[gpui_kit::test]

@@ -259,3 +259,24 @@ content:
     resourcepacks: "还没有资源包。把 zip 放进文件夹，或去下载页获取。"
     shaders: "还没有光影包。把 zip 放进文件夹，或去下载页获取。"
     saves: "还没有存档。在游戏里创建的世界会出现在这里。"
+mods:
+  online: "在线获取"
+  format:
+    fabric: "Fabric"
+    quilt: "Quilt"
+    forge: "Forge"
+    neoforge: "NeoForge"
+    legacy_forge: "旧版 Forge"
+    unknown: "未知"
+  disabled: "已禁用"
+  unreadable: "无法读取这个 jar"
+  enable: '启用"%{name}"'
+  delete: '删除"%{name}"…'
+  delete_title: '删除"%{name}"？'
+  delete_body: "文件会被永久删除。"
+  delete_confirm: "删除"
+  cancel: "取消"
+  changed_outside: "文件已在外部被改动"
+  name_taken: "同名文件已存在"
+  failed: '无法更改"%{name}"：%{error}'
+  busy: "%{reason}，暂时不能更改 Mod"

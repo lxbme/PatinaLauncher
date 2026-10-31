@@ -1,7 +1,21 @@
-//! Which page the main window shows ([`Nav`]) and its owner ([`ShellState`]).
+//! Which page the main window shows ([`Nav`]), its owner ([`ShellState`])
+//! and the shell's navigation commands ([`OpenDownloads`]).
 
-use gpui_kit::Context;
+use gpui_kit::{Action, Context};
 use rust_i18n::t;
+
+/// Shows the downloads page, aimed at instance `target` and searching
+/// `query` when given. Dispatched by the Mods tab's "在线获取" (with the
+/// instance) and by the global search's online group (with the words).
+/// The shell's root handles it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Action)]
+#[action(namespace = patina, no_json)]
+pub struct OpenDownloads {
+    /// The id of the instance to install into.
+    pub target: Option<String>,
+    /// What to search for.
+    pub query: Option<String>,
+}
 
 /// A destination of the left rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -192,6 +192,12 @@ impl InstancesPage {
         &self.detail
     }
 
+    /// The shell shows this page (`shown`) or another one.
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        self.detail
+            .update(cx, |detail, cx| detail.set_page_shown(shown, cx));
+    }
+
     /// Switches the detail's tab, when a healthy instance shows one.
     fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(

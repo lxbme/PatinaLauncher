@@ -26,6 +26,7 @@ use super::{
     HEADER_ICON, HEADER_TITLE, icon_for, instance_icon, loader_color, loader_full, now_secs,
     time_ago,
 };
+use crate::content::{ModsChanged, ModsEvents, ModsTab};
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
 use crate::launch::{LogView, OpState, RunState, stop_dialog};
@@ -171,6 +172,11 @@ pub struct DetailView {
     /// The settings tab of the selected instance, made when it is first
     /// shown.
     settings: Option<Entity<SettingsForm>>,
+    /// The Mods tab of the selected instance, made when it is first shown.
+    mods: Option<Entity<ModsTab>>,
+    /// Whether the instances page is the one on show (the shell may show
+    /// another): a tab on a hidden page does no background listing.
+    page_shown: bool,
     /// The tab strip's scroll: English labels need more than the narrowest
     /// detail pane, so the strip scrolls rather than cutting tabs off.
     tabs_scroll: ScrollHandle,
@@ -182,8 +188,9 @@ pub struct DetailView {
     /// The tab content's region, to tell whether the keyboard is in it.
     body_focus: FocusHandle,
     /// The model (the selection, the list) and its activity (the header's
-    /// operation and run state).
-    _observe: [Subscription; 2],
+    /// operation and run state), and the Mods tabs' changes (the tab
+    /// strip's mod count).
+    _observe: [Subscription; 3],
 }
 
 impl DetailView {
@@ -198,6 +205,10 @@ impl DetailView {
         let _observe = [
             cx.observe(&model, |this, _, cx| this.sync_stats(cx)),
             cx.observe(&activity, |this, _, cx| this.sync_stats(cx)),
+            cx.subscribe(
+                &ModsEvents::entity(cx),
+                |this, _, event: &ModsChanged, cx| this.mods_changed(&event.instance_id, cx),
+            ),
         ];
         let mut this = Self {
             model,
@@ -207,6 +218,8 @@ impl DetailView {
             log: None,
             versions: None,
             settings: None,
+            mods: None,
+            page_shown: true,
             tabs_scroll: ScrollHandle::new(),
             overview_scroll: ScrollHandle::new(),
             page_focus,
@@ -237,6 +250,23 @@ impl DetailView {
         self.log.as_ref()
     }
 
+    /// The Mods tab of the selected instance, once the tab has been shown
+    /// for the selection.
+    pub fn mods_view(&self) -> Option<&Entity<ModsTab>> {
+        self.mods.as_ref()
+    }
+
+    /// Shows the Mods tab with mod file `file_name` scrolled to and
+    /// highlighted (the global search's "installed mods" hits). The caller
+    /// selects the instance first.
+    pub fn show_mod(&mut self, file_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_tab_in(DetailTab::Mods, window, cx);
+        self.sync_mods(window, cx);
+        if let Some(mods) = self.mods.clone() {
+            mods.update(cx, |mods, cx| mods.focus_file(file_name, window, cx));
+        }
+    }
+
     /// Switches to `tab`, saving what was typed in the settings form first.
     /// The keyboard moves to the instances page when it was in the tab
     /// left behind or outside the page, so the tab keys keep working.
@@ -261,7 +291,9 @@ impl DetailView {
 
     pub fn set_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
         if self.tab != tab {
+            let was_shown = self.mods_shown();
             self.tab = tab;
+            self.sync_mods_shown(was_shown, cx);
             // A tab chosen out of view (scrolled away) comes into view.
             if let Some(ix) = DetailTab::ALL.iter().position(|t| *t == tab) {
                 self.tabs_scroll.scroll_to_item(ix);
@@ -324,6 +356,84 @@ impl DetailView {
             let model = self.model.clone();
             self.settings = Some(cx.new(|cx| SettingsForm::new(model, id, window, cx)));
         }
+    }
+
+    /// The shell shows the instances page (`shown`) or another page. The
+    /// Mods tab lists its folder again when it comes back into view, and
+    /// not while out of it.
+    pub fn set_page_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        let was_shown = self.mods_shown();
+        self.page_shown = shown;
+        self.sync_mods_shown(was_shown, cx);
+    }
+
+    /// Whether the Mods tab is in view: its tab chosen on the page on show.
+    fn mods_shown(&self) -> bool {
+        self.page_shown && self.tab == DetailTab::Mods
+    }
+
+    /// Tells the Mods tab of the selection that it came into view (it lists
+    /// again) or went out of it, when that changed since `was_shown`. One
+    /// of another instance is replaced when drawn.
+    fn sync_mods_shown(&mut self, was_shown: bool, cx: &mut Context<Self>) {
+        let shown = self.mods_shown();
+        if shown == was_shown {
+            return;
+        }
+        let selected = self.model.read(cx).selected().map(str::to_owned);
+        let mods =
+            (self.mods.clone()).filter(|m| Some(m.read(cx).instance_id()) == selected.as_deref());
+        if let Some(mods) = mods {
+            if shown {
+                mods.update(cx, |mods, cx| mods.shown(cx));
+            } else {
+                mods.update(cx, |mods, _| mods.hidden());
+            }
+        }
+    }
+
+    /// Makes the Mods tab follow the selection; made only when the tab is
+    /// shown (it needs the window).
+    fn sync_mods(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let instance = match self.model.read(cx).selected_entry() {
+            Some(Entry::Healthy(instance)) => instance.clone(),
+            _ => return,
+        };
+        let current = self
+            .mods
+            .as_ref()
+            .is_some_and(|v| v.read(cx).instance_id() == instance.id);
+        if !current {
+            let model = self.model.clone();
+            self.mods = Some(cx.new(|cx| ModsTab::new(model, instance, window, cx)));
+        }
+    }
+
+    /// One of the Mods tabs changed instance `id`'s mods: the tab strip's
+    /// count follows.
+    fn mods_changed(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.stats.id.as_deref() == Some(id) {
+            self.recount_stats(cx);
+        }
+    }
+
+    /// Counts the selected instance's mods and worlds again, keeping the
+    /// size's walk schedule; after a read in flight when one runs.
+    pub fn recount_stats(&mut self, cx: &mut Context<Self>) {
+        let Some(Entry::Healthy(instance)) = self.model.read(cx).selected_entry() else {
+            return;
+        };
+        if self.stats.id.as_deref() != Some(instance.id.as_str()) {
+            // Another instance's stats are read anyway.
+            return;
+        }
+        if self.stats.reading {
+            self.stats.again = true;
+            return;
+        }
+        let instance = instance.clone();
+        self.read_stats(instance, false, cx);
+        cx.notify();
     }
 
     /// Makes the versions tab follow the selection.
@@ -831,6 +941,10 @@ impl DetailView {
                 .size_full()
                 .children(self.settings.clone())
                 .into_any_element(),
+            DetailTab::Mods => div()
+                .size_full()
+                .children(self.mods.clone())
+                .into_any_element(),
             DetailTab::Overview => overview::render(
                 instance,
                 self.stats(&instance.id),
@@ -844,8 +958,10 @@ impl DetailView {
 
 impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.tab == DetailTab::Settings {
-            self.sync_settings(window, cx);
+        match self.tab {
+            DetailTab::Settings => self.sync_settings(window, cx),
+            DetailTab::Mods => self.sync_mods(window, cx),
+            _ => {}
         }
         let bg = cx.theme().background;
         let model = self.model.read(cx);
