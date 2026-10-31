@@ -2344,6 +2344,8 @@ struct FakeGames {
     warnings: Vec<PrepareWarning>,
     fail: Option<fn() -> SessionError>,
     prepares: std::sync::atomic::AtomicUsize,
+    /// The Java settings of each instance prepared.
+    seen: std::sync::Mutex<Vec<Option<patina_core::config::JavaSettings>>>,
 }
 
 impl FakeGames {
@@ -2369,7 +2371,12 @@ impl FakeGames {
             warnings,
             fail,
             prepares: Default::default(),
+            seen: Default::default(),
         }
+    }
+
+    fn seen(&self) -> Vec<Option<patina_core::config::JavaSettings>> {
+        self.seen.lock().unwrap().clone()
     }
 
     fn prepares(&self) -> usize {
@@ -2388,6 +2395,10 @@ impl LaunchBackend for FakeGames {
         _: LaunchAccount,
         _: ProgressSink,
     ) -> futures::future::BoxFuture<'static, Result<PendingLaunch, SessionError>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(inst.config.java_override.clone());
         self.prepares
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(fail) = self.fail {
@@ -3502,4 +3513,705 @@ fn creating_with_a_loader_installs_through_version_ops(cx: &mut TestAppContext) 
             replace_existing: false,
         }]
     );
+}
+
+// ---- Settings tab ----
+
+use patina_app::instances::{SettingsForm, seed_java_list};
+use patina_core::config::JavaSettings;
+use patina_core::instance::{InstanceConfig, WindowSize};
+use patina_core::java::JavaInstall;
+use patina_core::jvm::GcPreset;
+
+/// Scrolls the settings tab until element `id` (if drawn at all) is in view.
+fn reveal(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+    let id = id.into();
+    for _ in 0..40 {
+        let Some(found) = element(app, cx, id.clone()) else {
+            return;
+        };
+        if found.visible() {
+            return;
+        }
+        let top = element(app, cx, "settings-tab").map_or(px(0.), |tab| tab.bounds().top());
+        let up = found.bounds().center().y < top;
+        let dy = if up { px(120.) } else { px(-120.) };
+        cx.update_window(app.handle, |_, window, cx| {
+            window.scroll(
+                "settings-tab",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), dy)),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+/// [`click`], after scrolling to the element.
+fn sclick(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+    let id = id.into();
+    reveal(app, cx, id.clone());
+    click(app, cx, id);
+}
+
+/// [`shows`], after scrolling to the element.
+fn sshows(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> bool {
+    let id = id.into();
+    reveal(app, cx, id.clone());
+    shows(app, cx, id)
+}
+
+/// Makes the main window the active one: focus changes (a field losing the
+/// keyboard) reach the fields only in an active window.
+fn activate(app: &Booted, cx: &mut TestAppContext) {
+    cx.update_window(app.handle, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn java_install(path: &str, major: u32) -> JavaInstall {
+    JavaInstall {
+        path: path.into(),
+        major,
+        version: format!("{major}.0.1"),
+        is_64bit: true,
+    }
+}
+
+/// Boots over `names` (the first is selected), with the detected Java
+/// installs `installs`, and shows the settings tab.
+fn settings_app(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    names: &[&str],
+    installs: Vec<JavaInstall>,
+) -> (Booted, Entity<InstancesModel>, InstanceStore) {
+    let store = InstanceStore::new(DataDirs::new(dir).instances());
+    for name in names {
+        store.create(name, "1.21.1").unwrap();
+    }
+    let app = boot(cx, dir, AppSettings::default());
+    let model = open_settings(&app, cx, installs);
+    (app, model, store)
+}
+
+/// Shows the settings tab of the booted app.
+fn open_settings(
+    app: &Booted,
+    cx: &mut TestAppContext,
+    installs: Vec<JavaInstall>,
+) -> Entity<InstancesModel> {
+    cx.update(|cx| seed_java_list(installs, cx));
+    let model = instances_model(app, cx);
+    list_settled(&model, cx);
+    activate(app, cx);
+    sclick(app, cx, "tab-settings");
+    assert!(sshows(app, cx, "settings-tab"));
+    model
+}
+
+fn settings_form(app: &Booted, cx: &mut TestAppContext) -> Entity<SettingsForm> {
+    cx.update(|cx| {
+        let page = app.root.read(cx).instances().read(cx);
+        page.detail().read(cx).settings_view().cloned().unwrap()
+    })
+}
+
+fn saved(store: &InstanceStore, id: &str) -> InstanceConfig {
+    store.load(id).unwrap().config
+}
+
+fn saved_java(store: &InstanceStore, id: &str) -> Option<JavaSettings> {
+    saved(store, id).java_override
+}
+
+/// Turns "使用全局设置" off and waits for the override.
+fn override_on(app: &Booted, cx: &mut TestAppContext, store: &InstanceStore, id: &str) {
+    sclick(app, cx, "settings-use-global");
+    settle(cx, |_| saved_java(store, id).is_some());
+    cx.run_until_parked();
+}
+
+/// Replaces the text of the input `id`.
+fn replace_text(app: &Booted, cx: &mut TestAppContext, id: &'static str, text: &str) {
+    sclick(app, cx, id);
+    press(app, cx, "secondary-a");
+    type_text(app, cx, text);
+}
+
+/// Moves the keyboard away from the field being edited, so it commits.
+fn blur(app: &Booted, cx: &mut TestAppContext) {
+    sclick(app, cx, "settings-name");
+    // The focus change reaches the fields they lost it on the next frame.
+    cx.update_window(app.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn radio(
+    app: &Booted,
+    cx: &mut TestAppContext,
+    group: &'static str,
+    ix: usize,
+) -> Option<ElementSnapshot> {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within(group).try_find(ix)
+    })
+    .unwrap()
+}
+
+fn click_radio(app: &Booted, cx: &mut TestAppContext, group: &'static str, ix: usize) {
+    reveal(app, cx, group);
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within(group).click(ix, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn radio_disabled(app: &Booted, cx: &mut TestAppContext, group: &'static str, ix: usize) -> bool {
+    radio(app, cx, group, ix)
+        .expect("the radio is drawn")
+        .disabled()
+        == Some(true)
+}
+
+#[gpui_kit::test]
+fn override_toggle_writes_java_override(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    // The global config the override starts from.
+    std::fs::write(
+        DataDirs::new(tmp.path()).config_file(),
+        "[java]\nmin_mem_mib = 2048\nextra_jvm_args = \"-Dglobal=1\"\n",
+    )
+    .unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    assert_eq!(saved_java(&store, "Alpha"), None);
+    assert!(!sshows(&app, cx, "settings-min-mem"), "nothing to edit yet");
+
+    // Off: an override seeded from the global config.
+    sclick(&app, cx, "settings-use-global");
+    settle(cx, |_| saved_java(&store, "Alpha").is_some());
+    let java = saved_java(&store, "Alpha").unwrap();
+    assert_eq!(java.min_mem_mib, 2048);
+    assert_eq!(java.extra_jvm_args, "-Dglobal=1");
+    settle(cx, |cx| {
+        element(&app, cx, "settings-min-mem").and_then(|e| e.value().map(str::to_owned))
+            == Some("2048".into())
+    });
+
+    // On: the override goes.
+    sclick(&app, cx, "settings-use-global");
+    settle(cx, |_| saved_java(&store, "Alpha").is_none());
+    settle(cx, |cx| !sshows(&app, cx, "settings-min-mem"));
+}
+
+#[gpui_kit::test]
+fn invalid_jvm_args_not_saved(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+
+    sclick(&app, cx, "settings-args");
+    type_text(&app, cx, "-Xmx4G");
+    assert!(
+        sshows(&app, cx, "settings-args-error"),
+        "said next to the field"
+    );
+    blur(&app, cx);
+    cx.run_until_parked();
+    assert_eq!(saved_java(&store, "Alpha").unwrap().extra_jvm_args, "");
+    assert!(sshows(&app, cx, "settings-args-error"));
+
+    // Fixed: the error goes and the value is saved.
+    sclick(&app, cx, "settings-args");
+    press(&app, cx, "secondary-a");
+    type_text(&app, cx, "-Dfoo=bar");
+    assert!(!sshows(&app, cx, "settings-args-error"));
+    blur(&app, cx);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().extra_jvm_args == "-Dfoo=bar"
+    });
+}
+
+#[gpui_kit::test]
+fn min_over_max_rejected(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+
+    replace_text(&app, cx, "settings-max-mem", "2048");
+    replace_text(&app, cx, "settings-min-mem", "4096");
+    blur(&app, cx);
+    assert!(sshows(&app, cx, "settings-memory-error"));
+    cx.run_until_parked();
+    let java = saved_java(&store, "Alpha").unwrap();
+    assert_eq!(
+        (java.min_mem_mib, java.max_mem_mib),
+        (512, Some(2048)),
+        "only the maximum"
+    );
+
+    // Not a number is rejected too.
+    replace_text(&app, cx, "settings-min-mem", "lots");
+    blur(&app, cx);
+    assert!(sshows(&app, cx, "settings-memory-error"));
+
+    // A consistent pair saves, and "自动" clears the maximum.
+    replace_text(&app, cx, "settings-min-mem", "1024");
+    blur(&app, cx);
+    assert!(!sshows(&app, cx, "settings-memory-error"));
+    settle(cx, |_| {
+        let j = saved_java(&store, "Alpha").unwrap();
+        (j.min_mem_mib, j.max_mem_mib) == (1024, Some(2048))
+    });
+    sclick(&app, cx, "settings-max-auto");
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().max_mem_mib.is_none()
+    });
+}
+
+#[gpui_kit::test]
+fn gc_incompatible_disabled_for_java8(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let installs = vec![
+        java_install("/opt/j8/bin/java", 8),
+        java_install("/opt/j21/bin/java", 21),
+    ];
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], installs);
+    override_on(&app, cx, &store, "Alpha");
+
+    // Choose Java 8 (managed is 0, then the detected ones).
+    click_radio(&app, cx, "settings-java", 1);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().java_path == Some("/opt/j8/bin/java".into())
+    });
+    cx.run_until_parked();
+    assert!(!radio_disabled(&app, cx, "settings-gc", 0));
+    assert!(!radio_disabled(&app, cx, "settings-gc", 1), "G1 runs on 8");
+    assert!(radio_disabled(&app, cx, "settings-gc", 2), "ZGC needs 21");
+    assert!(sshows(&app, cx, "settings-gc-reason-2"));
+    assert_eq!(
+        label_of(&app, cx, "settings-gc-reason-2").as_deref(),
+        Some("Generational ZGC needs Java 21 or newer")
+    );
+
+    // A disabled preset cannot be picked.
+    click_radio(&app, cx, "settings-gc", 2);
+    cx.run_until_parked();
+    assert_eq!(
+        saved_java(&store, "Alpha").unwrap().gc_preset,
+        GcPreset::None
+    );
+
+    // Java 21 allows it; moving back to 8 resets it.
+    click_radio(&app, cx, "settings-java", 2);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().java_path == Some("/opt/j21/bin/java".into())
+    });
+    cx.run_until_parked();
+    assert!(!radio_disabled(&app, cx, "settings-gc", 2));
+    click_radio(&app, cx, "settings-gc", 2);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().gc_preset == GcPreset::GenerationalZgc
+    });
+    click_radio(&app, cx, "settings-java", 1);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().gc_preset == GcPreset::None
+    });
+}
+
+#[gpui_kit::test]
+fn window_size_bounds(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    assert!(!sshows(&app, cx, "settings-width"), "default has no inputs");
+
+    // 自定义 starts from the game's own default size.
+    click_radio(&app, cx, "settings-window-mode", 1);
+    settle(cx, |_| saved(&store, "Alpha").window.is_some());
+    assert_eq!(
+        saved(&store, "Alpha").window,
+        Some(WindowSize {
+            width: 854,
+            height: 480
+        })
+    );
+    settle(cx, |cx| sshows(&app, cx, "settings-width"));
+
+    // Out of range: said next to the field, not saved.
+    replace_text(&app, cx, "settings-width", "100");
+    blur(&app, cx);
+    assert!(sshows(&app, cx, "settings-window-error"));
+    replace_text(&app, cx, "settings-width", "20000");
+    blur(&app, cx);
+    assert!(sshows(&app, cx, "settings-window-error"));
+    replace_text(&app, cx, "settings-height", "200");
+    blur(&app, cx);
+    cx.run_until_parked();
+    assert_eq!(saved(&store, "Alpha").window.unwrap().width, 854);
+    assert_eq!(saved(&store, "Alpha").window.unwrap().height, 480);
+
+    // In range on both: saved.
+    replace_text(&app, cx, "settings-width", "1280");
+    replace_text(&app, cx, "settings-height", "720");
+    blur(&app, cx);
+    assert!(!sshows(&app, cx, "settings-window-error"));
+    settle(cx, |_| {
+        saved(&store, "Alpha").window
+            == Some(WindowSize {
+                width: 1280,
+                height: 720,
+            })
+    });
+
+    // 默认 drops it.
+    click_radio(&app, cx, "settings-window-mode", 0);
+    settle(cx, |_| saved(&store, "Alpha").window.is_none());
+}
+
+#[gpui_kit::test]
+fn neoforge_section_only_for_neoforge(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = DataDirs::new(tmp.path());
+    let store = InstanceStore::new(data.instances());
+    for name in ["Alpha", "Beta", "Gamma"] {
+        store.create(name, "1.21.1").unwrap();
+    }
+    set_loader(&store, "Beta", ComponentUid::Neoforge);
+    set_loader(&store, "Gamma", ComponentUid::Neoforge);
+    let gamma_fml = store
+        .load("Gamma")
+        .unwrap()
+        .game_dir()
+        .join("config/fml.toml");
+    std::fs::create_dir_all(gamma_fml.parent().unwrap()).unwrap();
+    std::fs::write(&gamma_fml, "this is [not toml").unwrap();
+    let beta_fml = store
+        .load("Beta")
+        .unwrap()
+        .game_dir()
+        .join("config/fml.toml");
+
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    cx.update(|cx| seed_java_list(vec![], cx));
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    activate(&app, cx);
+    sclick(&app, cx, "tab-settings");
+
+    // Vanilla: no section.
+    assert_eq!(selected(&model, cx).as_deref(), Some("Alpha"));
+    assert!(sshows(&app, cx, "settings-danger"));
+    assert!(!sshows(&app, cx, "settings-neoforge"));
+
+    // NeoForge: the switch reads and writes fml.toml.
+    sclick(&app, cx, row_id("Beta"));
+    settle(cx, |cx| sshows(&app, cx, "settings-neoforge"));
+    settle(cx, |cx| !disabled(&app, cx, "settings-early-window"));
+    assert!(!sshows(&app, cx, "settings-neoforge-error"));
+    sclick(&app, cx, "settings-early-window");
+    settle(cx, |_| {
+        std::fs::read_to_string(&beta_fml).is_ok_and(|t| t.contains("earlyWindowControl = false"))
+    });
+
+    // A file that does not parse: the error, and the switch is unavailable.
+    sclick(&app, cx, row_id("Gamma"));
+    settle(cx, |cx| sshows(&app, cx, "settings-neoforge-error"));
+    assert!(disabled(&app, cx, "settings-early-window"));
+    sclick(&app, cx, "settings-early-window");
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(&gamma_fml).unwrap(),
+        "this is [not toml"
+    );
+}
+
+#[gpui_kit::test]
+fn delete_disabled_while_running(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, store) = settings_app(cx, tmp.path(), &["Alpha", "Beta"], vec![]);
+    assert_eq!(selected(&model, cx).as_deref(), Some("Alpha"));
+
+    // Running: disabled, with the reason beside it; so is renaming.
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    cx.run_until_parked();
+    assert!(disabled(&app, cx, "settings-delete"));
+    assert_eq!(
+        label_of(&app, cx, "settings-delete-reason").as_deref(),
+        Some("The game is running")
+    );
+    assert_eq!(
+        label_of(&app, cx, "settings-name-reason").as_deref(),
+        Some("The game is running")
+    );
+    replace_text(&app, cx, "settings-name", "Nope");
+    press(&app, cx, "enter");
+    cx.run_until_parked();
+    assert_eq!(
+        saved(&store, "Alpha").name,
+        "Alpha",
+        "not renamed while running"
+    );
+    sclick(&app, cx, "settings-delete");
+    assert!(!sshows(&app, cx, "dialog"));
+
+    // Idle again: asks first, and 取消 keeps it.
+    model.update(cx, |m, cx| m.set_run_state("Alpha", None, cx));
+    cx.run_until_parked();
+    assert!(!disabled(&app, cx, "settings-delete"));
+    sclick(&app, cx, "settings-delete");
+    assert!(sshows(&app, cx, "dialog"));
+    assert_eq!(
+        dialog_label(&app, cx, "settings-delete-title"),
+        "Delete “Alpha”?"
+    );
+    dialog_click(&app, cx, "cancel");
+    assert!(!sshows(&app, cx, "dialog"));
+    cx.run_until_parked();
+    assert!(store.load("Alpha").is_ok());
+
+    // 删除 deletes it and selects the next one.
+    let changed = Rc::new(std::cell::Cell::new(0));
+    let _subscription = cx.update(|cx| {
+        let changed = changed.clone();
+        cx.subscribe(&model, move |_, _: &InstancesChanged, _| {
+            changed.set(changed.get() + 1)
+        })
+    });
+    sclick(&app, cx, "settings-delete");
+    dialog_click(&app, cx, "ok");
+    settle(cx, |cx| {
+        selected(&model, cx).as_deref() == Some("Beta")
+            && model.read_with(cx, |m, _| m.instances().len() == 1)
+    });
+    assert!(store.load("Alpha").is_err());
+    assert!(store.load("Beta").is_ok());
+    assert_eq!(changed.get(), 1, "the status bar is told");
+}
+
+#[gpui_kit::test]
+fn name_and_icon_save(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+
+    replace_text(&app, cx, "settings-name", "Renamed");
+    press(&app, cx, "enter");
+    settle(cx, |_| saved(&store, "Alpha").name == "Renamed");
+
+    // An empty name is refused next to the field and the input stays.
+    sclick(&app, cx, "settings-name");
+    press(&app, cx, "secondary-a");
+    press(&app, cx, "backspace");
+    press(&app, cx, "enter");
+    assert!(sshows(&app, cx, "settings-name-error"));
+    assert_eq!(saved(&store, "Alpha").name, "Renamed");
+    replace_text(&app, cx, "settings-name", "Again");
+    press(&app, cx, "enter");
+    sclick(&app, cx, "settings-icon-toggle");
+    settle(cx, |cx| !sshows(&app, cx, "settings-name-error"));
+    settle(cx, |_| saved(&store, "Alpha").name == "Again");
+
+    // The icon picker saves through the model.
+    sclick(&app, cx, pick_id("sword"));
+    settle(cx, |_| {
+        saved(&store, "Alpha").icon == Some(InstanceIcon::Builtin("sword".into()))
+    });
+}
+
+#[gpui_kit::test]
+fn typed_edits_are_saved_before_launch(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    with_account(tmp.path());
+    let backend = FakeGames::failing(|| SessionError::Io {
+        path: "/nowhere".into(),
+        error: "stop here".into(),
+    });
+    let app = boot_games(cx, tmp.path(), backend.clone());
+    open_settings(&app, cx, vec![]);
+    override_on(&app, cx, &store, "Alpha");
+
+    // Typed, never committed: the launch saves it first and uses it.
+    replace_text(&app, cx, "settings-max-mem", "3000");
+    click(&app, cx, "launch");
+    settle(cx, |_| backend.prepares() == 1);
+    assert_eq!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(3000));
+    assert_eq!(backend.seen()[0].as_ref().unwrap().max_mem_mib, Some(3000));
+}
+
+#[gpui_kit::test]
+fn typed_edits_are_saved_on_selection_and_tab_change(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha", "Beta"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+
+    replace_text(&app, cx, "settings-max-mem", "2048");
+    click(&app, cx, row_id("Beta"));
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().max_mem_mib == Some(2048)
+    });
+    assert_eq!(saved(&store, "Beta").java_override, None);
+
+    click(&app, cx, row_id("Alpha"));
+    settle(cx, |cx| sshows(&app, cx, "settings-args"));
+    replace_text(&app, cx, "settings-min-mem", "1024");
+    sclick(&app, cx, "settings-args");
+    type_text(&app, cx, "-Dx=1");
+    click(&app, cx, "tab-overview");
+    settle(cx, |_| {
+        let java = saved_java(&store, "Alpha").unwrap();
+        java.min_mem_mib == 1024 && java.extra_jvm_args == "-Dx=1"
+    });
+
+    // An invalid edit stays in its field, with its error, and is not saved.
+    click(&app, cx, "tab-settings");
+    sclick(&app, cx, "settings-args");
+    press(&app, cx, "secondary-a");
+    type_text(&app, cx, "-Xmx9G");
+    click(&app, cx, "tab-overview");
+    click(&app, cx, "tab-settings");
+    assert!(sshows(&app, cx, "settings-args-error"));
+    assert_eq!(saved_java(&store, "Alpha").unwrap().extra_jvm_args, "-Dx=1");
+}
+
+#[gpui_kit::test]
+fn global_toggle_keeps_the_discarded_override(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    replace_text(&app, cx, "settings-max-mem", "4096");
+    blur(&app, cx);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().max_mem_mib == Some(4096)
+    });
+
+    sclick(&app, cx, "settings-use-global");
+    settle(cx, |_| saved_java(&store, "Alpha").is_none());
+    // Off again: the same settings come back.
+    sclick(&app, cx, "settings-use-global");
+    settle(cx, |_| saved_java(&store, "Alpha").is_some());
+    assert_eq!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(4096));
+}
+
+#[gpui_kit::test]
+fn gc_options_wait_for_a_known_java(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(
+        cx,
+        tmp.path(),
+        &["Alpha"],
+        vec![java_install("/opt/j21/bin/java", 21)],
+    );
+    override_on(&app, cx, &store, "Alpha");
+
+    // The Minecraft version is not installed here, so the managed Java's
+    // version stays unknown: only the preset needing more than Java 8 is off.
+    settle(cx, |cx| sshows(&app, cx, "settings-gc-unknown"));
+    assert!(!radio_disabled(&app, cx, "settings-gc", 0));
+    assert!(
+        !radio_disabled(&app, cx, "settings-gc", 1),
+        "G1 runs on any Java"
+    );
+    assert!(radio_disabled(&app, cx, "settings-gc", 2), "ZGC needs 21");
+    assert!(!radio_disabled(&app, cx, "settings-gc", 3));
+
+    // A known Java opens them.
+    click_radio(&app, cx, "settings-java", 1);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().java_path.is_some()
+    });
+    settle(cx, |cx| !sshows(&app, cx, "settings-gc-unknown"));
+    assert!(!radio_disabled(&app, cx, "settings-gc", 2));
+}
+
+#[gpui_kit::test]
+fn a_saved_gc_preset_is_reset_when_the_java_turns_out_old(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let mut inst = store.create("Alpha", "1.21.1").unwrap();
+    inst.config.java_override = Some(JavaSettings {
+        java_path: Some("/opt/j8/bin/java".into()),
+        gc_preset: GcPreset::GenerationalZgc,
+        ..Default::default()
+    });
+    store.save(&inst).unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    // Not detected yet, and the file does not run: the major is unknown.
+    open_settings(&app, cx, vec![]);
+    cx.run_until_parked();
+    assert_eq!(
+        saved_java(&store, "Alpha").unwrap().gc_preset,
+        GcPreset::GenerationalZgc
+    );
+    assert_eq!(notification_count(&app, cx), 0);
+
+    // Detection finds it is Java 8: the preset cannot run on it.
+    cx.update(|cx| seed_java_list(vec![java_install("/opt/j8/bin/java", 8)], cx));
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().gc_preset == GcPreset::None
+    });
+    settle(cx, |cx| notification_count(&app, cx) == 1);
+}
+
+#[gpui_kit::test]
+fn a_file_that_is_no_java_is_refused(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    let form = settings_form(&app, cx);
+    cx.update_window(app.handle, |_, window, cx| {
+        form.update(cx, |form, cx| {
+            form.use_java_file("/nonexistent/not-a-java".into(), window, cx)
+        })
+    })
+    .unwrap();
+    settle(cx, |cx| sshows(&app, cx, "settings-java-error"));
+    assert_eq!(
+        label_of(&app, cx, "settings-java-error").as_deref(),
+        Some("That file isn’t a usable Java")
+    );
+    assert_eq!(saved_java(&store, "Alpha").unwrap().java_path, None);
+}
+
+#[gpui_kit::test]
+fn memory_has_an_upper_bound(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+
+    // 1,048,576 MiB (1 TiB) is the most accepted.
+    replace_text(&app, cx, "settings-max-mem", "1048577");
+    blur(&app, cx);
+    assert_eq!(
+        label_of(&app, cx, "settings-memory-error").as_deref(),
+        Some("Can’t exceed 1048576 MiB")
+    );
+    assert_eq!(saved_java(&store, "Alpha").unwrap().max_mem_mib, None);
+    replace_text(&app, cx, "settings-max-mem", "1048576");
+    blur(&app, cx);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().max_mem_mib == Some(1_048_576)
+    });
+}
+
+#[gpui_kit::test]
+fn a_failed_icon_save_shows_in_the_picker(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let junk = tmp.path().join("junk.png");
+    std::fs::write(&junk, b"definitely not a png").unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    sclick(&app, cx, "settings-icon-toggle");
+    sclick(&app, cx, "icon-upload");
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(move |_| Some(vec![junk]));
+    settle(cx, |cx| sshows(&app, cx, "icon-error"));
+    assert_eq!(saved(&store, "Alpha").icon, None);
 }

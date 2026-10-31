@@ -18,6 +18,7 @@ use rust_i18n::t;
 
 use super::model::{Entry, InstancesModel};
 use super::overview::{self, OverviewStats};
+use super::settings_tab::SettingsForm;
 use super::versions_tab::VersionsTab;
 use super::{
     HEADER_ICON, HEADER_TITLE, icon_for, instance_icon, loader_color, loader_full, now_secs,
@@ -130,6 +131,9 @@ pub struct DetailView {
     log: Option<Entity<LogView>>,
     /// The versions tab of the selected instance, made with the selection.
     versions: Option<Entity<VersionsTab>>,
+    /// The settings tab of the selected instance, made when it is first
+    /// shown.
+    settings: Option<Entity<SettingsForm>>,
     _observe: Subscription,
 }
 
@@ -143,6 +147,7 @@ impl DetailView {
             stats_task: Task::ready(()),
             log: None,
             versions: None,
+            settings: None,
             _observe,
         };
         this.sync_stats(cx);
@@ -158,9 +163,23 @@ impl DetailView {
         self.versions.as_ref()
     }
 
+    /// The settings tab's form, once the tab has been shown for the
+    /// selection.
+    pub fn settings_view(&self) -> Option<&Entity<SettingsForm>> {
+        self.settings.as_ref()
+    }
+
     /// The log tab's view, once the tab has been shown for the selection.
     pub fn log_view(&self) -> Option<&Entity<LogView>> {
         self.log.as_ref()
+    }
+
+    /// Switches to `tab`, saving what was typed in the settings form first.
+    pub fn set_tab_in(&mut self, tab: DetailTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(form) = self.settings.clone() {
+            form.update(cx, |form, cx| drop(form.flush(window, cx)));
+        }
+        self.set_tab(tab, cx);
     }
 
     pub fn set_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
@@ -195,6 +214,34 @@ impl DetailView {
         if !current {
             let model = self.model.clone();
             self.log = Some(cx.new(|cx| LogView::new(model, id, cx)));
+        }
+    }
+
+    /// Makes the settings form follow the selection; made only when the
+    /// tab is shown (it needs the window).
+    fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = match self.model.read(cx).selected_entry() {
+            Some(Entry::Healthy(instance)) => instance.id.clone(),
+            _ => return,
+        };
+        let current = self
+            .settings
+            .as_ref()
+            .is_some_and(|v| v.read(cx).instance_id() == id);
+        if !current {
+            // Nothing typed into the form of the instance left behind is
+            // lost: it is saved, and kept alive until that is done.
+            if let Some(old) = self.settings.take() {
+                let saved = old.update(cx, |form, cx| form.flush(window, cx));
+                window
+                    .spawn(cx, async move |_| {
+                        saved.await;
+                        drop(old);
+                    })
+                    .detach();
+            }
+            let model = self.model.clone();
+            self.settings = Some(cx.new(|cx| SettingsForm::new(model, id, window, cx)));
         }
     }
 
@@ -405,6 +452,9 @@ impl DetailView {
                 let busy = model.is_busy(&instance.id);
                 let starting = matches!(model.run_state(&instance.id), Some(RunState::Starting));
                 let (model, id) = (self.model.clone(), instance.id.clone());
+                // What was typed in the settings is saved before the launch
+                // reads the instance.
+                let form = (self.settings.clone()).filter(|f| f.read(cx).instance_id() == id);
                 Button::new("launch")
                     .custom(launch)
                     // A custom variant's resting fill is drawn at 20 %
@@ -419,8 +469,22 @@ impl DetailView {
                     .gap_1p5()
                     .text_size(rems(0.875))
                     .strong(FontWeight::SEMIBOLD, cx)
-                    .on_click(move |_, _, cx| {
-                        model.update(cx, |m, cx| m.launch(&id, cx));
+                    .on_click(move |_, window, cx| {
+                        let Some(form) = form.clone() else {
+                            model.update(cx, |m, cx| m.launch(&id, cx));
+                            return;
+                        };
+                        let saved = form.update(cx, |form, cx| form.flush(window, cx));
+                        let (model, id) = (model.clone(), id.clone());
+                        window
+                            .spawn(cx, async move |cx| {
+                                saved.await;
+                                cx.update(|_, cx| {
+                                    model.update(cx, |m, cx| m.launch(&id, cx));
+                                })
+                                .ok();
+                            })
+                            .detach();
                     })
             })
     }
@@ -617,8 +681,8 @@ impl DetailView {
                                 .bg(teal),
                         )
                     })
-                    .on_click(move |_, _, cx| {
-                        this.update(cx, |v, cx| v.set_tab(tab, cx)).ok();
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |v, cx| v.set_tab_in(tab, window, cx)).ok();
                     })
             }))
     }
@@ -656,6 +720,10 @@ impl DetailView {
                 .size_full()
                 .children(self.versions.clone())
                 .into_any_element(),
+            DetailTab::Settings => div()
+                .size_full()
+                .children(self.settings.clone())
+                .into_any_element(),
             DetailTab::Overview => overview::render(instance, self.stats(&instance.id), cx),
             tab => placeholder::page(tab.icon(), tab.label()).into_any_element(),
         }
@@ -663,7 +731,10 @@ impl DetailView {
 }
 
 impl Render for DetailView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.tab == DetailTab::Settings {
+            self.sync_settings(window, cx);
+        }
         let bg = cx.theme().background;
         let model = self.model.read(cx);
         let Some(Entry::Healthy(instance)) = model.selected_entry() else {

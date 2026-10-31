@@ -16,6 +16,7 @@ mod icon_picker;
 mod list;
 mod model;
 mod overview;
+mod settings_tab;
 mod version_picker;
 mod versions_tab;
 
@@ -47,6 +48,7 @@ pub use icon::{
 pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
 pub use model::{Entry, InstancesChanged, InstancesModel};
+pub use settings_tab::{SettingsForm, seed_java_list};
 pub use versions_tab::{Row as VersionsRow, VersionsTab};
 // The run state lives with the launch flow; listed here for the views.
 pub use crate::launch::RunState;
