@@ -9,6 +9,7 @@ pub mod content;
 pub mod core_bridge;
 pub mod disk_usage;
 pub mod downloads;
+pub mod fields;
 pub mod fonts;
 pub mod i18n;
 pub mod instances;
@@ -21,6 +22,7 @@ pub mod runtime;
 pub mod scale;
 pub mod search;
 pub mod settings;
+pub mod settings_page;
 pub mod shell;
 pub mod single_instance;
 pub mod theme;
@@ -43,13 +45,15 @@ const _: () = assert!(!patina_core::DEV_OFFLINE);
 pub const APP_ID: &str = "patina";
 
 /// Sets up the app-wide state the windows rely on: the settings, the CJK
-/// font, the zoom keys, the shell's, instances page's, downloads page's and log's keys and
-/// the accounts-changed signal. Call once, after
-/// `gpui_kit::init` and before [`open_main_window`].
+/// font, the zoom keys, the shell's, instances page's, downloads page's and log's keys,
+/// the multi-line fields' Tab and the accounts- and config-changed signals.
+/// Call once, after `gpui_kit::init` and the [`core_bridge::Core`] global,
+/// and before [`open_main_window`].
 pub fn init(settings: SettingsStore, cx: &mut App) {
     cx.set_global(settings);
     fonts::init(cx);
     scale::init(cx);
+    fields::init(cx);
     shell::init(cx);
     instances::init(cx);
     content::init(cx);
@@ -57,6 +61,10 @@ pub fn init(settings: SettingsStore, cx: &mut App) {
     search::init(cx);
     launch::log_view::init(cx);
     core_bridge::AccountsChanged::init(cx);
+    core_bridge::ConfigChanged::init(cx);
+    if cx.has_global::<core_bridge::Core>() {
+        core_bridge::ConfigChanged::follow_core(cx);
+    }
     cx.on_app_quit(|cx| {
         SettingsStore::flush(cx);
         async {}

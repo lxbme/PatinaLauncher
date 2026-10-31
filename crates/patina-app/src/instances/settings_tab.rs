@@ -39,7 +39,7 @@ use patina_core::config::JavaSettings;
 use patina_core::instance::{
     Instance, InstanceConfig, InstanceError, InstanceIcon, InstanceStore, WindowSize,
 };
-use patina_core::java::{JavaInstall, detect_all, probe};
+use patina_core::java::{JavaInstall, probe};
 use patina_core::jvm::{GcPreset, validate_extra_jvm_args};
 use patina_core::loader::LoaderKind;
 use rust_i18n::t;
@@ -58,31 +58,84 @@ const CONTENT_W: Rems = Rems(40.);
 const NUMBER_W: Rems = Rems(9.);
 /// What "自定义" starts from: Minecraft's own default window.
 const DEFAULT_WINDOW: (u32, u32) = (854, 480);
-/// The GC presets in the order they are listed.
 /// Largest memory value accepted, in MiB (1 TiB): far beyond any machine
 /// today, but it keeps the value inside what the JVM flags can express.
 pub const MAX_MEM_MIB: u32 = 1_048_576;
-const GC_PRESETS: [GcPreset; 4] = [
+/// The GC presets in the order they are listed.
+pub(crate) const GC_PRESETS: [GcPreset; 4] = [
     GcPreset::None,
     GcPreset::G1Aikar,
     GcPreset::GenerationalZgc,
     GcPreset::Custom,
 ];
 
+// --- the rules the global settings share -------------------------------------
+
+/// Reads the memory fields: the minimum, and the maximum (`None`, an empty
+/// field: automatic), or the localized reason they are not acceptable.
+/// Whole MiB, the minimum at least 1, neither above [`MAX_MEM_MIB`], and
+/// the minimum not above the maximum.
+pub(crate) fn parse_memory(min: &str, max: &str) -> Result<(u32, Option<u32>), String> {
+    let integer = || t!("instance_settings.mem_integer").to_string();
+    let min: u32 = min.trim().parse().map_err(|_| integer())?;
+    let too_big = || t!("instance_settings.mem_too_big", max = MAX_MEM_MIB).to_string();
+    if min == 0 {
+        return Err(t!("instance_settings.mem_min_zero").to_string());
+    }
+    if min > MAX_MEM_MIB {
+        return Err(too_big());
+    }
+    let max = match max.trim() {
+        "" => None,
+        text => Some(text.parse::<u32>().map_err(|_| integer())?),
+    };
+    if max.is_some_and(|max| max > MAX_MEM_MIB) {
+        return Err(too_big());
+    }
+    if max.is_some_and(|max| min > max) {
+        return Err(t!("instance_settings.mem_min_over_max").to_string());
+    }
+    Ok((min, max))
+}
+
+/// Whether GC `preset` may be chosen for a Java whose major is `major`.
+/// Without a known Java only the presets every Java Minecraft runs on (8
+/// and newer) can.
+fn gc_selectable(preset: GcPreset, major: Option<u32>) -> bool {
+    match major {
+        Some(m) => preset.is_compatible(m),
+        None => preset.min_java_major() <= 8,
+    }
+}
+
 // --- the detected Java installs, shared by the session ---------------------
 
-/// The Java installs found on this machine: looked for once per session, in
-/// the background, when a form first shows the Java choice.
+/// The Java installs found on this machine (`Core.detect_java`): looked
+/// for once per session, in the background, when a form or the settings
+/// page first shows them, and again on request ([`redetect_java`]).
 pub struct JavaList {
     installs: Option<Vec<JavaInstall>>,
     loading: bool,
+}
+
+impl JavaList {
+    /// The installs found, once looked for.
+    pub fn installs(&self) -> Option<&[JavaInstall]> {
+        self.installs.as_deref()
+    }
+
+    /// Whether a look is under way.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
 }
 
 struct JavaListGlobal(Entity<JavaList>);
 
 impl Global for JavaListGlobal {}
 
-fn java_list(cx: &mut App) -> Entity<JavaList> {
+/// The session's Java list.
+pub(crate) fn java_list(cx: &mut App) -> Entity<JavaList> {
     if let Some(global) = cx.try_global::<JavaListGlobal>() {
         return global.0.clone();
     }
@@ -105,19 +158,35 @@ pub fn seed_java_list(installs: Vec<JavaInstall>, cx: &mut App) {
 }
 
 /// Starts looking for Java installs unless that was done or is under way.
-fn detect_java(list: &Entity<JavaList>, cx: &mut App) {
-    let state = list.read(cx);
-    if state.installs.is_some() || state.loading {
+pub(crate) fn detect_java(list: &Entity<JavaList>, cx: &mut App) {
+    if list.read(cx).installs.is_some() {
         return;
     }
-    list.update(cx, |list, _| list.loading = true);
-    let job = run_blocking(cx, detect_all);
+    redetect_java(list, cx);
+}
+
+/// Looks for the Java installs again (the list shown meanwhile stays),
+/// unless a look is under way.
+pub(crate) fn redetect_java(list: &Entity<JavaList>, cx: &mut App) {
+    if list.read(cx).loading {
+        return;
+    }
+    list.update(cx, |list, cx| {
+        list.loading = true;
+        cx.notify();
+    });
+    let detect = Core::global(cx).detect_java.clone();
+    let job = run_blocking(cx, move || detect());
     let list = list.clone();
     cx.spawn(async move |cx| {
-        let found = job.await.unwrap_or_default();
+        let found = job.await.ok();
         list.update(cx, |list, cx| {
             list.loading = false;
-            list.installs = Some(found);
+            // A failed look keeps what was found before.
+            if let Some(found) = found {
+                list.installs = Some(found);
+            }
+            list.installs.get_or_insert_with(Vec::new);
             cx.notify();
         });
     })
@@ -239,18 +308,15 @@ impl SettingsForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let number = |window: &mut Window, cx: &mut Context<Self>, hint: String| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(hint))
-        };
+        let number =
+            |window: &mut Window, cx: &mut Context<Self>| cx.new(|cx| InputState::new(window, cx));
         let name = cx.new(|cx| InputState::new(window, cx));
-        let min_mem = number(window, cx, String::new());
-        let max_mem = number(
-            window,
-            cx,
-            t!("instance_settings.max_auto_placeholder").to_string(),
-        );
-        let width = number(window, cx, String::new());
-        let height = number(window, cx, String::new());
+        let min_mem = number(window, cx);
+        let max_mem = number(window, cx);
+        let auto = "instance_settings.max_auto_placeholder";
+        crate::i18n::localized_placeholder(&max_mem, auto, window, cx);
+        let width = number(window, cx);
+        let height = number(window, cx);
         let args = cx.new(|cx| TextareaState::new(window, cx));
         let current = match &model.read(cx).entry(&id) {
             Some(Entry::Healthy(instance)) => choice_of(instance),
@@ -730,28 +796,10 @@ impl SettingsForm {
     /// Reads the memory inputs: the minimum, and the maximum (`None` for
     /// automatic), or the reason they are not acceptable.
     fn read_memory(&self, cx: &App) -> Result<(u32, Option<u32>), String> {
-        let integer = || t!("instance_settings.mem_integer").to_string();
-        let min = self.min_mem.read(cx).value();
-        let min: u32 = min.trim().parse().map_err(|_| integer())?;
-        let too_big = || t!("instance_settings.mem_too_big", max = MAX_MEM_MIB).to_string();
-        if min == 0 {
-            return Err(t!("instance_settings.mem_min_zero").to_string());
-        }
-        if min > MAX_MEM_MIB {
-            return Err(too_big());
-        }
-        let max = self.max_mem.read(cx).value();
-        let max = match max.trim() {
-            "" => None,
-            text => Some(text.parse::<u32>().map_err(|_| integer())?),
-        };
-        if max.is_some_and(|max| max > MAX_MEM_MIB) {
-            return Err(too_big());
-        }
-        if max.is_some_and(|max| min > max) {
-            return Err(t!("instance_settings.mem_min_over_max").to_string());
-        }
-        Ok((min, max))
+        parse_memory(
+            &self.min_mem.read(cx).value(),
+            &self.max_mem.read(cx).value(),
+        )
     }
 
     fn commit_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1434,11 +1482,7 @@ impl SettingsForm {
         let major = self.java_major(java, cx);
         let unknown = self.java_unknown(java, cx);
         // Without a known Java only the presets that need none are open.
-        let compatible = |preset: GcPreset| match major {
-            Some(m) => preset.is_compatible(m),
-            // Every Java Minecraft runs on is at least 8.
-            None => preset.min_java_major() <= 8,
-        };
+        let compatible = |preset: GcPreset| gc_selectable(preset, major);
         let radios: Vec<Radio> = GC_PRESETS
             .iter()
             .map(|preset| {
@@ -1493,9 +1537,7 @@ impl SettingsForm {
     fn render_args(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         Self::field(t!("instance_settings.jvm_args").to_string(), cx)
             .child(
-                div()
-                    .id("settings-args")
-                    .test_support()
+                crate::fields::tab_leaves(div().id("settings-args").test_support())
                     .child(Textarea::new(&self.args).h(rems(5.5))),
             )
             .child(Self::hint(

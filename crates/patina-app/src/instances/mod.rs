@@ -54,7 +54,8 @@ pub use icon::{
 pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
 pub use model::{Entry, InstancesChanged, InstancesModel, RefreshFailed};
-pub use settings_tab::{SettingsForm, seed_java_list};
+pub(crate) use settings_tab::{GC_PRESETS, detect_java, java_list, parse_memory, redetect_java};
+pub use settings_tab::{JavaList, SettingsForm, seed_java_list};
 pub use versions_tab::{Incompatible, Row as VersionsRow, VersionsEvent, VersionsTab};
 // The run state lives with the launch flow; listed here for the views.
 pub use crate::launch::RunState;

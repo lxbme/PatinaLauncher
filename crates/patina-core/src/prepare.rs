@@ -384,14 +384,12 @@ impl Launcher {
                 Ok(java)
             }
             None => {
+                // Checked under the component's lock: a removal under way is
+                // waited for, never used half deleted.
                 let runtimes = ManagedRuntimes::new(self.data.runtimes());
-                let bin = if runtimes.is_installed(&req.component) {
-                    runtimes.java_bin(&req.component)
-                } else {
-                    runtimes
-                        .install(&self.downloader, &req.component, progress)
-                        .await?
-                };
+                let bin = runtimes
+                    .ensure(&self.downloader, &req.component, progress)
+                    .await?;
                 probe_blocking(bin).await
             }
         }

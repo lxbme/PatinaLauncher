@@ -298,11 +298,8 @@ impl VersionPicker {
     /// A picker with `chosen` marked; with `None` the latest release is
     /// chosen once the list has loaded. Starts loading the list.
     pub fn new(chosen: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("add_instance.search").to_string())
-                .clean_on_escape()
-        });
+        let search = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+        crate::i18n::localized_placeholder(&search, "add_instance.search", window, cx);
         let _search = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.rebuild_rows(cx);

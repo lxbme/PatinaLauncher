@@ -2,8 +2,10 @@
 //! use, version. Small, muted, `status_bar` fill.
 //!
 //! Everything but the version is read in the background; an item shows once
-//! it is known. The config and the runtime count are re-read at startup and
-//! whenever the window becomes active. The disk-use scan is heavier: one at a
+//! it is known. The config and the runtime count are re-read at startup,
+//! whenever the window becomes active and whenever the settings change
+//! ([`ConfigChanged`]). With the source, the latency the last speed test
+//! measured for the source in use is shown. The disk-use scan is heavier: one at a
 //! time, and on activation at most once per [`SCAN_INTERVAL`]; code that
 //! adds or removes instances calls [`StatusBar::refresh_now`].
 
@@ -23,7 +25,7 @@ use patina_core::instance::{InstanceError, InstanceStore};
 use patina_core::java::ManagedRuntimes;
 use rust_i18n::t;
 
-use crate::core_bridge::{Core, Revision, run_blocking};
+use crate::core_bridge::{ConfigChanged, Core, Revision, latency_text, mirror_name, run_blocking};
 use crate::disk_usage::{Walk, format_size};
 use crate::layout::{GUTTER, TEXT_SECONDARY};
 
@@ -133,6 +135,9 @@ impl ScanGate {
 /// The status bar view; owns what it shows.
 pub struct StatusBar {
     source: Option<SourceChoice>,
+    /// The source in use (its mirror id) and what the last speed test
+    /// measured for it.
+    latency: Option<(String, Option<Duration>)>,
     runtimes: Option<usize>,
     usage: Option<InstanceUsage>,
     /// Guards the config and runtime reads.
@@ -141,6 +146,7 @@ pub struct StatusBar {
     gate: ScanGate,
     scan: Task<()>,
     _activation: Subscription,
+    _config_changed: Subscription,
 }
 
 impl StatusBar {
@@ -151,8 +157,11 @@ impl StatusBar {
                 this.refresh(cx);
             }
         });
+        let epoch = ConfigChanged::epoch(cx);
+        let _config_changed = cx.observe(&epoch, |this, _, cx| this.read_quick(cx));
         let mut this = Self {
             source: None,
+            latency: None,
             runtimes: None,
             usage: None,
             revision: Revision::default(),
@@ -160,6 +169,7 @@ impl StatusBar {
             gate: ScanGate::default(),
             scan: Task::ready(()),
             _activation,
+            _config_changed,
         };
         this.refresh(cx);
         this
@@ -168,6 +178,12 @@ impl StatusBar {
     /// The configured download-source preference, once read.
     pub fn source(&self) -> Option<SourceChoice> {
         self.source
+    }
+
+    /// The source in use (its mirror id) and its latency in the last speed
+    /// test (`None`: no answer in time), once a test measured it.
+    pub fn latency(&self) -> Option<&(String, Option<Duration>)> {
+        self.latency.as_ref()
     }
 
     /// How many managed Java runtimes are installed, once counted.
@@ -222,6 +238,12 @@ impl StatusBar {
                 .ok();
             this.update(cx, |this, cx| {
                 if this.revision.is_current(id) {
+                    // Read after the config: by then the launcher follows it.
+                    let core = Core::global(cx);
+                    let mirror = core.launcher().downloader.mirror().id.clone();
+                    this.latency = (core.last_speed_test())
+                        .and_then(|test| test.latency(&mirror))
+                        .map(|latency| (mirror, latency));
                     // A failed read keeps what was shown.
                     this.source = source.or(this.source);
                     this.runtimes = runtimes.or(this.runtimes);
@@ -299,7 +321,16 @@ impl Render for StatusBar {
 
         let mut left: Vec<AnyElement> = Vec::new();
         if let Some(source) = self.source {
-            let text = t!("shell.status.source", source = source.display_name()).to_string();
+            let text = match &self.latency {
+                Some((mirror, latency)) => t!(
+                    "shell.status.source_latency",
+                    source = source.display_name(),
+                    mirror = mirror_name(mirror),
+                    latency = latency_text(*latency)
+                ),
+                None => t!("shell.status.source", source = source.display_name()),
+            }
+            .to_string();
             left.push(item("status-source", text).into_any_element());
         }
         if let Some(n) = self.runtimes {

@@ -12,16 +12,20 @@ use patina_core::accounts::login::{
     CancelToken, DeviceCode, DeviceCodeLogin, LoginError, LoginEvent,
 };
 use patina_core::content::online::{ContentSource, OnlineError, OnlinePage, OnlineQuery};
+use patina_core::download::{Mirror, measure_all};
 use patina_core::instance::InstanceStore;
+use patina_core::java::JavaInstall;
 use patina_core::loader::ops::{LoaderAction, OpOutcome};
 use patina_core::loader::{LoaderError, LoaderKind, LoaderVersion, VersionPick};
 use patina_core::meta::VersionManifest;
 use patina_core::paths::DataDirs;
+use patina_core::prepare::Launcher;
 use patina_core::progress::ProgressSink;
+use std::time::Duration;
 use tokio::runtime::Handle;
 
 use super::service::{Fakes, Startup};
-use super::{Catalog, Core, LaunchBackend, VersionOps};
+use super::{Catalog, Core, LaunchBackend, SpeedTest, VersionOps};
 
 /// A [`Core`] over `data` that lists versions from `catalog`. It loads the
 /// config and the accounts as the real one does and follows a configured
@@ -111,6 +115,42 @@ pub fn core_with_login(
         ..Fakes::default()
     };
     Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
+/// [`core`] whose speed tests go through `speed` (a [`ProbeSpeedTest`]
+/// against local servers) and whose Java detection finds `java`.
+pub fn core_with_speed_test(
+    rt: Handle,
+    data: DataDirs,
+    catalog: Arc<dyn Catalog>,
+    speed: Arc<dyn SpeedTest>,
+    java: Vec<JavaInstall>,
+) -> Core {
+    let fakes = Fakes {
+        catalog: Some(catalog),
+        speed_test: Some(speed),
+        detect_java: Some(Arc::new(move || java.clone())),
+        ..Fakes::default()
+    };
+    Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
+/// A speed test with its own HTTP client, probing `candidates` (mirrors
+/// that point at local servers, such as wiremock's) for `probe_url`. The
+/// launcher's client is not used: an offline core's reaches no host.
+pub struct ProbeSpeedTest {
+    pub client: reqwest::Client,
+    pub candidates: Vec<Mirror>,
+    pub probe_url: String,
+    pub timeout: Duration,
+}
+
+impl SpeedTest for ProbeSpeedTest {
+    fn measure(&self, _: Arc<Launcher>) -> BoxFuture<'static, Vec<(Mirror, Option<Duration>)>> {
+        let (client, candidates) = (self.client.clone(), self.candidates.clone());
+        let (probe_url, timeout) = (self.probe_url.clone(), self.timeout);
+        async move { measure_all(&client, &candidates, &probe_url, timeout).await }.boxed()
+    }
 }
 
 /// A sign-in that shows `code`, reports waiting, then waits until it is

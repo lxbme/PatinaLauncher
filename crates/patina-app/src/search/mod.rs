@@ -103,9 +103,8 @@ impl GlobalSearch {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(t!("shell.search.placeholder").to_string())
-        });
+        let input = cx.new(|cx| InputState::new(window, cx));
+        crate::i18n::localized_placeholder(&input, "shell.search.placeholder", window, cx);
         let instances = page.read(cx).model().clone();
         let model = cx.new(|cx| SearchModel::new(instances, window, cx));
         let _subscriptions = [
@@ -126,6 +125,11 @@ impl GlobalSearch {
             scroll: ScrollHandle::new(),
             _subscriptions,
         }
+    }
+
+    /// The search box.
+    pub fn input(&self) -> &Entity<InputState> {
+        &self.input
     }
 
     pub fn model(&self) -> &Entity<SearchModel> {

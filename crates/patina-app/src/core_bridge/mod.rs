@@ -12,6 +12,7 @@
 //!   [`Core::update_config`] and [`Core::with_accounts`]; the accounts change
 //!   only through [`Core::update_accounts`] and [`Core::reload_accounts`],
 //!   which then call [`AccountsChanged::bump`] so views re-read them;
+//!   config changes and speed tests signal [`ConfigChanged`] likewise;
 //! - a stream of progress reaches a view through [`forward_progress`], at most
 //!   about 30 times a second;
 //! - launches are prepared through `Core.launch_backend` ([`LaunchBackend`]),
@@ -23,16 +24,23 @@
 //!   if it is stale.
 
 mod accounts_changed;
+mod config_changed;
 mod launch;
 mod service;
+mod speed;
 mod task;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 mod version_ops;
 
 pub use accounts_changed::{AccountsChanged, AccountsEpoch};
+pub use config_changed::{ConfigChanged, ConfigEpoch};
 pub use launch::LaunchBackend;
-pub use service::{Catalog, Core, InitError, LoadError, LoadedAccounts, LoadedConfig};
+pub use service::{
+    Catalog, ConfigSaveError, ConfigSaved, Core, DetectJava, InitError, LoadError, LoadedAccounts,
+    LoadedConfig, SpeedTested, config_reason,
+};
+pub use speed::{MirrorProbe, SpeedTest, SpeedTestResult, latency_text, mirror_name};
 pub use task::{
     BridgeError, PROGRESS_MIN_GAP, Revision, RevisionId, forward_progress, run, run_blocking,
 };

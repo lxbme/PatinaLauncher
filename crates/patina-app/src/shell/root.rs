@@ -6,18 +6,18 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::future::Either;
-use gpui_kit::component::{ActiveTheme, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, Styled, Subscription, TestSupportExt, WeakEntity, Window, actions, div,
 };
 
-use super::placeholder;
 use super::{Nav, OpenDownloads, Rail, ShellState, StatusBar, TitleBarView};
 use crate::accounts::AccountsPage;
 use crate::downloads::DownloadsPage;
 use crate::fonts;
 use crate::instances::{InstancesChanged, InstancesPage};
+use crate::settings_page::SettingsPage;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use rust_i18n::t;
@@ -40,6 +40,7 @@ pub struct RootView {
     instances: Entity<InstancesPage>,
     downloads: Entity<DownloadsPage>,
     accounts: Entity<AccountsPage>,
+    settings: Entity<SettingsPage>,
     focus: FocusHandle,
     _observe: Subscription,
     _instances_changed: Subscription,
@@ -56,6 +57,7 @@ impl RootView {
         let model = instances.read(cx).model().clone();
         let downloads = cx.new(|cx| DownloadsPage::new(model.clone(), window, cx));
         let accounts = cx.new(|cx| AccountsPage::new(window, cx));
+        let settings = cx.new(|cx| SettingsPage::new(model.clone(), window, cx));
         // This app's own instance operations change the status bar's
         // count and size at once, without waiting for its throttle.
         let _instances_changed = cx.subscribe(&model, |this, _, _: &InstancesChanged, cx| {
@@ -76,6 +78,7 @@ impl RootView {
             instances,
             downloads,
             accounts,
+            settings,
             _observe: cx.observe(&shell, |this, shell, cx| {
                 let nav = shell.read(cx).nav();
                 this.instances
@@ -83,7 +86,8 @@ impl RootView {
                 match nav {
                     Nav::Downloads => this.downloads.update(cx, |page, cx| page.shown(cx)),
                     Nav::Accounts => this.accounts.update(cx, |page, cx| page.shown(cx)),
-                    Nav::Instances | Nav::Settings => {}
+                    Nav::Settings => this.settings.update(cx, |page, cx| page.shown(cx)),
+                    Nav::Instances => {}
                 }
                 cx.notify();
             }),
@@ -118,6 +122,10 @@ impl RootView {
         &self.accounts
     }
 
+    pub fn settings(&self) -> &Entity<SettingsPage> {
+        &self.settings
+    }
+
     /// The launch flow's requests for the shell and the window.
     fn on_launch_event(
         &mut self,
@@ -138,16 +146,20 @@ impl RootView {
                 for warning in warnings {
                     window.push_notification(Notification::warning(warning.clone()), cx);
                 }
-                match SettingsStore::get(cx).after_launch {
-                    AfterLaunch::Keep => {}
-                    AfterLaunch::Minimize => window.minimize_window(),
-                    // The game keeps running: quitting drops its session,
-                    // which keeps the running record for the next start to
-                    // reattach.
-                    AfterLaunch::Close if *record_saved => cx.quit(),
-                    // Without the record nothing could find the game again.
-                    AfterLaunch::Close => {
-                        let text = t!("launch.close_skipped").to_string();
+                // Work that quitting would cut short: operations, launches,
+                // stops, and a managed runtime being deleted.
+                let busy = {
+                    let model = self.instances.read(cx).model();
+                    model.read(cx).activity().read(cx).has_work_in_flight()
+                        || self.settings.read(cx).is_removing_runtime()
+                };
+                let setting = SettingsStore::get(cx).after_launch;
+                match after_launch_step(setting, *record_saved, busy) {
+                    AfterLaunchStep::Stay => {}
+                    AfterLaunchStep::Minimize => window.minimize_window(),
+                    AfterLaunchStep::Quit => cx.quit(),
+                    AfterLaunchStep::Skip(key) => {
+                        let text = t!(key).to_string();
                         window.push_notification(Notification::warning(text), cx);
                     }
                 }
@@ -176,8 +188,7 @@ impl RootView {
             .update(cx, |t, cx| t.focus_search(window, cx));
     }
 
-    /// The page for `nav`. The settings page is a placeholder until plan
-    /// 4c fills it.
+    /// The page for `nav`.
     fn render_page(&self, nav: Nav) -> AnyElement {
         let page = div()
             .id(nav.page_id())
@@ -189,10 +200,35 @@ impl RootView {
             Nav::Instances => page.child(self.instances.clone()).into_any_element(),
             Nav::Downloads => page.child(self.downloads.clone()).into_any_element(),
             Nav::Accounts => page.child(self.accounts.clone()).into_any_element(),
-            Nav::Settings => page
-                .child(placeholder::page(IconName::Settings, nav.label()))
-                .into_any_element(),
+            Nav::Settings => page.child(self.settings.clone()).into_any_element(),
         }
+    }
+}
+
+/// What the window does once a game has started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterLaunchStep {
+    Stay,
+    Minimize,
+    Quit,
+    /// The setting says close, but quitting now would lose something: stay,
+    /// and say why (the locale key).
+    Skip(&'static str),
+}
+
+/// What the `setting` asks for once a game started, given whether its
+/// running record was saved and whether other work is under way.
+fn after_launch_step(setting: AfterLaunch, record_saved: bool, busy: bool) -> AfterLaunchStep {
+    match setting {
+        AfterLaunch::Keep => AfterLaunchStep::Stay,
+        AfterLaunch::Minimize => AfterLaunchStep::Minimize,
+        // Without the record nothing could find the game again.
+        AfterLaunch::Close if !record_saved => AfterLaunchStep::Skip("launch.close_skipped"),
+        // Quitting would cut an install, a launch or a stop short.
+        AfterLaunch::Close if busy => AfterLaunchStep::Skip("launch.close_skipped_busy"),
+        // The game keeps running: quitting drops its session, which keeps
+        // the running record for the next start to reattach.
+        AfterLaunch::Close => AfterLaunchStep::Quit,
     }
 }
 
@@ -257,5 +293,33 @@ impl Render for RootView {
                     .child(self.render_page(nav)),
             )
             .child(self.status_bar.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_after_launch_waits_for_other_work() {
+        use AfterLaunchStep::*;
+        assert_eq!(after_launch_step(AfterLaunch::Keep, true, true), Stay);
+        assert_eq!(
+            after_launch_step(AfterLaunch::Minimize, true, true),
+            Minimize
+        );
+        assert_eq!(after_launch_step(AfterLaunch::Close, true, false), Quit);
+        assert_eq!(
+            after_launch_step(AfterLaunch::Close, true, true),
+            Skip("launch.close_skipped_busy")
+        );
+        assert_eq!(
+            after_launch_step(AfterLaunch::Close, false, true),
+            Skip("launch.close_skipped")
+        );
+        assert_eq!(
+            after_launch_step(AfterLaunch::Close, false, false),
+            Skip("launch.close_skipped")
+        );
     }
 }

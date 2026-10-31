@@ -236,6 +236,27 @@ impl ManagedRuntimes {
         self.install_locked(dl, component, progress).await
     }
 
+    /// The `java` of `component`, installing it first unless it is
+    /// installed. Checked under the component's lock, so a removal under
+    /// way is waited for and never handed out half deleted: once it is
+    /// done the component is installed again.
+    pub async fn ensure(
+        &self,
+        dl: &Downloader,
+        component: &str,
+        progress: &ProgressSink,
+    ) -> Result<PathBuf, RuntimeError> {
+        if !is_safe_name(component) {
+            return Err(RuntimeError::InvalidComponent(component.to_string()));
+        }
+        let lock = component_lock(&self.root, component);
+        let _guard = lock.lock().await;
+        if self.is_installed(component) {
+            return Ok(self.java_bin(component));
+        }
+        self.install_locked(dl, component, progress).await
+    }
+
     async fn install_locked(
         &self,
         dl: &Downloader,
@@ -320,6 +341,12 @@ impl ManagedRuntimes {
         // Waits for a running install of the same component.
         let lock = component_lock(&self.root, component);
         let _guard = lock.lock().await;
+        // The marker goes first: a removal cut short never leaves files
+        // that look installed.
+        match tokio::fs::remove_file(self.home(component).join(MARKER)).await {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         match tokio::fs::remove_dir_all(self.home(component)).await {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             r => r,
@@ -611,6 +638,85 @@ mod tests {
         } else {
             assert!(!home.exists());
         }
+    }
+
+    /// Marks `component` installed under `rt` (no files but the marker).
+    fn fake_installed(rt: &ManagedRuntimes, component: &str) {
+        let home = rt.home(component);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(MARKER), "17.0.8").unwrap();
+    }
+
+    /// A launch asking for a component that is being removed waits, and
+    /// then does not use the removed one: here the reinstall fails (the
+    /// server has nothing), so it refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_waits_for_a_removal_and_never_uses_it() {
+        let server = MockServer::start().await;
+        // The index offers nothing: a reinstall fails without leaving the
+        // local server.
+        let idx_path = RUNTIME_INDEX_URL
+            .strip_prefix("https://piston-meta.mojang.com")
+            .unwrap();
+        serve(&server, idx_path, br#"{"linux":{}}"#.to_vec()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = Arc::new(ManagedRuntimes::new(tmp.path().join("runtimes")));
+        fake_installed(&rt, "jre-legacy");
+        // An installed one is handed out at once.
+        let dl = downloader(&server);
+        assert_eq!(
+            rt.ensure(&dl, "jre-legacy", &None).await.unwrap(),
+            rt.java_bin("jre-legacy")
+        );
+
+        // A removal holds the component.
+        let lock = component_lock(&rt.root, "jre-legacy");
+        let removal = lock.lock().await;
+        let ensured = tokio::spawn({
+            let (rt, dl) = (rt.clone(), downloader(&server));
+            async move { rt.ensure(&dl, "jre-legacy", &None).await }
+        });
+        let waited = tokio::time::timeout(Duration::from_millis(100), async {
+            while !ensured.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(waited.is_err(), "it waits for the removal");
+        std::fs::remove_dir_all(rt.home("jre-legacy")).unwrap();
+        drop(removal);
+        let result = ensured.await.unwrap();
+        assert!(
+            matches!(result, Err(RuntimeError::Unavailable { .. })),
+            "the removed runtime is not used: {result:?}"
+        );
+        assert!(!rt.is_installed("jre-legacy"));
+    }
+
+    /// The installed marker goes first: a removal that fails halfway leaves
+    /// a component that is not installed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removal_drops_the_marker_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = ManagedRuntimes::new(tmp.path().join("runtimes"));
+        fake_installed(&rt, "jre-legacy");
+        let stuck = rt.home("jre-legacy").join("lib");
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::write(stuck.join("rt.jar"), "x").unwrap();
+        let set = |mode| std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(mode));
+        set(0o555).unwrap();
+        // Root deletes anyway; then there is nothing to check.
+        let enforced = std::fs::write(stuck.join("probe"), "").is_err();
+        let removed = rt.remove("jre-legacy").await;
+        set(0o755).unwrap();
+        if enforced {
+            assert!(removed.is_err(), "the removal failed halfway");
+            assert!(rt.home("jre-legacy").exists());
+        }
+        assert!(!rt.is_installed("jre-legacy"));
+        assert!(rt.list_installed().is_empty());
     }
 
     #[tokio::test]

@@ -49,6 +49,8 @@ patina-core = { version = "0.1.0", path = "../patina-core", features = ["test-su
 serde-saphyr = "2.0.0"
 serde_json = "1.0.154"
 tempfile = "3.27.0"
+# Local HTTP servers for the speed-test tests; the version patina-core uses.
+wiremock = "0.6.5"
 # Writes the test mod jars; the version and features patina-core uses.
 zip = "9.1.3"
 

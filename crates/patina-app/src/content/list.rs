@@ -255,11 +255,8 @@ pub fn filter_input<T: Send + 'static>(
     window: &mut Window,
     cx: &mut App,
 ) -> (Entity<InputState>, Subscription) {
-    let input = cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder(t!("content.filter.placeholder").to_string())
-            .clean_on_escape()
-    });
+    let input = cx.new(|cx| InputState::new(window, cx).clean_on_escape());
+    crate::i18n::localized_placeholder(&input, "content.filter.placeholder", window, cx);
     let tab = tab.downgrade();
     let subscription = cx.subscribe(&input, move |input, event: &InputEvent, cx| {
         if matches!(event, InputEvent::Change) {

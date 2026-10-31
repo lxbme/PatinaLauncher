@@ -6,7 +6,12 @@
 //! this crate and gpui-component (its own widget strings) each translate from
 //! it, and [`set_language`] switches all three together.
 
+use gpui_kit::component::input::InputState;
+use gpui_kit::{App, Entity, Global, WeakEntity, Window};
+
 pub use patina_core::i18n::Language;
+
+use crate::settings::SettingsStore;
 
 /// Switches the interface language of the core library, this crate and
 /// gpui-component.
@@ -26,6 +31,58 @@ pub fn set_language(l: Language) {
     // gpui-component's own setter, so its widget strings follow even if it
     // ever keeps a locale of its own.
     gpui_kit::component::set_locale(l.code());
+}
+
+/// The inputs whose placeholder is a translation, with its key; a language
+/// switch ([`apply_language`]) sets them again.
+#[derive(Default)]
+struct Placeholders(Vec<(WeakEntity<InputState>, &'static str)>);
+
+impl Global for Placeholders {}
+
+/// Gives `input` the translation of `key` as its placeholder, now and after
+/// every language switch ([`apply_language`]). Use it for every input
+/// whose placeholder is localized: an input keeps the text it was given.
+pub fn localized_placeholder(
+    input: &Entity<InputState>,
+    key: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    input.update(cx, |input, cx| {
+        input.set_placeholder(rust_i18n::t!(key).to_string(), window, cx)
+    });
+    let inputs = &mut cx.default_global::<Placeholders>().0;
+    inputs.retain(|(input, _)| input.upgrade().is_some());
+    inputs.push((input.downgrade(), key));
+}
+
+/// Switches the interface language while the app runs: saves it as the
+/// `language` setting, switches the core library, this crate and
+/// gpui-component ([`set_language`]), puts the localized placeholders
+/// ([`localized_placeholder`]) in the new language and redraws every
+/// window. Everything formatted when drawn follows on the next frame; text
+/// formatted earlier and kept (an operation's error message, say) stays as
+/// it was.
+pub fn apply_language(l: Language, window: &mut Window, cx: &mut App) {
+    SettingsStore::update(cx, |s| s.language = l);
+    set_language(l);
+    tracing::info!(language = l.code(), "interface language changed");
+    let inputs = (cx.try_global::<Placeholders>())
+        .map(|p| p.0.clone())
+        .unwrap_or_default();
+    for (input, key) in inputs {
+        input
+            .update(cx, |input, cx| {
+                input.set_placeholder(rust_i18n::t!(key).to_string(), window, cx)
+            })
+            .ok();
+    }
+    if cx.has_global::<Placeholders>() {
+        let inputs = &mut cx.global_mut::<Placeholders>().0;
+        inputs.retain(|(input, _)| input.upgrade().is_some());
+    }
+    cx.refresh_windows();
 }
 
 /// The language a first run starts in: Chinese when the system locale
@@ -126,6 +183,31 @@ mod tests {
             placeholders("a %{url}: %{reason} %{url}"),
             BTreeSet::from(["url".to_string(), "reason".to_string()])
         );
+    }
+
+    /// The download source is a preference, never a lock: no text says
+    /// "固定", in this crate's locales or the core's (whose source names the
+    /// settings page shows).
+    #[test]
+    fn copy_never_says_fixed() {
+        let core = |file: &str| format!("../patina-core/locales/{file}");
+        let mut checked = 0;
+        for file in ["en.yml", "zh-CN.yml"] {
+            for path in [format!("locales/{file}"), core(file)] {
+                let path = format!("{}/{path}", env!("CARGO_MANIFEST_DIR"));
+                let text = std::fs::read_to_string(&path).unwrap();
+                let v: serde_json::Value = serde_saphyr::from_str(&text).unwrap();
+                let mut all = BTreeMap::new();
+                flatten("", &v, &mut all);
+                let fixed: Vec<_> = (all.iter())
+                    .filter(|(_, text)| text.contains("固定"))
+                    .map(|(key, _)| key)
+                    .collect();
+                assert!(fixed.is_empty(), "{path}: 固定 in {fixed:?}");
+                checked += all.len();
+            }
+        }
+        assert!(checked > 100, "the locale files were read");
     }
 
     #[test]

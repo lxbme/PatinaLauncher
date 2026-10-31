@@ -4359,6 +4359,37 @@ fn invalid_jvm_args_not_saved(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn tab_leaves_the_jvm_arguments(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    let form = settings_form(&app, cx);
+    let args = form.read_with(cx, |f, _| f.args_input().clone());
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(app.handle, |_, window, cx| {
+            args.read(cx).focus_handle(cx).is_focused(window)
+        })
+        .unwrap()
+    };
+
+    // Tab moves on (no tab character) and the field commits.
+    sclick(&app, cx, "settings-args");
+    type_text(&app, cx, "-Dk=v");
+    assert!(focused(cx));
+    press(&app, cx, "tab");
+    assert!(!focused(cx));
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().extra_jvm_args == "-Dk=v"
+    });
+    // Shift-Tab moves back, likewise.
+    sclick(&app, cx, "settings-args");
+    press(&app, cx, "shift-tab");
+    assert!(!focused(cx));
+    assert_eq!(args.read_with(cx, |a, _| a.value().to_string()), "-Dk=v");
+}
+
+#[gpui_kit::test]
 fn min_over_max_rejected(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
@@ -7767,5 +7798,729 @@ uuid = "00000000-0000-0000-0000-000000000002"
         settle(cx, |cx| names(&app, cx) == Some(vec!["Steve".to_string()]));
         settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
         assert!(!disabled(&app, cx, "accounts-add-msa"));
+    }
+}
+
+// ---- Settings page ----
+
+mod settings_page {
+    use std::cell::Cell;
+
+    use super::*;
+    use gpui_kit::{ScrollDelta, point};
+    use patina_app::core_bridge::testing::ProbeSpeedTest;
+    use patina_app::settings_page::{
+        REPO_URL, Section, SettingsPage, runtime_delete_id, runtime_row_id, scale_step_id,
+        speed_row_id,
+    };
+    use patina_core::config::GlobalConfig;
+    use patina_core::download::Mirror;
+
+    fn page(app: &Booted, cx: &mut TestAppContext) -> Entity<SettingsPage> {
+        cx.update(|cx| app.root.read(cx).settings().clone())
+    }
+
+    /// Shows the settings page and waits for the config to be read.
+    fn open(app: &Booted, cx: &mut TestAppContext) -> Entity<SettingsPage> {
+        activate(app, cx);
+        click(app, cx, "rail-settings");
+        let page = page(app, cx);
+        settle(cx, |cx| page.read_with(cx, |p, _| p.config().is_some()));
+        cx.run_until_parked();
+        page
+    }
+
+    /// Scrolls the page's column until element `id` (if drawn) is in view.
+    fn reveal(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+        let id = id.into();
+        reveal_found(app, cx, |app, cx| element(app, cx, id.clone()));
+    }
+
+    /// Scrolls the page's column until what `find` finds (if drawn) is in
+    /// view.
+    fn reveal_found(
+        app: &Booted,
+        cx: &mut TestAppContext,
+        find: impl Fn(&Booted, &mut TestAppContext) -> Option<ElementSnapshot>,
+    ) {
+        for _ in 0..60 {
+            let Some(found) = find(app, cx) else {
+                return;
+            };
+            if found.visible() {
+                return;
+            }
+            let column = element(app, cx, "prefs-content").expect("the page is drawn");
+            let up = found.bounds().center().y < column.bounds().top();
+            let dy = if up { px(120.) } else { px(-120.) };
+            cx.update_window(app.handle, |_, window, cx| {
+                window.scroll("prefs-content", ScrollDelta::Pixels(point(px(0.), dy)), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    fn pclick(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+        let id = id.into();
+        reveal(app, cx, id.clone());
+        click(app, cx, id);
+    }
+
+    fn pshows(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> bool {
+        let id = id.into();
+        reveal(app, cx, id.clone());
+        shows(app, cx, id)
+    }
+
+    /// Radio `ix` of `group`, scrolled into view.
+    fn pradio(
+        app: &Booted,
+        cx: &mut TestAppContext,
+        group: &'static str,
+        ix: usize,
+    ) -> ElementSnapshot {
+        reveal_radio(app, cx, group, ix);
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within(group).find(ix)
+        })
+        .unwrap()
+    }
+
+    fn reveal_radio(app: &Booted, cx: &mut TestAppContext, group: &'static str, ix: usize) {
+        reveal_found(app, cx, |app, cx| {
+            cx.update_window(app.handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.within(group).try_find(ix)
+            })
+            .unwrap()
+        });
+    }
+
+    fn pclick_radio(app: &Booted, cx: &mut TestAppContext, group: &'static str, ix: usize) {
+        reveal_radio(app, cx, group, ix);
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within(group).click(ix, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Replaces the text of input `id`.
+    fn replace(app: &Booted, cx: &mut TestAppContext, id: &'static str, text: &str) {
+        pclick(app, cx, id);
+        press(app, cx, "secondary-a");
+        type_text(app, cx, text);
+    }
+
+    /// Moves the keyboard on (Tab), so the field it leaves commits.
+    fn leave(app: &Booted, cx: &mut TestAppContext) {
+        press(app, cx, "tab");
+        cx.update_window(app.handle, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Whether the page's JVM arguments field has the keyboard.
+    fn args_focused(app: &Booted, cx: &mut TestAppContext) -> bool {
+        use gpui_kit::Focusable as _;
+        let args = page(app, cx).read_with(cx, |p, _| p.args_input().clone());
+        cx.update_window(app.handle, |_, window, cx| {
+            args.read(cx).focus_handle(cx).is_focused(window)
+        })
+        .unwrap()
+    }
+
+    fn on_disk(dir: &Path) -> GlobalConfig {
+        GlobalConfig::load(&DataDirs::new(dir).config_file()).unwrap()
+    }
+
+    /// Waits until no save is queued or in flight.
+    fn saves_done(page: &Entity<SettingsPage>, cx: &mut TestAppContext) {
+        settle(cx, |cx| page.read_with(cx, |p, _| !p.is_saving()));
+        cx.run_until_parked();
+    }
+
+    fn status_source(app: &Booted, cx: &mut TestAppContext) -> String {
+        label_of(app, cx, "status-source").unwrap_or_default()
+    }
+
+    #[gpui_kit::test]
+    fn language_switch_updates_visible_text(cx: &mut TestAppContext) {
+        use patina_app::launch::OpError;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+        let alpha = store.create("Alpha", "1.21.1").unwrap().id;
+        let beta = store.create("Beta", "1.21.1").unwrap().id;
+        let mut start = AppSettings::default();
+        start.language = Language::ZhCn;
+        let app = boot(cx, tmp.path(), start);
+        app.language(Language::ZhCn);
+        let model = instances_model(&app, cx);
+        list_settled(&model, cx);
+
+        // Beta: an operation failed, its message formatted in Chinese.
+        let done = Rc::new(Cell::new(0));
+        let no_loader = || Err(OpError::Loader(LoaderError::NoLoader));
+        let (ok, gate, tick) = start_gated(&model, cx, &beta, no_loader, done.clone());
+        assert!(ok);
+        drop(tick);
+        gate.send(()).unwrap();
+        settle(cx, |cx| failed_message(&model, cx, &beta).is_some());
+        let cached = failed_message(&model, cx, &beta).unwrap();
+        assert_eq!(cached, LoaderError::NoLoader.to_string(), "Chinese now");
+        // Alpha: an operation runs, at a step.
+        let (ok, alpha_gate, tick) = start_gated(&model, cx, &alpha, || Ok(()), done.clone());
+        assert!(ok);
+        tick.send(items(Phase::FetchMetadata, 1, 4)).unwrap();
+        settle(cx, |cx| {
+            matches!(
+                op_of(&model, cx, &alpha),
+                Some(OpState::Running {
+                    progress: Some(_),
+                    ..
+                })
+            )
+        });
+        model.update(cx, |m, cx| m.select(&alpha, cx));
+        settle(cx, |cx| !status_source(&app, cx).is_empty());
+        let text = label_of(&app, cx, "instance-op-text").unwrap_or_default();
+        assert!(text.starts_with("正在获取版本信息"), "{text}");
+        assert_eq!(label_of(&app, cx, "tab-overview").as_deref(), Some("概览"));
+        assert!(status_source(&app, cx).starts_with("下载源"));
+
+        // Switched on the settings page: saved, and every view follows on
+        // the next frame.
+        open(&app, cx);
+        pclick_radio(&app, cx, "prefs-language", 1);
+        assert_eq!(
+            cx.update(|cx| SettingsStore::get(cx).language),
+            Language::En
+        );
+        cx.update(|cx| SettingsStore::flush(cx));
+        assert_eq!(settings::load(tmp.path()).language, Language::En);
+        click(&app, cx, "rail-instances");
+        let text = label_of(&app, cx, "instance-op-text").unwrap_or_default();
+        assert!(text.starts_with("Fetching version info"), "{text}");
+        assert_eq!(
+            label_of(&app, cx, "tab-overview").as_deref(),
+            Some("Overview")
+        );
+        assert!(
+            status_source(&app, cx).starts_with("Download source: Auto"),
+            "{}",
+            status_source(&app, cx)
+        );
+        // The inputs' placeholders too.
+        let placeholder = cx.update(|cx| {
+            let search = app.root.read(cx).title_bar().read(cx).search().read(cx);
+            search
+                .input()
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        });
+        assert_eq!(placeholder, "Press / to search instances and mods");
+        let placeholder = cx.update(|cx| {
+            let downloads = app.root.read(cx).downloads().read(cx);
+            downloads
+                .input()
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .to_string()
+        });
+        assert!(
+            !placeholder
+                .chars()
+                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+        );
+
+        // A message formatted before the switch and kept stays as it was.
+        assert_eq!(
+            failed_message(&model, cx, &beta).as_deref(),
+            Some(cached.as_str())
+        );
+        model.update(cx, |m, cx| m.select(&beta, cx));
+        assert_eq!(
+            label_of(&app, cx, "instance-op-error"),
+            Some(cached.clone())
+        );
+        assert_ne!(cached, LoaderError::NoLoader.to_string(), "English now");
+
+        alpha_gate.send(()).unwrap();
+        settle(cx, |cx| op_of(&model, cx, &alpha).is_none());
+    }
+
+    /// Whether the scale control marks step `scale` as the one on show.
+    fn step_on(app: &Booted, cx: &mut TestAppContext, scale: f32) -> bool {
+        let step = element(app, cx, scale_step_id(scale)).expect("the step is offered");
+        step.checked() == Some(true) || step.selected() == Some(true)
+    }
+
+    #[gpui_kit::test]
+    fn scale_setting_syncs_with_shortcuts(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let base = font_size(cx);
+        open(&app, cx);
+        reveal(&app, cx, "prefs-scale");
+        assert!(step_on(&app, cx, 1.0));
+        // The test display is 1920×1080: 200 % does not fit, so it is not
+        // offered.
+        assert!(shows(&app, cx, scale_step_id(1.75)));
+        assert!(element(&app, cx, scale_step_id(2.0)).is_none());
+
+        // A zoom key moves the control.
+        press(&app, cx, "ctrl-=");
+        assert!(step_on(&app, cx, 1.1));
+        assert!(!step_on(&app, cx, 1.0));
+
+        // The control zooms, saves, and the keys go on from there.
+        pclick(&app, cx, scale_step_id(1.5));
+        assert_eq!(cx.update(|cx| SettingsStore::get(cx).ui_scale), 1.5);
+        assert_eq!(font_size(cx), base * 1.5);
+        assert!(step_on(&app, cx, 1.5));
+        press(&app, cx, "ctrl--");
+        assert_eq!(cx.update(|cx| SettingsStore::get(cx).ui_scale), 1.25);
+        assert!(step_on(&app, cx, 1.25));
+        press(&app, cx, "ctrl-0");
+        assert!(step_on(&app, cx, 1.0));
+        assert_eq!(font_size(cx), base);
+    }
+
+    fn mirrors(cx: &mut TestAppContext) -> (Arc<patina_core::prepare::Launcher>, String, String) {
+        cx.update(|cx| {
+            let launcher = Core::global(cx).launcher();
+            let dl = &launcher.downloader;
+            let (mirror, fallback) = (
+                dl.mirror().id.clone(),
+                dl.fallback_mirror()
+                    .map(|m| m.id.clone())
+                    .unwrap_or_default(),
+            );
+            (launcher, mirror, fallback)
+        })
+    }
+
+    #[gpui_kit::test]
+    fn source_change_rebuilds_launcher(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        let (before, mirror, _) = mirrors(cx);
+        assert_eq!(mirror, "bmclapi");
+        assert!(pradio(&app, cx, "prefs-source", 0).checked() == Some(true));
+
+        // 优先官方: saved, and a new launcher downloads from the official
+        // source with BMCLAPI behind it.
+        pclick_radio(&app, cx, "prefs-source", 2);
+        saves_done(&page, cx);
+        assert_eq!(on_disk(tmp.path()).download.source, SourceChoice::Official);
+        settle(cx, |cx| mirrors(cx).1 == "official");
+        let (after, _, fallback) = mirrors(cx);
+        assert_eq!(fallback, "bmclapi", "a preference: the other source stays");
+        assert!(!Arc::ptr_eq(&before, &after));
+        // Work that started earlier keeps the launcher it holds.
+        assert_eq!(before.downloader.mirror().id, "bmclapi");
+        // The status bar follows.
+        settle(cx, |cx| status_source(&app, cx).contains("Prefer official"));
+
+        // 优先 BMCLAPI.
+        pclick_radio(&app, cx, "prefs-source", 1);
+        saves_done(&page, cx);
+        assert_eq!(on_disk(tmp.path()).download.source, SourceChoice::Bmclapi);
+        settle(cx, |cx| mirrors(cx).1 == "bmclapi");
+        assert_eq!(mirrors(cx).2, "official");
+    }
+
+    async fn probe_server(delay: Duration) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("ok")
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn local_mirror(id: &str, server: &wiremock::MockServer) -> Mirror {
+        Mirror {
+            id: id.into(),
+            rules: vec![("https://probe.invalid".into(), server.uri())],
+        }
+    }
+
+    #[gpui_kit::test]
+    fn speedtest_results_rendered(cx: &mut TestAppContext) {
+        let servers = patina_app::runtime::start();
+        let (slow, fast) = servers.block_on(async {
+            (
+                probe_server(Duration::from_secs(5)).await,
+                probe_server(Duration::ZERO).await,
+            )
+        });
+        let probe = ProbeSpeedTest {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            candidates: vec![
+                local_mirror("official", &slow),
+                local_mirror("bmclapi", &fast),
+            ],
+            probe_url: "https://probe.invalid/probe".into(),
+            timeout: Duration::from_millis(500),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+            testing::core_with_speed_test(
+                rt,
+                data,
+                Arc::new(FakeCatalog::new()),
+                Arc::new(probe),
+                Vec::new(),
+            )
+        });
+        let page = open(&app, cx);
+        assert!(!shows(&app, cx, speed_row_id("bmclapi")));
+        let tests = |cx: &mut TestAppContext| cx.update(|cx| Core::global(cx).last_speed_test());
+        assert!(tests(cx).is_none());
+
+        pclick(&app, cx, "prefs-speed-test");
+        settle(cx, |cx| {
+            !page.read_with(cx, |p, _| p.is_speed_testing())
+                && element(&app, cx, speed_row_id("bmclapi")).is_some()
+        });
+        // Each source: its latency, or that it did not answer in time.
+        assert_eq!(
+            label_of(&app, cx, speed_row_id("official")).as_deref(),
+            Some("Official Timed out")
+        );
+        let fast_row = label_of(&app, cx, speed_row_id("bmclapi")).unwrap();
+        let ms = fast_row
+            .strip_prefix("BMCLAPI ")
+            .and_then(|r| r.strip_suffix(" ms"))
+            .unwrap_or_else(|| panic!("{fast_row}"));
+        assert!(ms.parse::<u64>().is_ok(), "{fast_row}");
+        assert!(pshows(&app, cx, "prefs-speed-at"));
+        // On automatic the fastest is stored as the pick.
+        settle(cx, |_| {
+            on_disk(tmp.path()).download.auto_pick.as_deref() == Some("bmclapi")
+        });
+        settle(cx, |cx| {
+            label_of(&app, cx, "prefs-auto-pick").as_deref() == Some("Picked BMCLAPI automatically")
+        });
+        // The core keeps the result; the status bar shows the latency of
+        // the source in use.
+        assert!(tests(cx).is_some_and(|t| t.latency("official") == Some(None)));
+        let expected = format!("Download source: Auto (fastest) · {fast_row}");
+        settle(cx, |cx| status_source(&app, cx) == expected);
+        drop(app);
+        drop(servers);
+    }
+
+    /// Writes an installed managed runtime `component` at `version`.
+    fn runtime(dir: &Path, component: &str, version: &str) -> std::path::PathBuf {
+        let home = DataDirs::new(dir).runtimes().join(component);
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join(".patina-installed"), version).unwrap();
+        home
+    }
+
+    #[gpui_kit::test]
+    fn runtime_delete_requires_confirmation(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let gamma = runtime(tmp.path(), "java-runtime-gamma", "17.0.8");
+        let delta = runtime(tmp.path(), "java-runtime-delta", "21.0.3");
+        let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+        let alpha = store.create("Alpha", "1.21.1").unwrap().id;
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        settle(cx, |cx| {
+            page.read_with(cx, |p, _| p.runtimes().is_some_and(|r| r.len() == 2))
+        });
+        assert!(pshows(&app, cx, runtime_row_id("java-runtime-gamma")));
+        assert_eq!(
+            label_of(&app, cx, runtime_row_id("java-runtime-delta")).as_deref(),
+            Some("java-runtime-delta")
+        );
+
+        // Asks first, with the keyboard on 取消: a reflexive Enter keeps it.
+        pclick(&app, cx, runtime_delete_id("java-runtime-gamma"));
+        assert!(shows(&app, cx, "dialog"));
+        assert_eq!(
+            dialog_label(&app, cx, "prefs-runtime-delete-title"),
+            "Delete “java-runtime-gamma”?"
+        );
+        settle(cx, |cx| {
+            element(&app, cx, "prefs-runtime-cancel").and_then(|e| e.focused()) == Some(true)
+        });
+        press(&app, cx, "enter");
+        assert!(!shows(&app, cx, "dialog"));
+        cx.run_until_parked();
+        // Nothing was started: no deletion is under way.
+        assert!(!page.read_with(cx, |p, _| p.is_removing_runtime()));
+        assert!(gamma.exists());
+
+        // 删除 deletes it; the list and the status bar follow.
+        pclick(&app, cx, runtime_delete_id("java-runtime-gamma"));
+        dialog_click(&app, cx, "prefs-runtime-ok");
+        settle(cx, |cx| {
+            page.read_with(cx, |p, _| p.runtimes().is_some_and(|r| r.len() == 1))
+        });
+        assert!(!gamma.exists());
+        assert!(delta.exists());
+        let status = cx.update(|cx| app.root.read(cx).status_bar().clone());
+        settle(cx, |cx| {
+            status.read_with(cx, |s, _| s.runtimes() == Some(1))
+        });
+
+        // Not while a game runs (it may be using it).
+        let model = instances_model(&app, cx);
+        model.update(cx, |m, cx| m.set_run_state(&alpha, Some(elsewhere()), cx));
+        cx.run_until_parked();
+        reveal(&app, cx, runtime_delete_id("java-runtime-delta"));
+        assert!(disabled(&app, cx, runtime_delete_id("java-runtime-delta")));
+        assert!(pshows(&app, cx, "prefs-runtimes-busy"));
+        model.update(cx, |m, cx| m.set_run_state(&alpha, None, cx));
+        cx.run_until_parked();
+        assert!(!disabled(&app, cx, runtime_delete_id("java-runtime-delta")));
+    }
+
+    #[gpui_kit::test]
+    fn java_defaults_validation(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        settle(cx, |cx| {
+            element(&app, cx, "prefs-min-mem")
+                .and_then(|e| e.value().map(str::to_owned))
+                .as_deref()
+                == Some("512")
+        });
+        let java = |dir: &Path| on_disk(dir).java;
+
+        // Each rule of the instance settings, said under the fields; what
+        // breaks one is not saved.
+        replace(&app, cx, "prefs-min-mem", "0");
+        leave(&app, cx);
+        assert_eq!(
+            label_of(&app, cx, "prefs-memory-error").as_deref(),
+            Some("Minimum memory is at least 1 MiB")
+        );
+        saves_done(&page, cx);
+        assert!(
+            !DataDirs::new(tmp.path()).config_file().exists(),
+            "nothing saved"
+        );
+        replace(&app, cx, "prefs-min-mem", "512");
+        replace(&app, cx, "prefs-max-mem", "2048");
+        leave(&app, cx);
+        saves_done(&page, cx);
+        assert_eq!(java(tmp.path()).max_mem_mib, Some(2048));
+        replace(&app, cx, "prefs-min-mem", "4096");
+        leave(&app, cx);
+        assert_eq!(
+            label_of(&app, cx, "prefs-memory-error").as_deref(),
+            Some("Minimum memory can’t exceed maximum memory")
+        );
+        replace(&app, cx, "prefs-max-mem", "2000000");
+        leave(&app, cx);
+        assert_eq!(
+            label_of(&app, cx, "prefs-memory-error").as_deref(),
+            Some("Can’t exceed 1048576 MiB")
+        );
+        replace(&app, cx, "prefs-max-mem", "lots");
+        press(&app, cx, "enter");
+        assert_eq!(
+            label_of(&app, cx, "prefs-memory-error").as_deref(),
+            Some("Enter a whole number")
+        );
+        saves_done(&page, cx);
+        assert_eq!(
+            (java(tmp.path()).min_mem_mib, java(tmp.path()).max_mem_mib),
+            (512, Some(2048)),
+            "nothing more saved"
+        );
+
+        // A consistent pair saves; "自动" clears the maximum.
+        replace(&app, cx, "prefs-max-mem", "8192");
+        press(&app, cx, "enter");
+        saves_done(&page, cx);
+        assert!(!pshows(&app, cx, "prefs-memory-error"));
+        assert_eq!(
+            (java(tmp.path()).min_mem_mib, java(tmp.path()).max_mem_mib),
+            (4096, Some(8192))
+        );
+        pclick(&app, cx, "prefs-max-auto");
+        saves_done(&page, cx);
+        assert_eq!(java(tmp.path()).max_mem_mib, None);
+
+        // JVM arguments: memory flags belong to the fields above.
+        pclick(&app, cx, "prefs-args");
+        type_text(&app, cx, "-Xmx4G");
+        assert!(pshows(&app, cx, "prefs-args-error"));
+        // Tab leaves the field (no tab character) and it commits.
+        assert!(args_focused(&app, cx));
+        leave(&app, cx);
+        assert!(!args_focused(&app, cx));
+        saves_done(&page, cx);
+        assert_eq!(java(tmp.path()).extra_jvm_args, "");
+        pclick(&app, cx, "prefs-args");
+        press(&app, cx, "secondary-a");
+        type_text(&app, cx, "-Dfoo=bar");
+        assert!(!pshows(&app, cx, "prefs-args-error"));
+        leave(&app, cx);
+        assert!(!args_focused(&app, cx));
+        saves_done(&page, cx);
+        assert_eq!(java(tmp.path()).extra_jvm_args, "-Dfoo=bar");
+        // Shift-Tab leaves it backwards, also without indenting.
+        pclick(&app, cx, "prefs-args");
+        press(&app, cx, "shift-tab");
+        assert!(!args_focused(&app, cx));
+        let args = cx.update(|cx| page.read(cx).args_input().read(cx).value().to_string());
+        assert_eq!(args, "-Dfoo=bar");
+
+        // GC: the default adds nothing; every preset may be the default
+        // (an instance whose Java can't run it launches without it).
+        assert_eq!(java(tmp.path()).gc_preset, GcPreset::None);
+        assert!(pradio(&app, cx, "prefs-gc", 0).checked() == Some(true));
+        for ix in 0..4 {
+            assert_ne!(pradio(&app, cx, "prefs-gc", ix).disabled(), Some(true));
+        }
+        assert_eq!(
+            label_of(&app, cx, "prefs-gc-note").as_deref(),
+            Some(
+                "An instance whose Java can’t run the chosen preset launches without it, with a warning."
+            )
+        );
+        pclick_radio(&app, cx, "prefs-gc", 2);
+        saves_done(&page, cx);
+        assert_eq!(java(tmp.path()).gc_preset, GcPreset::GenerationalZgc);
+        pclick_radio(&app, cx, "prefs-gc", 1);
+        saves_done(&page, cx);
+        assert_eq!(java(tmp.path()).gc_preset, GcPreset::G1Aikar);
+    }
+
+    #[gpui_kit::test]
+    fn an_unreadable_config_is_backed_up_before_the_first_save(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = DataDirs::new(tmp.path()).config_file();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "download = [").unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        settle(cx, |cx| shows(&app, cx, "prefs-config-error"));
+        let said = label_of(&app, cx, "prefs-config-error").unwrap();
+        assert!(said.starts_with("Couldn’t read config.toml: "), "{said}");
+        assert!(!said.contains("config file format"), "said once: {said}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "download = [");
+
+        pclick_radio(&app, cx, "prefs-source", 2);
+        saves_done(&page, cx);
+        let bak = file.with_file_name("config.toml.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "download = [");
+        assert_eq!(on_disk(tmp.path()).download.source, SourceChoice::Official);
+        settle(cx, |cx| !shows(&app, cx, "prefs-config-error"));
+    }
+
+    #[gpui_kit::test]
+    fn after_launch_and_data_folder(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        assert!(pradio(&app, cx, "prefs-after-launch-choice", 0).checked() == Some(true));
+        assert_eq!(
+            label_of(&app, cx, "prefs-after-launch-hint").as_deref(),
+            Some("Closing Patina doesn’t stop the game.")
+        );
+        pclick_radio(&app, cx, "prefs-after-launch-choice", 2);
+        assert_eq!(
+            cx.update(|cx| SettingsStore::get(cx).after_launch),
+            settings::AfterLaunch::Close
+        );
+
+        // The data folder: its path, and "打开" opens it.
+        assert_eq!(
+            label_of(&app, cx, "prefs-data-path"),
+            Some(tmp.path().display().to_string())
+        );
+        let opened = Rc::new(std::cell::RefCell::new(None));
+        page.update(cx, |p, _| {
+            let opened = opened.clone();
+            p.set_opener(move |dir, _| *opened.borrow_mut() = Some(dir.to_path_buf()));
+        });
+        pclick(&app, cx, "prefs-data-open");
+        settle(cx, |_| opened.borrow().is_some());
+        assert_eq!(opened.borrow().as_deref(), Some(tmp.path()));
+
+        // About: the repository is a link, reached by Tab and opened with
+        // Enter or Space as well as the pointer.
+        let urls = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        page.update(cx, |p, _| {
+            let urls = urls.clone();
+            p.set_url_opener(move |url, _| urls.borrow_mut().push(url.to_string()));
+        });
+        assert!(pshows(&app, cx, "prefs-repo-link"));
+        assert!(REPO_URL.starts_with("https://github.com/lxbme/"));
+        let link_focused = |cx: &mut TestAppContext| {
+            element(&app, cx, "prefs-repo-link").and_then(|e| e.focused()) == Some(true)
+        };
+        pclick(&app, cx, "prefs-min-mem");
+        for _ in 0..40 {
+            if link_focused(cx) {
+                break;
+            }
+            press(&app, cx, "tab");
+        }
+        assert!(link_focused(cx), "Tab reaches the link");
+        press(&app, cx, "enter");
+        press(&app, cx, "space");
+        assert_eq!(*urls.borrow(), vec![REPO_URL.to_string(); 2]);
+        pclick(&app, cx, "prefs-repo-link");
+        assert_eq!(urls.borrow().len(), 3);
+        #[cfg(feature = "dev-offline")]
+        assert!(pshows(&app, cx, "prefs-dev-build"));
+        #[cfg(not(feature = "dev-offline"))]
+        assert!(element(&app, cx, "prefs-dev-build").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn the_page_fits_the_smallest_window(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open(&app, cx);
+        // Wide: the index, which brings a section to the top.
+        assert!(shows(&app, cx, "prefs-index"));
+        click(&app, cx, Section::About.index_id());
+        assert!(shows(&app, cx, Section::About.id()));
+        assert!(inside_window(&app, cx, "prefs-repo-link"));
+
+        // 960×600: the index folds away; every section is reached by
+        // scrolling the column, and lies inside the window.
+        cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+        cx.run_until_parked();
+        assert!(!shows(&app, cx, "prefs-index"));
+        for section in Section::ALL {
+            reveal(&app, cx, section.id());
+            assert!(shows(&app, cx, section.id()), "{section:?}");
+        }
+        for id in [
+            "prefs-speed-test",
+            "prefs-max-auto",
+            "prefs-data-open",
+            "prefs-scale-100",
+            "prefs-scale-175",
+        ] {
+            reveal(&app, cx, id);
+            assert!(inside_window(&app, cx, id), "{id} is cut off at 960×600");
+        }
     }
 }

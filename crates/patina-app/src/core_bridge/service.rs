@@ -1,16 +1,18 @@
 //! [`Core`]: patina-core's services, shared by every view.
 
-use std::sync::{Arc, PoisonError, RwLock as StdRwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock as StdRwLock};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use gpui_kit::{App, AppContext as _, Global, Task};
 use patina_core::accounts::login::DeviceCodeLogin;
 use patina_core::accounts::{AccountError, AccountStore};
-use patina_core::config::{ConfigError, GlobalConfig};
+use patina_core::config::{ConfigError, GlobalConfig, SourceChoice};
 use patina_core::content::online::{ContentSource, UnavailableSource};
 use patina_core::download::{Mirror, resolve_choice};
 use patina_core::instance::InstanceStore;
+use patina_core::java::{JavaInstall, detect_all};
 use patina_core::loader::{LoaderError, LoaderKind, LoaderVersion, list_versions};
 use patina_core::meta::VersionManifest;
 use patina_core::paths::DataDirs;
@@ -20,7 +22,9 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock};
 
 use super::accounts_changed::AccountsChanged;
+use super::config_changed::ConfigChanged;
 use super::launch::{CoreLaunchBackend, LaunchBackend};
+use super::speed::{MirrorProbe, SpeedTest, SpeedTestResult};
 use super::task::{BridgeError, run, run_blocking};
 use super::version_ops::{CoreVersionOps, VersionOps};
 
@@ -60,6 +64,9 @@ impl<E: std::error::Error + 'static> std::error::Error for LoadError<E> {}
 pub struct LoadedConfig {
     pub config: GlobalConfig,
     pub load_error: Option<LoadError<ConfigError>>,
+    /// Where the unreadable file was copied, once it was: one copy per
+    /// failed load, however many saves fail after it.
+    pub backup: Option<PathBuf>,
 }
 
 /// The account store as loaded at startup, or why it is not available (the
@@ -113,14 +120,79 @@ pub struct Core {
     /// (`dev-offline`) walk a fake one that never adds an account
     /// (`accounts::FakeLogin`).
     pub login: Arc<dyn DeviceCodeLogin>,
+    /// Probes the download sources, injectable for UI tests.
+    pub speed_test: Arc<dyn SpeedTest>,
+    /// Looks for the Java installs on this machine (blocking: it runs
+    /// them), injectable for UI tests; an offline test core finds none.
+    pub detect_java: DetectJava,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
+    /// The last speed test of the download sources, if any ran.
+    speed_result: Arc<StdMutex<Option<SpeedTestResult>>>,
+    /// Counts the speed tests recorded, for the UI to follow the ones run
+    /// on the runtime (the startup test).
+    speed_epoch: Arc<tokio::sync::watch::Sender<u64>>,
     #[cfg(any(test, feature = "test-support"))]
     startup: Startup,
 }
 
 impl Global for Core {}
+
+/// Finds the Java installs on this machine (see `Core.detect_java`).
+pub type DetectJava = Arc<dyn Fn() -> Vec<JavaInstall> + Send + Sync>;
+
+/// What a config save did besides saving.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigSaved {
+    /// Where the unreadable `config.toml` was copied before this save wrote
+    /// over it (the first save after a failed load).
+    pub backup: Option<PathBuf>,
+}
+
+/// What [`Core::speed_test_now`] found and did.
+#[derive(Debug, Clone)]
+pub struct SpeedTested {
+    pub result: SpeedTestResult,
+    /// Storing the fastest source as the automatic pick: only with the
+    /// setting on automatic and a source that answered.
+    pub saved: Option<Result<ConfigSaved, Arc<ConfigSaveError>>>,
+}
+
+/// Why a config change was not saved. Each says its reason once, without
+/// the prefixes of the layers it went through.
+#[derive(Debug)]
+pub enum ConfigSaveError {
+    /// The config was never loaded, so it is not written over the file.
+    NotLoaded,
+    /// The unreadable `config.toml` could not be backed up, so it was not
+    /// written over (the I/O error).
+    Backup(String),
+    /// Writing the file failed.
+    Save(ConfigError),
+}
+
+impl std::fmt::Display for ConfigSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSaveError::NotLoaded => f.write_str(&t!("core_bridge.not_loaded")),
+            ConfigSaveError::Backup(e) => f.write_str(&t!("core_bridge.backup_failed", error = e)),
+            ConfigSaveError::Save(e) => f.write_str(config_reason(e)),
+        }
+    }
+}
+
+impl std::error::Error for ConfigSaveError {}
+
+/// The reason inside `e`, without the "config file" prefix its `Display`
+/// adds: for a message that names the file itself.
+pub fn config_reason(e: &ConfigError) -> &str {
+    match e {
+        ConfigError::Io(reason) | ConfigError::Parse(reason) | ConfigError::Serialize(reason) => {
+            reason
+        }
+    }
+}
 
 /// A client that cannot reach any host: every request goes through a
 /// proxy at a closed local port and fails at once. Whatever the download
@@ -153,6 +225,8 @@ pub(super) struct Fakes {
     pub(super) version_ops: Option<Arc<dyn VersionOps>>,
     pub(super) content_source: Option<Arc<dyn ContentSource>>,
     pub(super) login: Option<Arc<dyn DeviceCodeLogin>>,
+    pub(super) speed_test: Option<Arc<dyn SpeedTest>>,
+    pub(super) detect_java: Option<DetectJava>,
 }
 
 impl Core {
@@ -178,6 +252,8 @@ impl Core {
             version_ops,
             content_source,
             login,
+            speed_test,
+            detect_java,
         } = fakes;
         let client = {
             let _rt = rt.enter();
@@ -205,6 +281,7 @@ impl Core {
         let config = Arc::new(RwLock::new(LoadedConfig {
             config: GlobalConfig::default(),
             load_error: Some(LoadError::NotLoaded),
+            backup: None,
         }));
         let launch_backend = launch_backend.unwrap_or_else(|| {
             Arc::new(CoreLaunchBackend {
@@ -221,6 +298,13 @@ impl Core {
         });
         let content_source = content_source.unwrap_or_else(|| Arc::new(UnavailableSource));
         let login = login.unwrap_or_else(default_login);
+        let speed_test = speed_test.unwrap_or_else(|| Arc::new(MirrorProbe));
+        let detect_java = detect_java.unwrap_or_else(|| match startup {
+            Startup::SpeedTest => Arc::new(detect_all),
+            // Never runs a program of the machine's.
+            #[cfg(any(test, feature = "test-support"))]
+            Startup::Offline => Arc::new(Vec::new),
+        });
         let core = Core {
             rt,
             store,
@@ -230,9 +314,13 @@ impl Core {
             version_ops,
             content_source,
             login,
+            speed_test,
+            detect_java,
             config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),
+            speed_result: Arc::default(),
+            speed_epoch: Arc::new(tokio::sync::watch::channel(0).0),
             #[cfg(any(test, feature = "test-support"))]
             startup,
         };
@@ -286,16 +374,77 @@ impl Core {
 
     /// Changes the config with `f` and saves it, under the config's write
     /// lock so saves reach the disk in order. Memory changes only once the
-    /// save succeeded. A changed download source also swaps the launcher.
+    /// save succeeded. A changed download source also swaps the launcher
+    /// (work in flight keeps the old one). Signals [`ConfigChanged`] once
+    /// done, whether or not anyone waits for the result.
     ///
-    /// After a failed load this overwrites the unreadable `config.toml`:
-    /// back it up first. Refused while the config was never loaded.
+    /// The first save after a failed load copies the unreadable
+    /// `config.toml` to `config.toml.bak` (or `.bak.1`, `.bak.2`, … when
+    /// that exists) before writing over it, and says where
+    /// ([`ConfigSaved::backup`]); when the copy fails nothing is saved.
+    /// Refused while the config was never loaded.
     pub fn update_config(
         cx: &mut App,
         f: impl FnOnce(&mut GlobalConfig) + Send + 'static,
-    ) -> Task<Result<Result<(), ConfigError>, BridgeError>> {
+    ) -> Task<Result<Result<ConfigSaved, ConfigSaveError>, BridgeError>> {
         let core = Core::global(cx).clone();
-        run(cx, async move { core.update_config_now(f).await })
+        let change = run(cx, async move { core.update_config_now(f).await });
+        config_signal_after(cx, change)
+    }
+
+    /// The last speed test of the download sources, if one ran.
+    pub fn last_speed_test(&self) -> Option<SpeedTestResult> {
+        (self.speed_result.lock())
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Changes whenever a speed test is recorded, wherever it ran (the
+    /// startup test runs on the runtime): see `ConfigChanged::follow_core`.
+    pub fn speed_tests(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.speed_epoch.subscribe()
+    }
+
+    fn record_speed_test(&self, result: &SpeedTestResult) {
+        *self
+            .speed_result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(result.clone());
+        self.speed_epoch.send_modify(|n| *n += 1);
+    }
+
+    /// Speed-tests the download sources now (`Core.speed_test`) and keeps
+    /// the result ([`Core::last_speed_test`]). With the setting on
+    /// automatic, the fastest source that answered becomes the automatic
+    /// pick and is saved, which also swaps the launcher. Signals
+    /// [`ConfigChanged`] once done.
+    pub fn speed_test_now(cx: &mut App) -> Task<Result<SpeedTested, BridgeError>> {
+        let core = Core::global(cx).clone();
+        let test = run(cx, async move {
+            let results = core.speed_test.measure(core.launcher()).await;
+            let result = SpeedTestResult::new(&results);
+            core.record_speed_test(&result);
+            let auto = core.config.read().await.config.download.source == SourceChoice::Auto;
+            let pick = (result.fastest())
+                .filter(|id| Mirror::by_id(id).is_some())
+                .map(str::to_owned);
+            let saved = match pick {
+                Some(pick) if auto => {
+                    let saved = core
+                        .update_config_now(move |c| {
+                            // The setting may have changed meanwhile.
+                            if c.download.source == SourceChoice::Auto {
+                                c.download.auto_pick = Some(pick);
+                            }
+                        })
+                        .await;
+                    Some(saved.map_err(Arc::new))
+                }
+                _ => None,
+            };
+            SpeedTested { result, saved }
+        });
+        config_signal_after(cx, test)
     }
 
     /// Runs `f` with the account store on the blocking pool (the store does
@@ -360,21 +509,40 @@ impl Core {
     async fn update_config_now(
         &self,
         f: impl FnOnce(&mut GlobalConfig),
-    ) -> Result<(), ConfigError> {
+    ) -> Result<ConfigSaved, ConfigSaveError> {
         let guard = self.config.clone().write_owned().await;
         if matches!(guard.load_error, Some(LoadError::NotLoaded)) {
-            return Err(ConfigError::Io(t!("core_bridge.not_loaded").to_string()));
+            return Err(ConfigSaveError::NotLoaded);
         }
         let mut next = guard.config.clone();
         f(&mut next);
         if next == guard.config {
-            return Ok(());
+            return Ok(ConfigSaved::default());
         }
         let source_changed = next.download != guard.config.download;
         let path = self.data.config_file();
         let (guard, saved) = blocking(move || {
             let mut guard = guard;
-            let saved = next.save(&path);
+            // What is on disk could not be read: keep a copy before
+            // writing over it, once.
+            let backup = if guard.load_error.is_some() && guard.backup.is_none() {
+                match back_up(&path) {
+                    Ok(backup) => backup,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "backing up config.toml failed; not saving");
+                        return (guard, Err(ConfigSaveError::Backup(e.to_string())));
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(bak) = &backup {
+                tracing::info!(bak = %bak.display(), "backed up the unreadable config.toml");
+                guard.backup = Some(bak.clone());
+            }
+            let saved = (next.save(&path))
+                .map(|()| ConfigSaved { backup })
+                .map_err(ConfigSaveError::Save);
             if saved.is_ok() {
                 guard.config = next;
                 guard.load_error = None;
@@ -442,10 +610,20 @@ impl Core {
             return;
         }
 
+        let results = self.speed_test.measure(self.launcher()).await;
+        let result = SpeedTestResult::new(&results);
+        self.record_speed_test(&result);
         let mut probe = GlobalConfig {
             download: before.clone(),
             ..GlobalConfig::default()
         };
+        // Resolved without probing again: the pick names a mirror, and
+        // without one (every probe failed) the official source is used for
+        // this run and nothing is stored, so the next run tests again.
+        match result.fastest().filter(|id| Mirror::by_id(id).is_some()) {
+            Some(pick) => probe.download.auto_pick = Some(pick.to_owned()),
+            None => probe.download.source = SourceChoice::Official,
+        }
         let source = resolve_mirror(&client, &mut probe).await;
         let mut config = self.config.clone().write_owned().await;
         if config.config.download != before {
@@ -478,6 +656,62 @@ fn default_login() -> Arc<dyn DeviceCodeLogin> {
     return Arc::new(crate::accounts::FakeLogin::default());
     #[cfg(not(feature = "dev-offline"))]
     Arc::new(patina_core::accounts::login::UnavailableLogin)
+}
+
+/// Signals [`ConfigChanged`] once `change` (work on the settings) has
+/// finished, whether or not anyone still waits for its result (as
+/// [`signal_after`] does for the accounts).
+fn config_signal_after<R: Send + 'static>(
+    cx: &mut App,
+    change: Task<Result<R, BridgeError>>,
+) -> Task<Result<R, BridgeError>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    cx.spawn(async move |cx| {
+        let result = change.await;
+        cx.update(ConfigChanged::bump);
+        tx.send(result).ok();
+    })
+    .detach();
+    cx.background_spawn(async move {
+        // Dropped unanswered only when the app is quitting.
+        rx.await.unwrap_or(Err(BridgeError::Panicked))
+    })
+}
+
+/// Copies `file` to `<file>.bak`, or to `<file>.bak.N` with the first
+/// free N: an existing backup is never written over. `Ok(None)` when there
+/// is no file to keep.
+fn back_up(file: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::io::ErrorKind;
+    let mut source = match std::fs::File::open(file) {
+        Ok(source) => source,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0..1000 {
+        let bak = match n {
+            0 => file.with_file_name(format!("{name}.bak")),
+            n => file.with_file_name(format!("{name}.bak.{n}")),
+        };
+        let mut target = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&bak)
+        {
+            Ok(target) => target,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let copied = std::io::copy(&mut source, &mut target).and_then(|_| target.sync_all());
+        if let Err(e) = copied {
+            drop(target);
+            std::fs::remove_file(&bak).ok();
+            return Err(e);
+        }
+        return Ok(Some(bak));
+    }
+    Err(std::io::Error::other("no free backup name"))
 }
 
 /// Signals [`AccountsChanged`] once `change` (work on the accounts) has
@@ -865,6 +1099,166 @@ uuid = "00000000-0000-0000-0000-00000000000b"
         let refused = cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("a")));
         assert!(refused.await.is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not [valid");
+    }
+
+    #[gpui_kit::test]
+    async fn first_save_after_a_failed_load_backs_the_file_up(cx: &mut TestAppContext) {
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "download = [").unwrap();
+        // An older backup is never written over.
+        std::fs::write(dir.path().join("config.toml.bak"), "older").unwrap();
+        let core = offline_core(rt.handle(), dir.path());
+        cx.update(|cx| cx.set_global(core.clone()));
+        cx.executor().allow_parking();
+        assert!(loaded(&rt, &core).load_error.is_some());
+
+        let saved = cx.update(|cx| Core::update_config(cx, |c| c.java.min_mem_mib = 1024));
+        let saved = saved.await.unwrap().unwrap();
+        let bak = dir.path().join("config.toml.bak.1");
+        assert_eq!(saved.backup.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "download = [");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.bak")).unwrap(),
+            "older"
+        );
+        assert_eq!(GlobalConfig::load(&file).unwrap().java.min_mem_mib, 1024);
+        assert!(cx.update(Core::config_load_error).await.unwrap().is_none());
+
+        // Only the first save: the file is the app's own now.
+        let saved = cx.update(|cx| Core::update_config(cx, |c| c.java.min_mem_mib = 2048));
+        assert_eq!(saved.await.unwrap().unwrap().backup, None);
+        assert!(!dir.path().join("config.toml.bak.2").exists());
+
+        // One copy per failed load: a save failing after the backup does
+        // not make another.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "download = [").unwrap();
+        let core = offline_core(rt.handle(), dir.path());
+        cx.update(|cx| cx.set_global(core.clone()));
+        assert!(loaded(&rt, &core).load_error.is_some());
+        let kept = dir.path().join("config.toml.bak");
+        rt.block_on(async { core.config.write().await.backup = Some(kept.clone()) });
+        let saved = cx.update(|cx| Core::update_config(cx, |c| c.java.min_mem_mib = 1024));
+        assert_eq!(saved.await.unwrap().unwrap().backup, None);
+        assert!(!kept.exists(), "no second copy");
+
+        // Nothing to keep when there is no file.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(back_up(&empty.path().join("config.toml")).unwrap(), None);
+    }
+
+    /// A server answering `/probe` after `delay`.
+    async fn probe_server(delay: std::time::Duration) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("ok")
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Mirror `id` sending the probe to `server`.
+    fn local_mirror(id: &str, server: &wiremock::MockServer) -> Mirror {
+        Mirror {
+            id: id.into(),
+            rules: vec![("https://probe.invalid".into(), server.uri())],
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn speed_test_keeps_the_result_and_stores_the_pick(cx: &mut TestAppContext) {
+        use std::time::Duration;
+        let rt = crate::runtime::start();
+        let (fast, slow) = rt.block_on(async {
+            (
+                probe_server(Duration::ZERO).await,
+                probe_server(Duration::from_secs(5)).await,
+            )
+        });
+        let probe = testing::ProbeSpeedTest {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            candidates: vec![
+                local_mirror("official", &fast),
+                local_mirror("bmclapi", &slow),
+            ],
+            probe_url: "https://probe.invalid/probe".into(),
+            timeout: Duration::from_millis(500),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let core = testing::core_with_speed_test(
+            rt.handle().clone(),
+            DataDirs::new(dir.path()),
+            Arc::new(FakeCatalog::new()),
+            Arc::new(probe),
+            Vec::new(),
+        );
+        cx.update(|cx| cx.set_global(core.clone()));
+        cx.executor().allow_parking();
+        loaded(&rt, &core);
+        let epoch = cx.update(|cx| ConfigChanged::epoch(cx).read(cx).get());
+        assert_eq!(core.last_speed_test(), None);
+        assert_eq!(sources(&core).0, "bmclapi");
+
+        // On automatic: the fastest answer becomes the pick, saved, and
+        // the launcher follows it.
+        let tested = cx.update(Core::speed_test_now).await.unwrap();
+        assert!(tested.result.latency("official").unwrap().is_some());
+        assert_eq!(tested.result.latency("bmclapi"), Some(None), "timed out");
+        assert!(matches!(tested.saved, Some(Ok(_))));
+        assert_eq!(core.last_speed_test(), Some(tested.result.clone()));
+        let on_disk = GlobalConfig::load(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(on_disk.download.auto_pick.as_deref(), Some("official"));
+        cx.update(Core::read_config).await.unwrap();
+        assert_eq!(sources(&core), ("official".into(), Some("bmclapi".into())));
+        cx.run_until_parked();
+        assert!(cx.update(|cx| ConfigChanged::epoch(cx).read(cx).get()) > epoch);
+
+        // A preference set: the result is kept, nothing is stored.
+        let saved =
+            cx.update(|cx| Core::update_config(cx, |c| c.download.source = SourceChoice::Bmclapi));
+        saved.await.unwrap().unwrap();
+        let tested = cx.update(Core::speed_test_now).await.unwrap();
+        assert!(tested.saved.is_none());
+        let on_disk = GlobalConfig::load(&dir.path().join("config.toml")).unwrap();
+        assert_eq!(on_disk.download.auto_pick.as_deref(), Some("official"));
+        assert_eq!(on_disk.download.source, SourceChoice::Bmclapi);
+    }
+
+    /// A speed test the core runs on its own (at startup) reaches the UI's
+    /// signal, so the status bar shows it at once.
+    #[gpui_kit::test]
+    async fn a_speed_test_of_the_core_signals_the_ui(cx: &mut TestAppContext) {
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        let core = offline_core(rt.handle(), dir.path());
+        cx.update(|cx| {
+            cx.set_global(core.clone());
+            ConfigChanged::follow_core(cx);
+        });
+        cx.executor().allow_parking();
+        let epoch =
+            |cx: &mut TestAppContext| cx.update(|cx| ConfigChanged::epoch(cx).read(cx).get());
+        cx.run_until_parked();
+        let before = epoch(cx);
+        core.record_speed_test(&SpeedTestResult::new(&[(Mirror::official(), None)]));
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if epoch(cx) > before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(epoch(cx), before + 1);
     }
 
     #[gpui_kit::test]

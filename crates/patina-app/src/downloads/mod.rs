@@ -251,9 +251,8 @@ impl DownloadsPage {
         cx: &mut Context<Self>,
     ) -> Self {
         let model = cx.new(|cx| DownloadsModel::new(instances.clone(), cx));
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(t!("downloads.search_placeholder").to_string())
-        });
+        let input = cx.new(|cx| InputState::new(window, cx));
+        crate::i18n::localized_placeholder(&input, "downloads.search_placeholder", window, cx);
         let version = dropdown(version_choices(&[], None), true, window, cx);
         let loader = dropdown(loader_choices(), false, window, cx);
         let category = dropdown(

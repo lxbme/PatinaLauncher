@@ -279,6 +279,22 @@ impl InstanceActivity {
         }
     }
 
+    /// Whether this app has work under way that quitting would cut short:
+    /// an operation (install, version change, launch…), a launch flow or a
+    /// force stop, on any instance. Games that run are not work: they go
+    /// on without the launcher.
+    pub fn has_work_in_flight(&self) -> bool {
+        self.ops.values().any(|e| e.state.is_running())
+            || !self.flows.is_empty()
+            || !self.stopping.is_empty()
+    }
+
+    /// Whether a game of any instance is starting or running (here or in
+    /// another Patina process).
+    pub fn any_game_busy(&self) -> bool {
+        self.running.values().any(RunState::is_busy)
+    }
+
     /// Whether this app follows a game of `id`: its session, or a look
     /// through its running record (in flight or polling).
     pub fn is_following(&self, id: &str) -> bool {

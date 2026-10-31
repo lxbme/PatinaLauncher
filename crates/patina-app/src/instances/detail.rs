@@ -28,7 +28,7 @@ use super::{
 use crate::content::{LocalKind, LocalTab, ModsChanged, ModsEvents, ModsTab};
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
-use crate::launch::{LogView, OpState, RunState, stop_dialog};
+use crate::launch::{LogView, OpState, ProgressView, RunState, stop_dialog};
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
 use crate::theme::ProductColors;
 
@@ -819,7 +819,7 @@ impl DetailView {
         match op {
             OpState::Running { progress, .. } => {
                 let fraction = progress.as_ref().and_then(|p| p.fraction);
-                let step = progress.as_ref().map(|p| p.step.clone());
+                let step = progress.as_ref().map(ProgressView::step);
                 let amount = progress.as_ref().and_then(|p| p.amount.clone());
                 let text = [step, amount].into_iter().flatten().collect::<Vec<_>>();
                 area.child(

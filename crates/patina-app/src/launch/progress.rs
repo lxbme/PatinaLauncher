@@ -10,8 +10,9 @@ const KIB: u64 = 1024;
 /// What the header's progress area shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgressView {
-    /// The localized step description.
-    pub step: String,
+    /// The step; described in the current language when drawn
+    /// ([`ProgressView::step`]), so it follows a language switch.
+    pub phase: Phase,
     /// The bar's fill in `0.0..=1.0`; `None` when the total is unknown
     /// (an indeterminate bar).
     pub fraction: Option<f32>,
@@ -19,14 +20,20 @@ pub struct ProgressView {
     pub amount: Option<String>,
 }
 
+impl ProgressView {
+    /// The localized step description, in the current language.
+    pub fn step(&self) -> String {
+        self.phase.display_name()
+    }
+}
+
 /// The view of one progress tick, on its own. `done` above `total` is
 /// clamped; `total == 0` is indeterminate. Use [`ProgressTracker`] to also
 /// keep the bar from going back within a phase.
 pub fn view_of(p: &TaskProgress) -> ProgressView {
-    let step = p.phase.display_name();
     if p.total == 0 {
         return ProgressView {
-            step,
+            phase: p.phase,
             fraction: None,
             amount: None,
         };
@@ -42,7 +49,7 @@ pub fn view_of(p: &TaskProgress) -> ProgressView {
         Unit::Bytes => t!("ops.amount_kb", done = done / KIB, total = p.total / KIB).to_string(),
     };
     ProgressView {
-        step,
+        phase: p.phase,
         fraction: Some(fraction),
         amount: Some(amount),
     }
