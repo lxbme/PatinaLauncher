@@ -14,6 +14,7 @@ use gpui_kit::{
 
 use super::placeholder;
 use super::{Nav, OpenDownloads, Rail, ShellState, StatusBar, TitleBarView};
+use crate::accounts::AccountsPage;
 use crate::downloads::DownloadsPage;
 use crate::fonts;
 use crate::instances::{InstancesChanged, InstancesPage};
@@ -38,6 +39,7 @@ pub struct RootView {
     status_bar: Entity<StatusBar>,
     instances: Entity<InstancesPage>,
     downloads: Entity<DownloadsPage>,
+    accounts: Entity<AccountsPage>,
     focus: FocusHandle,
     _observe: Subscription,
     _instances_changed: Subscription,
@@ -53,6 +55,7 @@ impl RootView {
         let instances = cx.new(|cx| InstancesPage::new(window, cx));
         let model = instances.read(cx).model().clone();
         let downloads = cx.new(|cx| DownloadsPage::new(model.clone(), window, cx));
+        let accounts = cx.new(|cx| AccountsPage::new(window, cx));
         // This app's own instance operations change the status bar's
         // count and size at once, without waiting for its throttle.
         let _instances_changed = cx.subscribe(&model, |this, _, _: &InstancesChanged, cx| {
@@ -72,12 +75,15 @@ impl RootView {
             status_bar: cx.new(|cx| StatusBar::new(window, cx)),
             instances,
             downloads,
+            accounts,
             _observe: cx.observe(&shell, |this, shell, cx| {
                 let nav = shell.read(cx).nav();
                 this.instances
                     .update(cx, |page, cx| page.set_shown(nav == Nav::Instances, cx));
-                if nav == Nav::Downloads {
-                    this.downloads.update(cx, |page, cx| page.shown(cx));
+                match nav {
+                    Nav::Downloads => this.downloads.update(cx, |page, cx| page.shown(cx)),
+                    Nav::Accounts => this.accounts.update(cx, |page, cx| page.shown(cx)),
+                    Nav::Instances | Nav::Settings => {}
                 }
                 cx.notify();
             }),
@@ -106,6 +112,10 @@ impl RootView {
 
     pub fn downloads(&self) -> &Entity<DownloadsPage> {
         &self.downloads
+    }
+
+    pub fn accounts(&self) -> &Entity<AccountsPage> {
+        &self.accounts
     }
 
     /// The launch flow's requests for the shell and the window.
@@ -166,8 +176,8 @@ impl RootView {
             .update(cx, |t, cx| t.focus_search(window, cx));
     }
 
-    /// The page for `nav`. The accounts and settings pages are
-    /// placeholders until plan 4c fills them.
+    /// The page for `nav`. The settings page is a placeholder until plan
+    /// 4c fills it.
     fn render_page(&self, nav: Nav) -> AnyElement {
         let page = div()
             .id(nav.page_id())
@@ -178,9 +188,7 @@ impl RootView {
         match nav {
             Nav::Instances => page.child(self.instances.clone()).into_any_element(),
             Nav::Downloads => page.child(self.downloads.clone()).into_any_element(),
-            Nav::Accounts => page
-                .child(placeholder::page(IconName::CircleUser, nav.label()))
-                .into_any_element(),
+            Nav::Accounts => page.child(self.accounts.clone()).into_any_element(),
             Nav::Settings => page
                 .child(placeholder::page(IconName::Settings, nav.label()))
                 .into_any_element(),

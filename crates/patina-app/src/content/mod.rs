@@ -30,6 +30,7 @@ pub use list::{
     ContentLoader, ContentTab, ContentToolbar, EmptyKind, EmptyState, LoadState, Named, Reloaded,
     filter_input, matches_filter,
 };
+pub(crate) use local_tab::focus_first_button;
 pub use local_tab::{LocalItem, LocalKind, LocalTab, local_delete_id, local_row_id};
 pub use mods_tab::{
     HIGHLIGHT_FOR, ModInfo, ModItem, ModsChanged, ModsEvents, ModsTab, mod_delete_id,

@@ -22,10 +22,12 @@ impl AccountsEpoch {
 
 /// The app's [`AccountsEpoch`] (a gpui `Global`, set by [`AccountsChanged::init`]).
 ///
-/// **Every writer of the accounts must call [`AccountsChanged::bump`]** once
-/// its change through [`Core::with_accounts`](super::Core::with_accounts)
-/// has finished (add, remove, switch, sign-in, reload): views read the
-/// accounts again only when told.
+/// **Every change of the accounts is followed by [`AccountsChanged::bump`]**
+/// (add, remove, switch, sign-in, reload): views read the accounts again
+/// only when told. Writers go through
+/// [`Core::update_accounts`](super::Core::update_accounts) and
+/// [`Core::reload_accounts`](super::Core::reload_accounts), which bump once
+/// the change has finished.
 pub struct AccountsChanged(Entity<AccountsEpoch>);
 
 impl Global for AccountsChanged {}

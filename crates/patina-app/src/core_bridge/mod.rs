@@ -9,8 +9,9 @@
 //!   dropping that task cancels the work if it has not started (or, for
 //!   async work, at its next await);
 //! - the config and the accounts are reached through [`Core::read_config`],
-//!   [`Core::update_config`] and [`Core::with_accounts`]; whoever changes
-//!   the accounts then calls [`AccountsChanged::bump`] so views re-read them;
+//!   [`Core::update_config`] and [`Core::with_accounts`]; the accounts change
+//!   only through [`Core::update_accounts`] and [`Core::reload_accounts`],
+//!   which then call [`AccountsChanged::bump`] so views re-read them;
 //! - a stream of progress reaches a view through [`forward_progress`], at most
 //!   about 30 times a second;
 //! - launches are prepared through `Core.launch_backend` ([`LaunchBackend`]),

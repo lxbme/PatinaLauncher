@@ -1,10 +1,13 @@
 //! The title bar (client-side, `title_bar` fill): mark and name, a centred
 //! global search box (`/` focuses it; see [`GlobalSearch`]), then download
-//! activity, the current account, settings and the window controls.
+//! activity, the current account (a switcher, see
+//! [`account_switcher`]), settings and the window controls.
 //!
 //! The bar is gpui-component's `TitleBar`, as in crypto_pro and the
 //! prototype: on a client-side decorated window it drags the window and draws
 //! the window controls; under server decorations it is a plain bar.
+
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -18,7 +21,8 @@ use gpui_kit::{
 use rust_i18n::t;
 
 use super::{Nav, ShellState};
-use crate::core_bridge::{AccountsChanged, Core, Revision};
+use crate::accounts::{AccountsSnapshot, account_switcher, read_accounts};
+use crate::core_bridge::{AccountsChanged, Revision};
 use crate::fonts::Strong;
 use crate::instances::InstancesPage;
 use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY};
@@ -42,6 +46,9 @@ pub struct TitleBarView {
     shell: Entity<ShellState>,
     search: Entity<GlobalSearch>,
     account: AccountLabel,
+    /// The accounts the switcher lists; `None` until read, or when they
+    /// could not be read.
+    accounts: Option<Rc<AccountsSnapshot>>,
     account_rev: Revision,
     account_load: Task<()>,
     _accounts_changed: Subscription,
@@ -67,6 +74,7 @@ impl TitleBarView {
             shell,
             search,
             account: AccountLabel::default(),
+            accounts: None,
             account_rev: Revision::default(),
             account_load: Task::ready(()),
             _accounts_changed,
@@ -88,30 +96,31 @@ impl TitleBarView {
         &self.account
     }
 
-    /// Reads the current account's name in the background; a newer read
-    /// supersedes this one.
+    /// Reads the accounts in the background; a newer read supersedes this
+    /// one.
     pub fn refresh_account(&mut self, cx: &mut Context<Self>) {
         let id = self.account_rev.start();
-        let read = Core::with_accounts(cx, |accounts| match accounts {
-            Ok(store) => Ok(store.current().map(|a| a.username.clone())),
-            Err(e) => Err(e.to_string()),
-        });
+        let read = read_accounts(cx);
         self.account_load = cx.spawn(async move |this, cx| {
-            let label = match read.await {
-                Ok(Ok(Some(name))) => AccountLabel::SignedIn(name.into()),
-                Ok(Ok(None)) => AccountLabel::SignedOut,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "accounts unavailable; title bar shows signed out");
-                    AccountLabel::SignedOut
+            let (label, accounts) = match read.await {
+                Ok(snapshot) => {
+                    let label = match snapshot.current() {
+                        Some(a) => AccountLabel::SignedIn(a.username.clone().into()),
+                        None => AccountLabel::SignedOut,
+                    };
+                    (label, Some(Rc::new(snapshot)))
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "reading the current account failed");
-                    AccountLabel::SignedOut
+                    tracing::warn!(%error, "accounts unavailable; title bar shows signed out");
+                    (AccountLabel::SignedOut, None)
                 }
             };
             this.update(cx, |this, cx| {
-                if this.account_rev.is_current(id) && this.account != label {
+                if this.account_rev.is_current(id)
+                    && (this.account != label || this.accounts != accounts)
+                {
                     this.account = label;
+                    this.accounts = accounts;
                     cx.notify();
                 }
             })
@@ -184,18 +193,10 @@ impl TitleBarView {
                     .on_click(go(Nav::Downloads, self.shell.clone())),
             )
             .child(Separator::vertical().h(rems(1.)).mx_1())
-            .child({
-                let button = Button::new("title-account")
-                    .ghost()
-                    .small()
-                    .icon(Icon::new(IconName::CircleUser))
-                    .tooltip(Nav::Accounts.label())
-                    .on_click(go(Nav::Accounts, self.shell.clone()));
-                match account {
-                    Some(name) => button.label(name),
-                    None => button.accessibility_label(Nav::Accounts.label()),
-                }
-            })
+            .child(account_switcher(account, self.accounts.clone(), {
+                let shell = self.shell.clone();
+                Rc::new(move |_, cx| shell.update(cx, |s, cx| s.navigate(Nav::Accounts, cx)))
+            }))
             .child(
                 Button::new("title-settings")
                     .ghost()

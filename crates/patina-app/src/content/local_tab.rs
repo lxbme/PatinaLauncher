@@ -878,7 +878,7 @@ impl LocalTab {
 /// call only): the footer's region (`footer`) takes the focus, and the next
 /// tab stop after it is the first button. The destructive button is never
 /// the default.
-fn focus_first_button(
+pub(crate) fn focus_first_button(
     footer: &FocusHandle,
     pending: &Cell<bool>,
     window: &mut Window,

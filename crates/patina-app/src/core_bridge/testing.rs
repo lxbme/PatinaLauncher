@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use patina_core::accounts::login::{
+    CancelToken, DeviceCode, DeviceCodeLogin, LoginError, LoginEvent,
+};
 use patina_core::content::online::{ContentSource, OnlineError, OnlinePage, OnlineQuery};
 use patina_core::instance::InstanceStore;
 use patina_core::loader::ops::{LoaderAction, OpOutcome};
@@ -92,6 +95,78 @@ pub fn core_with_source(
         ..Fakes::default()
     };
     Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
+/// [`core`] whose Microsoft sign-in goes through `login` (a
+/// [`HeldLogin`]).
+pub fn core_with_login(
+    rt: Handle,
+    data: DataDirs,
+    catalog: Arc<dyn Catalog>,
+    login: Arc<dyn DeviceCodeLogin>,
+) -> Core {
+    let fakes = Fakes {
+        catalog: Some(catalog),
+        login: Some(login),
+        ..Fakes::default()
+    };
+    Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
+/// A sign-in that shows `code`, reports waiting, then waits until it is
+/// cancelled; it counts the attempts started and the cancellations it saw
+/// (by the token's value or its sender being dropped).
+pub struct HeldLogin {
+    code: String,
+    started: AtomicUsize,
+    cancelled: Arc<AtomicUsize>,
+}
+
+impl HeldLogin {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            started: AtomicUsize::new(0),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    pub fn cancelled(&self) -> usize {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl DeviceCodeLogin for HeldLogin {
+    fn start(
+        &self,
+        events: tokio::sync::mpsc::UnboundedSender<LoginEvent>,
+        mut cancel: CancelToken,
+    ) -> BoxFuture<'static, ()> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let code = DeviceCode {
+            user_code: self.code.clone(),
+            verification_uri: "https://microsoft.com/link".into(),
+            expires_in: std::time::Duration::from_secs(900),
+        };
+        let cancelled = self.cancelled.clone();
+        async move {
+            events.send(LoginEvent::Code(code)).ok();
+            events.send(LoginEvent::Waiting).ok();
+            // Ends on `true` or when the sender is gone.
+            while !*cancel.borrow_and_update() {
+                if cancel.changed().await.is_err() {
+                    break;
+                }
+            }
+            cancelled.fetch_add(1, Ordering::SeqCst);
+            events.send(LoginEvent::Failed(LoginError::Cancelled)).ok();
+        }
+        .boxed()
+    }
 }
 
 type Answerer = Box<dyn Fn(&OnlineQuery) -> Result<OnlinePage, OnlineError> + Send + Sync>;

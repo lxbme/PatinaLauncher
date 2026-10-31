@@ -7356,3 +7356,416 @@ mod downloads {
         assert_eq!(look(cx), (Some("Van".into()), "y".into()));
     }
 }
+
+// ---- Accounts page ----
+
+mod accounts {
+    use super::*;
+    use gpui_kit::MouseButton;
+    use gpui_kit::test::TestEventExt;
+    use patina_app::accounts::{
+        AccountsPage, account_row_id, current_tag_id, remove_id, set_current_id,
+    };
+    use patina_app::core_bridge::testing::HeldLogin;
+
+    const TWO: &str = r#"
+current = "msa-1"
+
+[[accounts]]
+id = "msa-1"
+kind = "msa"
+username = "Steve"
+uuid = "00000000-0000-0000-0000-000000000001"
+
+[[accounts]]
+id = "msa-2"
+kind = "msa"
+username = "Alex"
+uuid = "00000000-0000-0000-0000-000000000002"
+"#;
+
+    fn page(app: &Booted, cx: &mut TestAppContext) -> Entity<AccountsPage> {
+        cx.update(|cx| app.root.read(cx).accounts().clone())
+    }
+
+    /// The names on the page, once it has read them.
+    fn names(app: &Booted, cx: &mut TestAppContext) -> Option<Vec<String>> {
+        page(app, cx).read_with(cx, |p, _| {
+            p.snapshot()
+                .map(|s| s.accounts.iter().map(|a| a.username.clone()).collect())
+        })
+    }
+
+    /// Shows the accounts page and waits until it has read the accounts
+    /// (or failed to).
+    fn open_page(app: &Booted, cx: &mut TestAppContext) {
+        click(app, cx, "rail-accounts");
+        let page = page(app, cx);
+        settle(cx, |cx| {
+            page.read_with(cx, |p, _| p.snapshot().is_some() || p.error().is_some())
+        });
+    }
+
+    fn title_label(app: &Booted, cx: &mut TestAppContext) -> AccountLabel {
+        let title = cx.update(|cx| app.root.read(cx).title_bar().clone());
+        title.read_with(cx, |t, _| t.account().clone())
+    }
+
+    fn signed_in(name: &str) -> AccountLabel {
+        AccountLabel::SignedIn(name.to_string().into())
+    }
+
+    fn accounts_file(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("accounts.toml")).unwrap_or_default()
+    }
+
+    fn stored_current(dir: &Path) -> Option<String> {
+        let file: toml::Table = toml::from_str(&accounts_file(dir)).unwrap();
+        file.get("current")
+            .and_then(|c| c.as_str())
+            .map(str::to_owned)
+    }
+
+    /// Clicks the open menu's item `label` (menu items have no own id).
+    fn click_item(app: &Booted, cx: &mut TestAppContext, label: &str) {
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let item = window.within("popup-menu").find_by_label(label);
+            let at = item.bounds().center();
+            window.pointer_move(at, None, cx);
+            window.pointer_down(at, MouseButton::Left, cx);
+            window.pointer_up(at, MouseButton::Left, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn menu_open(app: &Booted, cx: &mut TestAppContext) -> bool {
+        shows(app, cx, "popup-menu")
+    }
+
+    /// Waits for the login dialog's code and returns it.
+    fn wait_code(app: &Booted, cx: &mut TestAppContext) -> String {
+        settle(cx, |cx| label_of(app, cx, "login-code").is_some());
+        label_of(app, cx, "login-code").unwrap()
+    }
+
+    #[cfg(not(feature = "dev-offline"))]
+    #[gpui_kit::test]
+    fn release_accounts_page_has_no_offline_entry(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+        assert!(shows(&app, cx, "accounts-add-msa"));
+        assert!(!disabled(&app, cx, "accounts-add-msa"));
+        assert!(element(&app, cx, "accounts-add-offline").is_none());
+
+        // The sign-in of this build has no flow.
+        let login = cx.update(|cx| Core::global(cx).login.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel, token) = tokio::sync::watch::channel(false);
+        app._rt.block_on(login.start(tx, token));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(patina_core::accounts::login::LoginEvent::Failed(
+                patina_core::accounts::login::LoginError::Unavailable
+            ))
+        );
+    }
+
+    #[cfg(not(feature = "dev-offline"))]
+    #[gpui_kit::test]
+    fn release_login_shows_unavailable(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+        click(&app, cx, "accounts-add-msa");
+        assert!(shows(&app, cx, "dialog"));
+        settle(cx, |cx| label_of(&app, cx, "login-failed").is_some());
+        assert_eq!(
+            label_of(&app, cx, "login-failed").as_deref(),
+            Some("Microsoft sign-in isn’t available yet")
+        );
+        assert!(element(&app, cx, "login-code").is_none());
+        assert!(element(&app, cx, "login-cancel").is_none());
+        app.language(Language::ZhCn);
+        assert_eq!(
+            label_of(&app, cx, "login-failed").as_deref(),
+            Some("微软登录暂未开放")
+        );
+        app.language(Language::En);
+        click(&app, cx, "login-close");
+        assert!(!shows(&app, cx, "dialog"));
+        assert!(!tmp.path().join("accounts.toml").exists(), "nothing saved");
+    }
+
+    #[cfg(feature = "dev-offline")]
+    #[gpui_kit::test]
+    fn fake_login_walks_states_and_adds_nothing(cx: &mut TestAppContext) {
+        use patina_app::accounts::{FAKE_CODE, FAKE_URI};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("accounts.toml"), ACCOUNT).unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+        let before = accounts_file(tmp.path());
+
+        click(&app, cx, "accounts-add-msa");
+        assert!(shows(&app, cx, "dialog"));
+        assert_eq!(wait_code(&app, cx), FAKE_CODE);
+        settle(cx, |cx| shows(&app, cx, "login-waiting"));
+        assert!(shows(&app, cx, "login-cancel"));
+
+        click(&app, cx, "login-copy");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(copied.as_deref(), Some(FAKE_CODE));
+        click(&app, cx, "login-open");
+        assert_eq!(cx.opened_url().as_deref(), Some(FAKE_URI));
+
+        // The fake approves after 2 s; the dialog only says so.
+        settle(cx, |cx| label_of(&app, cx, "login-done").is_some());
+        assert_eq!(
+            label_of(&app, cx, "login-done").as_deref(),
+            Some("Development build: the walkthrough finished; no account was added")
+        );
+        assert!(element(&app, cx, "login-code").is_none());
+        assert!(element(&app, cx, "login-cancel").is_none());
+        click(&app, cx, "login-close");
+        assert!(!shows(&app, cx, "dialog"));
+
+        std::thread::sleep(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(accounts_file(tmp.path()), before, "accounts.toml unchanged");
+        assert_eq!(names(&app, cx), Some(vec!["Steve".to_string()]));
+    }
+
+    #[cfg(feature = "dev-offline")]
+    #[gpui_kit::test]
+    fn offline_name_validation(cx: &mut TestAppContext) {
+        use patina_core::accounts::AccountError;
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+        assert!(shows(&app, cx, "accounts-empty"));
+        click(&app, cx, "accounts-add-offline");
+        assert!(shows(&app, cx, "dialog"));
+        // Nothing typed: no complaint yet, but nothing to add.
+        assert!(element(&app, cx, "offline-name-error").is_none());
+        assert!(disabled(&app, cx, "offline-add"));
+
+        // The keyboard is in the name.
+        type_text(&app, cx, "ab");
+        let invalid = |name: &str| AccountError::InvalidName(name.into()).to_string();
+        assert_eq!(
+            label_of(&app, cx, "offline-name-error"),
+            Some(invalid("ab"))
+        );
+        assert!(disabled(&app, cx, "offline-add"));
+        // Enter does not add an invalid name.
+        press(&app, cx, "enter");
+        assert!(shows(&app, cx, "dialog"));
+
+        type_text(&app, cx, "c");
+        assert!(element(&app, cx, "offline-name-error").is_none());
+        assert!(!disabled(&app, cx, "offline-add"));
+
+        type_text(&app, cx, " d");
+        assert_eq!(
+            label_of(&app, cx, "offline-name-error"),
+            Some(invalid("abc d"))
+        );
+        assert!(disabled(&app, cx, "offline-add"));
+        press(&app, cx, "ctrl-a");
+        type_text(&app, cx, &"x".repeat(17));
+        assert!(label_of(&app, cx, "offline-name-error").is_some());
+
+        nothing_saved(tmp.path(), cx);
+
+        press(&app, cx, "ctrl-a");
+        type_text(&app, cx, "Dev_One");
+        assert!(element(&app, cx, "offline-name-error").is_none());
+        press(&app, cx, "enter");
+        assert!(!shows(&app, cx, "dialog"));
+        settle(cx, |cx| {
+            names(&app, cx) == Some(vec!["Dev_One".to_string()])
+        });
+        // The first account becomes the current one.
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Dev_One"));
+        assert!(accounts_file(tmp.path()).contains("Dev_One"));
+    }
+
+    /// Gives background work a moment, then checks nothing was written.
+    #[cfg(feature = "dev-offline")]
+    fn nothing_saved(dir: &Path, cx: &mut TestAppContext) {
+        std::thread::sleep(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(!dir.join("accounts.toml").exists(), "nothing saved");
+    }
+
+    #[gpui_kit::test]
+    fn cancel_stops_login(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let login = Arc::new(HeldLogin::new("HELD-1234"));
+        let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+            testing::core_with_login(rt, data, Arc::new(FakeCatalog::new()), login.clone())
+        });
+        open_page(&app, cx);
+
+        // "取消" sets the token.
+        click(&app, cx, "accounts-add-msa");
+        assert_eq!(wait_code(&app, cx), "HELD-1234");
+        settle(cx, |cx| shows(&app, cx, "login-waiting"));
+        assert_eq!(login.started(), 1);
+        assert_eq!(login.cancelled(), 0);
+        click(&app, cx, "login-cancel");
+        assert!(!shows(&app, cx, "dialog"));
+        settle(cx, |_| login.cancelled() == 1);
+
+        // Escape closes the dialog, which drops the token.
+        click(&app, cx, "accounts-add-msa");
+        assert_eq!(wait_code(&app, cx), "HELD-1234");
+        assert_eq!(login.started(), 2);
+        press(&app, cx, "escape");
+        assert!(!shows(&app, cx, "dialog"));
+        settle(cx, |_| login.cancelled() == 2);
+
+        // Enter on the dialog commits nothing and keeps the attempt.
+        click(&app, cx, "accounts-add-msa");
+        wait_code(&app, cx);
+        press(&app, cx, "enter");
+        assert!(shows(&app, cx, "dialog"));
+        assert_eq!(login.cancelled(), 2);
+        assert!(!tmp.path().join("accounts.toml").exists(), "nothing saved");
+    }
+
+    #[gpui_kit::test]
+    fn set_current_updates_title_bar(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("accounts.toml"), TWO).unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
+        open_page(&app, cx);
+        assert_eq!(
+            names(&app, cx),
+            Some(vec!["Steve".to_string(), "Alex".to_string()])
+        );
+        assert!(shows(&app, cx, current_tag_id("msa-1")));
+        assert!(!shows(&app, cx, current_tag_id("msa-2")));
+        assert!(element(&app, cx, set_current_id("msa-1")).is_none());
+        assert_eq!(
+            element(&app, cx, account_row_id("msa-1")).and_then(|e| e.selected()),
+            Some(true)
+        );
+
+        // From the page.
+        click(&app, cx, set_current_id("msa-2"));
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Alex"));
+        assert_eq!(stored_current(tmp.path()).as_deref(), Some("msa-2"));
+        settle(cx, |cx| shows(&app, cx, current_tag_id("msa-2")));
+        assert!(!shows(&app, cx, current_tag_id("msa-1")));
+
+        // From the title bar's menu, by pointer: the current one is checked.
+        click(&app, cx, "title-account");
+        assert!(menu_open(&app, cx));
+        click_item(&app, cx, "Steve");
+        assert!(!menu_open(&app, cx));
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
+        assert_eq!(stored_current(tmp.path()).as_deref(), Some("msa-1"));
+        settle(cx, |cx| shows(&app, cx, current_tag_id("msa-1")));
+
+        // By keyboard: Tab reaches the button, Enter opens the menu, the
+        // arrows choose, Enter switches; Escape closes it.
+        tab_to(&app, cx, "title-account");
+        press(&app, cx, "enter");
+        assert!(menu_open(&app, cx));
+        press(&app, cx, "escape");
+        assert!(!menu_open(&app, cx));
+        tab_to(&app, cx, "title-account");
+        press(&app, cx, "enter");
+        assert!(menu_open(&app, cx));
+        press(&app, cx, "down");
+        press(&app, cx, "down");
+        press(&app, cx, "enter");
+        assert!(!menu_open(&app, cx));
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Alex"));
+        assert_eq!(stored_current(tmp.path()).as_deref(), Some("msa-2"));
+
+        // "管理账号…" shows the page.
+        click(&app, cx, "rail-instances");
+        assert_eq!(nav(&app, cx), Nav::Instances);
+        click(&app, cx, "title-account");
+        click_item(&app, cx, "Manage accounts…");
+        assert_eq!(nav(&app, cx), Nav::Accounts);
+    }
+
+    #[gpui_kit::test]
+    fn remove_requires_confirmation(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("accounts.toml"), TWO).unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+
+        click(&app, cx, remove_id("msa-2"));
+        assert!(shows(&app, cx, "dialog"));
+        assert_eq!(
+            label_of(&app, cx, "account-remove-title").as_deref(),
+            Some("Remove “Alex”?")
+        );
+        // The keyboard starts on 取消: a reflexive Enter cancels.
+        settle(cx, |cx| {
+            element(&app, cx, "account-remove-cancel").and_then(|e| e.focused()) == Some(true)
+        });
+        press(&app, cx, "enter");
+        assert!(!shows(&app, cx, "dialog"));
+        std::thread::sleep(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(accounts_file(tmp.path()).contains("Alex"));
+        assert_eq!(
+            names(&app, cx),
+            Some(vec!["Steve".to_string(), "Alex".to_string()])
+        );
+
+        // 移除 removes it.
+        click(&app, cx, remove_id("msa-2"));
+        click(&app, cx, "account-remove-ok");
+        assert!(!shows(&app, cx, "dialog"));
+        settle(cx, |cx| names(&app, cx) == Some(vec!["Steve".to_string()]));
+        assert!(!accounts_file(tmp.path()).contains("Alex"));
+        assert_eq!(title_label(&app, cx), signed_in("Steve"));
+
+        // Removing the current one signs out.
+        click(&app, cx, remove_id("msa-1"));
+        click(&app, cx, "account-remove-ok");
+        settle(cx, |cx| names(&app, cx) == Some(Vec::new()));
+        settle(cx, |cx| title_label(&app, cx) == AccountLabel::SignedOut);
+        assert!(shows(&app, cx, "accounts-empty"));
+    }
+
+    #[gpui_kit::test]
+    async fn an_unreadable_file_is_shown_and_never_written(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("accounts.toml");
+        std::fs::write(&file, "not [valid").unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+        let error = page(&app, cx).read_with(cx, |p, _| p.error().map(str::to_owned));
+        let error = error.expect("the page says why");
+        assert!(error.starts_with("Invalid accounts file format"), "{error}");
+        assert_eq!(label_of(&app, cx, "accounts-error"), Some(error));
+        assert!(disabled(&app, cx, "accounts-add-msa"));
+        #[cfg(feature = "dev-offline")]
+        assert!(disabled(&app, cx, "accounts-add-offline"));
+        settle(cx, |cx| title_label(&app, cx) == AccountLabel::SignedOut);
+
+        // A change from elsewhere (the title bar's menu) is refused too.
+        let refused = cx.update(|cx| Core::update_accounts(cx, |store| store.set_current("msa-1")));
+        assert!(refused.await.is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not [valid");
+
+        // Fixed outside the app, "Read again" picks it up.
+        std::fs::write(&file, ACCOUNT).unwrap();
+        click(&app, cx, "accounts-reload");
+        settle(cx, |cx| names(&app, cx) == Some(vec!["Steve".to_string()]));
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
+        assert!(!disabled(&app, cx, "accounts-add-msa"));
+    }
+}

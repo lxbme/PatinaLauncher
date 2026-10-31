@@ -347,3 +347,45 @@ downloads:
     install_to: "安装到 %{instance}"
     choose_instance: "选择实例…"
     install_soon: "在线下载即将推出"
+
+accounts:
+  title: "账号"
+  add_msa: "添加微软账号…"
+  add_offline: "添加离线账号…"
+  dev_only: "仅开发构建"
+  kind:
+    msa: "微软"
+    offline: "离线（开发构建）"
+  current: "当前"
+  set_current: "设为当前"
+  remove: "移除…"
+  remove_title: '移除"%{name}"？'
+  remove_body: "只从启动器中移除，之后可以重新添加。"
+  remove_confirm: "移除"
+  remove_failed: '无法移除"%{name}"：%{error}'
+  switch_failed: "无法切换账号：%{error}"
+  cancel: "取消"
+  empty: "还没有账号。添加账号后才能启动游戏。"
+  failed_hint: "启动器不会改动这个文件。修好或移走它之后，点“重新读取”。"
+  reload: "重新读取"
+  switcher:
+    tooltip: "账号"
+    manage: "管理账号…"
+  login:
+    title: "添加微软账号"
+    preparing: "正在获取验证码…"
+    enter_code: "在 %{site} 输入这个代码："
+    copy: "复制"
+    copied: "已复制"
+    open: "打开 %{site}"
+    waiting: "等待你在浏览器中完成登录…"
+    done_not_added: "开发构建：流程演示完成，未添加账号"
+    unavailable: "微软登录暂未开放"
+    cancel: "取消"
+    close: "关闭"
+    retry: "重试"
+  offline:
+    title: "添加离线账号（仅开发构建）"
+    name: "玩家名"
+    add: "添加"
+    add_failed: '无法添加"%{name}"：%{error}'

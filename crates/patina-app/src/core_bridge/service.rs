@@ -4,7 +4,8 @@ use std::sync::{Arc, PoisonError, RwLock as StdRwLock};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use gpui_kit::{App, Global, Task};
+use gpui_kit::{App, AppContext as _, Global, Task};
+use patina_core::accounts::login::DeviceCodeLogin;
 use patina_core::accounts::{AccountError, AccountStore};
 use patina_core::config::{ConfigError, GlobalConfig};
 use patina_core::content::online::{ContentSource, UnavailableSource};
@@ -18,6 +19,7 @@ use rust_i18n::t;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock};
 
+use super::accounts_changed::AccountsChanged;
 use super::launch::{CoreLaunchBackend, LaunchBackend};
 use super::task::{BridgeError, run, run_blocking};
 use super::version_ops::{CoreVersionOps, VersionOps};
@@ -106,6 +108,11 @@ pub struct Core {
     /// Online mod/pack search, injectable for UI tests. Production has no
     /// real source yet ([`UnavailableSource`]).
     pub content_source: Arc<dyn ContentSource>,
+    /// Microsoft sign-in, injectable for UI tests. Release builds have no
+    /// real flow yet (`UnavailableLogin`); development builds
+    /// (`dev-offline`) walk a fake one that never adds an account
+    /// (`accounts::FakeLogin`).
+    pub login: Arc<dyn DeviceCodeLogin>,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
@@ -145,6 +152,7 @@ pub(super) struct Fakes {
     pub(super) launch_backend: Option<Arc<dyn LaunchBackend>>,
     pub(super) version_ops: Option<Arc<dyn VersionOps>>,
     pub(super) content_source: Option<Arc<dyn ContentSource>>,
+    pub(super) login: Option<Arc<dyn DeviceCodeLogin>>,
 }
 
 impl Core {
@@ -169,6 +177,7 @@ impl Core {
             launch_backend,
             version_ops,
             content_source,
+            login,
         } = fakes;
         let client = {
             let _rt = rt.enter();
@@ -211,6 +220,7 @@ impl Core {
             })
         });
         let content_source = content_source.unwrap_or_else(|| Arc::new(UnavailableSource));
+        let login = login.unwrap_or_else(default_login);
         let core = Core {
             rt,
             store,
@@ -219,6 +229,7 @@ impl Core {
             launch_backend,
             version_ops,
             content_source,
+            login,
             config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),
@@ -288,15 +299,62 @@ impl Core {
     }
 
     /// Runs `f` with the account store on the blocking pool (the store does
-    /// file I/O). A caller that changes the accounts must call
-    /// [`AccountsChanged::bump`](super::AccountsChanged::bump) once the task
-    /// has finished, so views showing accounts read them again.
+    /// file I/O). For reading: changes go through [`Core::update_accounts`]
+    /// or [`Core::reload_accounts`], which signal [`AccountsChanged`] so
+    /// views showing accounts read them again.
     pub fn with_accounts<R: Send + 'static>(
         cx: &mut App,
         f: impl FnOnce(&mut LoadedAccounts) -> R + Send + 'static,
     ) -> Task<Result<R, BridgeError>> {
         let accounts = Core::global(cx).accounts.clone();
         run_blocking(cx, move || f(&mut accounts.blocking_lock()))
+    }
+
+    /// Changes the accounts with `f`, saves them, then signals
+    /// [`AccountsChanged`]: the one way to write the accounts. Resolves to
+    /// `f`'s value, or the localized reason nothing was saved.
+    ///
+    /// Refused while the accounts are not loaded (an unreadable
+    /// `accounts.toml` is never written over). When `f` fails nothing is
+    /// saved; when saving fails, memory is read back from the file so it
+    /// matches what is on disk. The change and the signal happen even if
+    /// the returned task is dropped.
+    pub fn update_accounts<R: Send + 'static>(
+        cx: &mut App,
+        f: impl FnOnce(&mut AccountStore) -> Result<R, AccountError> + Send + 'static,
+    ) -> Task<Result<R, String>> {
+        let data = Core::global(cx).data.clone();
+        let change = Core::with_accounts(cx, move |loaded| {
+            let store = loaded.as_mut().map_err(|e| e.to_string())?;
+            let value = f(store).map_err(|e| e.to_string())?;
+            if let Err(error) = store.save() {
+                tracing::warn!(%error, "saving the accounts failed; reading them back");
+                match AccountStore::load(&data) {
+                    Ok(on_disk) => *store = on_disk,
+                    Err(e) => tracing::warn!(error = %e, "reading the accounts back failed"),
+                }
+                return Err(error.to_string());
+            }
+            Ok(value)
+        });
+        signal_after(cx, change)
+    }
+
+    /// Reads `accounts.toml` again (after a failed load, or to pick up an
+    /// edit made outside the app), then signals [`AccountsChanged`].
+    /// Resolves to the localized reason the file could not be read; the
+    /// accounts in memory are then that error too, so nothing writes over
+    /// the file.
+    pub fn reload_accounts(cx: &mut App) -> Task<Result<(), String>> {
+        let data = Core::global(cx).data.clone();
+        let reload = Core::with_accounts(cx, move |loaded| {
+            *loaded = AccountStore::load(&data).map_err(|e| {
+                tracing::warn!(error = %e, "failed to reload the accounts");
+                LoadError::Failed(Arc::new(e))
+            });
+            loaded.as_ref().map(|_| ()).map_err(|e| e.to_string())
+        });
+        signal_after(cx, reload)
     }
 
     async fn update_config_now(
@@ -412,6 +470,35 @@ impl Core {
         })
         .await;
     }
+}
+
+/// The sign-in flow of this build (see `Core.login`).
+fn default_login() -> Arc<dyn DeviceCodeLogin> {
+    #[cfg(feature = "dev-offline")]
+    return Arc::new(crate::accounts::FakeLogin::default());
+    #[cfg(not(feature = "dev-offline"))]
+    Arc::new(patina_core::accounts::login::UnavailableLogin)
+}
+
+/// Signals [`AccountsChanged`] once `change` (work on the accounts) has
+/// finished, whether or not anyone still waits for its result: a detached
+/// task does the waiting and hands the result on.
+fn signal_after<R: Send + 'static>(
+    cx: &mut App,
+    change: Task<Result<Result<R, String>, BridgeError>>,
+) -> Task<Result<R, String>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    cx.spawn(async move |cx| {
+        let result = change.await.unwrap_or_else(|e| Err(e.to_string()));
+        cx.update(AccountsChanged::bump);
+        tx.send(result).ok();
+    })
+    .detach();
+    cx.background_spawn(async move {
+        // Dropped unanswered only when the app is quitting.
+        rx.await
+            .unwrap_or_else(|_| Err(BridgeError::Panicked.to_string()))
+    })
 }
 
 /// Runs `f` on the blocking pool from runtime work; a panic in `f` goes on
@@ -688,6 +775,96 @@ mod tests {
                 .loader_versions(LoaderKind::Fabric, "1.21".into()),
         );
         assert!(matches!(loaders, Err(LoaderError::NoVersions { .. })));
+    }
+
+    const TWO_ACCOUNTS: &str = r#"
+current = "a"
+
+[[accounts]]
+id = "a"
+kind = "msa"
+username = "Ann"
+uuid = "00000000-0000-0000-0000-00000000000a"
+
+[[accounts]]
+id = "b"
+kind = "msa"
+username = "Bob"
+uuid = "00000000-0000-0000-0000-00000000000b"
+"#;
+
+    #[gpui_kit::test]
+    async fn account_changes_save_then_signal(cx: &mut TestAppContext) {
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("accounts.toml");
+        std::fs::write(&file, TWO_ACCOUNTS).unwrap();
+        let core = offline_core(rt.handle(), dir.path());
+        cx.update(|cx| {
+            cx.set_global(core.clone());
+            AccountsChanged::init(cx);
+        });
+        cx.executor().allow_parking();
+        let signals =
+            |cx: &mut TestAppContext| cx.update(|cx| AccountsChanged::epoch(cx).read(cx).get());
+        let current = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                Core::with_accounts(cx, |a| {
+                    a.as_ref()
+                        .ok()
+                        .and_then(|s| s.current())
+                        .map(|c| c.id.clone())
+                })
+            })
+        };
+
+        // A change is saved, then signalled.
+        let changed = cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("b")));
+        changed.await.unwrap();
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("current = \"b\"")
+        );
+        cx.run_until_parked();
+        assert_eq!(signals(cx), 1);
+
+        // A refused change saves nothing; the reason is localized.
+        let refused = cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("zzz")));
+        let error = refused.await.unwrap_err();
+        assert!(error.contains("zzz"), "{error}");
+        cx.run_until_parked();
+        assert_eq!(signals(cx), 2);
+
+        // A failed save leaves memory as the file has it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let set = |mode| {
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+            };
+            set(0o555);
+            // Root writes anyway; then there is nothing to check.
+            let enforced = std::fs::write(dir.path().join("probe"), "").is_err();
+            if enforced {
+                let failed = cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("a")));
+                assert!(failed.await.is_err());
+                assert_eq!(current(cx).await.unwrap().as_deref(), Some("b"));
+            }
+            set(0o755);
+        }
+
+        // An edit made outside the app is read back on request.
+        std::fs::write(&file, TWO_ACCOUNTS).unwrap();
+        cx.update(Core::reload_accounts).await.unwrap();
+        assert_eq!(current(cx).await.unwrap().as_deref(), Some("a"));
+
+        // An unreadable file is reported, kept, and refuses changes.
+        std::fs::write(&file, "not [valid").unwrap();
+        assert!(cx.update(Core::reload_accounts).await.is_err());
+        let refused = cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("a")));
+        assert!(refused.await.is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not [valid");
     }
 
     #[gpui_kit::test]
