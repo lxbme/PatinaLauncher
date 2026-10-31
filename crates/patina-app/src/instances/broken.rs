@@ -1,7 +1,8 @@
 //! The detail of a broken entry: the core's error, "打开文件夹", and
 //! "删除…" behind a confirmation.
 
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt, h_flex, v_flex,
@@ -44,7 +45,10 @@ fn confirm_delete(
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.open_alert_dialog(cx, move |alert, _, _| {
+    let footer_focus = cx.focus_handle();
+    let first_draw = std::cell::Cell::new(true);
+    window.open_alert_dialog(cx, move |alert, window, cx| {
+        crate::content::focus_first_button(&footer_focus, &first_draw, window, cx);
         let title = SharedString::from(t!("instances.broken.delete_title", id = broken.id));
         let (broken, model) = (broken.clone(), model.clone());
         alert
@@ -56,25 +60,48 @@ fn confirm_delete(
                     .test_support(),
             )
             .description(t!("instances.broken.delete_body").to_string())
-            .confirm()
-            .ok_text(t!("instances.broken.delete_confirm").to_string())
-            .ok_variant(ButtonVariant::Danger)
-            .cancel_text(t!("instances.broken.cancel").to_string())
-            .on_ok(move |_, window, cx| {
-                let id = broken.id.clone();
-                let job = model.update(cx, |m, cx| m.delete_broken(broken.clone(), cx));
-                window
-                    .spawn(cx, async move |cx| {
-                        if let Err(error) = job.await {
-                            let text = t!("instances.broken.delete_failed", id = id, error = error);
-                            cx.update(|window, cx| {
-                                window.push_notification(Notification::error(text.to_string()), cx);
-                            })
-                            .ok();
-                        }
-                    })
-                    .detach();
-                true
+            .footer(
+                div().w_full().track_focus(&footer_focus).child(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(t!("instances.broken.cancel").to_string())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("ok")
+                                .danger()
+                                .label(t!("instances.broken.delete_confirm").to_string())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let id = broken.id.clone();
+                                    let job = model
+                                        .update(cx, |m, cx| m.delete_broken(broken.clone(), cx));
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            if let Err(error) = job.await {
+                                                let text = t!(
+                                                    "instances.broken.delete_failed",
+                                                    id = id,
+                                                    error = error
+                                                );
+                                                cx.update(|window, cx| {
+                                                    window.push_notification(
+                                                        Notification::error(text.to_string()),
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                            }
+                                        })
+                                        .detach();
+                                }),
+                        ),
+                ),
+            )
+            .on_ok(|_, _, cx| {
+                cx.propagate();
+                false
             })
     });
 }

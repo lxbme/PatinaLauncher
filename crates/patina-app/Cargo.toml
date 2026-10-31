@@ -21,6 +21,7 @@ test-support = ["dep:reqwest"]
 e2e = ["dev-offline", "test-support"]
 
 [dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 futures = "0.3.34"
 gpui-kit.workspace = true

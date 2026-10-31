@@ -739,7 +739,7 @@ mod tests {
                 *seen.lock().unwrap() = Some(path.to_path_buf());
             })
         });
-        task.await;
+        task.await.unwrap();
         assert!(target.is_dir());
         assert_eq!(opened.lock().unwrap().as_deref(), Some(target.as_path()));
     }

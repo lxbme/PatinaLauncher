@@ -199,9 +199,17 @@ pub struct SettingsPage {
     /// Saves waiting for the one in flight, run in order.
     queue: VecDeque<(Field, ConfigEdit)>,
     saving: bool,
+    idle_waiters: Vec<futures::channel::oneshot::Sender<()>>,
+    /// Latest accepted intent, kept until matching readback or its final write fails.
+    requested_memory: Option<(u32, Option<u32>)>,
+    requested_args: Option<String>,
+    requested_gc: Option<patina_core::jvm::GcPreset>,
+    requested_source: Option<patina_core::config::SourceChoice>,
     errors: Errors,
     /// The config changed since the inputs were last set from it.
     inputs_stale: bool,
+    /// A never-shown page has blank inputs, not user edits to flush.
+    inputs_ready: bool,
     speed: Speed,
     min_mem: Entity<InputState>,
     max_mem: Entity<InputState>,
@@ -272,8 +280,14 @@ impl SettingsPage {
             config_task: Task::ready(()),
             queue: VecDeque::new(),
             saving: false,
+            idle_waiters: Vec::new(),
+            requested_memory: None,
+            requested_args: None,
+            requested_gc: None,
+            requested_source: None,
             errors: Errors::default(),
             inputs_stale: false,
+            inputs_ready: false,
             speed: Speed::default(),
             min_mem,
             max_mem,
@@ -349,6 +363,27 @@ impl SettingsPage {
         self.saving || !self.queue.is_empty()
     }
 
+    /// Validates focused inputs and waits for all queued writes to finish.
+    pub fn flush(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        if self.inputs_ready {
+            self.commit_memory(window, cx);
+            self.commit_args(window, cx);
+        }
+        let (done, wait) = futures::channel::oneshot::channel();
+        if self.is_saving() {
+            self.idle_waiters.push(done);
+        } else {
+            done.send(()).ok();
+        }
+        async move {
+            wait.await.ok();
+        }
+    }
+
     /// Shows `section` at the top of the column.
     pub fn scroll_to(&mut self, section: Section, cx: &mut Context<Self>) {
         self.scroll.scroll_to_top_of_item(section.position());
@@ -369,11 +404,27 @@ impl SettingsPage {
                 if !this.config_rev.is_current(id) {
                     return;
                 }
-                if let Ok(config) = config
-                    && this.config.as_ref() != Some(&config)
-                {
-                    this.config = Some(config);
-                    this.inputs_stale = true;
+                if let Ok(config) = config {
+                    if !this.is_saving() {
+                        if this.requested_memory
+                            == Some((config.java.min_mem_mib, config.java.max_mem_mib))
+                        {
+                            this.requested_memory = None;
+                        }
+                        if this.requested_args.as_ref() == Some(&config.java.extra_jvm_args) {
+                            this.requested_args = None;
+                        }
+                        if this.requested_gc == Some(config.java.gc_preset) {
+                            this.requested_gc = None;
+                        }
+                        if this.requested_source == Some(config.download.source) {
+                            this.requested_source = None;
+                        }
+                    }
+                    if this.config.as_ref() != Some(&config) {
+                        this.config = Some(config);
+                        this.inputs_stale = true;
+                    }
                 }
                 if let Ok(error) = error {
                     this.load_error = error;
@@ -427,6 +478,9 @@ impl SettingsPage {
             return;
         }
         let Some((field, edit)) = self.queue.pop_front() else {
+            for waiter in self.idle_waiters.drain(..) {
+                waiter.send(()).ok();
+            }
             return;
         };
         self.saving = true;
@@ -442,6 +496,14 @@ impl SettingsPage {
                 *this.errors.slot(field) = match &result {
                     Ok(_) => None,
                     Err(error) => {
+                        if !this.queue.iter().any(|(queued, _)| *queued == field) {
+                            match field {
+                                Field::Memory => this.requested_memory = None,
+                                Field::Args => this.requested_args = None,
+                                Field::Gc => this.requested_gc = None,
+                                Field::Source => this.requested_source = None,
+                            }
+                        }
                         tracing::warn!(%error, ?field, "saving a setting failed");
                         Some(error.clone().into())
                     }

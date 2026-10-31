@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use futures::channel::oneshot;
 use std::path::PathBuf;
 
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::{Radio, RadioGroup};
@@ -39,7 +40,7 @@ use patina_core::config::JavaSettings;
 use patina_core::instance::{
     Instance, InstanceConfig, InstanceError, InstanceIcon, InstanceStore, WindowSize,
 };
-use patina_core::java::{JavaInstall, probe};
+use patina_core::java::JavaInstall;
 use patina_core::jvm::{GcPreset, validate_extra_jvm_args};
 use patina_core::loader::LoaderKind;
 use rust_i18n::t;
@@ -268,12 +269,26 @@ pub struct SettingsForm {
     /// Java majors found by probing a chosen or saved path that no detected
     /// install covers.
     probed: HashMap<PathBuf, Option<u32>>,
+    java_choice_revision: u64,
+    /// The pending path keeps Automatic actionable while a file is checked.
+    java_file_pending: Option<PathBuf>,
     /// Paths a probe was started for.
     probe_started: HashSet<PathBuf>,
     probing: Vec<Task<()>>,
     /// Saves waiting for the one in flight, run in order.
     queue: VecDeque<(Field, SaveJob)>,
     saving: bool,
+    /// Latest accepted intent, kept until matching readback or its final write fails.
+    requested_memory: Option<(u32, Option<u32>)>,
+    requested_args: Option<String>,
+    requested_name: Option<String>,
+    requested_window: Option<Option<WindowSize>>,
+    requested_java: Option<Option<PathBuf>>,
+    requested_gc: Option<GcPreset>,
+    requested_global: Option<bool>,
+    mode_revision: Revision,
+    /// An override awaiting global defaults must also be drained on close.
+    mode_seed_pending: bool,
     /// Resolved once no save is queued or in flight.
     idle_waiters: Vec<oneshot::Sender<()>>,
     /// The override "使用全局设置" turned off, kept for turning it on again.
@@ -378,10 +393,21 @@ impl SettingsForm {
             icon_open: false,
             java_list,
             probed: HashMap::new(),
+            java_choice_revision: 0,
+            java_file_pending: None,
             probe_started: HashSet::new(),
             probing: Vec::new(),
             queue: VecDeque::new(),
             saving: false,
+            requested_memory: None,
+            requested_args: None,
+            requested_name: None,
+            requested_window: None,
+            requested_java: None,
+            requested_gc: None,
+            requested_global: None,
+            mode_revision: Revision::default(),
+            mode_seed_pending: false,
             idle_waiters: Vec::new(),
             discarded: Arc::new(Mutex::new(None)),
             gc_reset_for: None,
@@ -476,27 +502,63 @@ impl SettingsForm {
             return;
         };
         let config = instance.config.clone();
+        let java = config.java_override.clone().unwrap_or_default();
+        if !self.has_pending_saves() {
+            if self.requested_name.as_ref() == Some(&config.name) {
+                self.requested_name = None;
+            }
+            if self.requested_window == Some(config.window) {
+                self.requested_window = None;
+            }
+            if self.requested_java.as_ref() == Some(&java.java_path) {
+                self.requested_java = None;
+            }
+            if self.requested_gc == Some(java.gc_preset) {
+                self.requested_gc = None;
+            }
+            if self.requested_global == Some(config.java_override.is_none()) {
+                self.requested_global = None;
+                if config.java_override.is_none() {
+                    self.requested_java = None;
+                    self.requested_gc = None;
+                    self.requested_memory = None;
+                    self.requested_args = None;
+                }
+            }
+            if self.requested_memory == Some((java.min_mem_mib, java.max_mem_mib)) {
+                self.requested_memory = None;
+            }
+            if self.requested_args.as_ref() == Some(&java.extra_jvm_args) {
+                self.requested_args = None;
+            }
+        }
         if !force && self.seen.as_ref() == Some(&config) {
             return;
         }
         self.seen = Some(config.clone());
-        let java = config.java_override.clone().unwrap_or_default();
-        Self::set_text(&self.name, &config.name, force, window, cx);
-        Self::set_text(
-            &self.min_mem,
-            &java.min_mem_mib.to_string(),
-            force,
-            window,
-            cx,
-        );
-        let max = java.max_mem_mib.map(|m| m.to_string()).unwrap_or_default();
-        Self::set_text(&self.max_mem, &max, force, window, cx);
-        let size = config
-            .window
-            .map_or(DEFAULT_WINDOW, |w| (w.width, w.height));
-        Self::set_text(&self.width, &size.0.to_string(), force, window, cx);
-        Self::set_text(&self.height, &size.1.to_string(), force, window, cx);
-        if self.args.read(cx).value() != java.extra_jvm_args.as_str()
+        if self.requested_name.is_none() {
+            Self::set_text(&self.name, &config.name, force, window, cx);
+        }
+        if self.requested_memory.is_none() {
+            Self::set_text(
+                &self.min_mem,
+                &java.min_mem_mib.to_string(),
+                force,
+                window,
+                cx,
+            );
+            let max = java.max_mem_mib.map(|m| m.to_string()).unwrap_or_default();
+            Self::set_text(&self.max_mem, &max, force, window, cx);
+        }
+        if self.requested_window.is_none() {
+            let size = config
+                .window
+                .map_or(DEFAULT_WINDOW, |w| (w.width, w.height));
+            Self::set_text(&self.width, &size.0.to_string(), force, window, cx);
+            Self::set_text(&self.height, &size.1.to_string(), force, window, cx);
+        }
+        if self.requested_args.is_none()
+            && self.args.read(cx).value() != java.extra_jvm_args.as_str()
             && (force || !self.args.focus_handle(cx).is_focused(window))
         {
             self.args.update(cx, |args, cx| {
@@ -516,6 +578,10 @@ impl SettingsForm {
         self.revalidate_gc(window, cx);
     }
 
+    fn has_pending_saves(&self) -> bool {
+        self.saving || !self.queue.is_empty() || self.mode_seed_pending
+    }
+
     /// Runs every pending commit, as leaving a field would: a valid edit is
     /// saved, an invalid one stays in its field with its error. The
     /// future resolves once all saves have reached the disk.
@@ -529,7 +595,7 @@ impl SettingsForm {
         self.commit_window(window, cx);
         self.commit_args(window, cx);
         let (done, wait) = oneshot::channel();
-        if self.saving || !self.queue.is_empty() {
+        if self.has_pending_saves() {
             self.idle_waiters.push(done);
         } else {
             done.send(()).ok();
@@ -542,7 +608,7 @@ impl SettingsForm {
     /// Resets a saved GC preset the Java now known cannot run, with a
     /// notice.
     fn revalidate_gc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || !self.queue.is_empty() {
+        if self.has_pending_saves() {
             return;
         }
         let Some(config) = self.config(cx) else {
@@ -661,6 +727,8 @@ impl SettingsForm {
         if !self.probe_started.insert(path.clone()) || self.detected_major(&path, cx).is_some() {
             return;
         }
+        let choice = self.java_choice_revision;
+        let probe = Core::global(cx).probe_java.clone();
         let job = run_blocking(cx, {
             let path = path.clone();
             move || probe(&path).map(|install| install.major)
@@ -668,6 +736,10 @@ impl SettingsForm {
         let task = cx.spawn_in(window, async move |this, cx| {
             let major = job.await.ok().flatten();
             this.update_in(cx, |this, window, cx| {
+                if this.java_choice_revision != choice {
+                    this.probe_started.remove(&path);
+                    return;
+                }
                 this.probed.insert(path, major);
                 this.revalidate_gc(window, cx);
                 cx.notify();
@@ -718,6 +790,9 @@ impl SettingsForm {
             return;
         }
         let Some((field, job)) = self.queue.pop_front() else {
+            if self.mode_seed_pending {
+                return;
+            }
             for waiter in self.idle_waiters.drain(..) {
                 waiter.send(()).ok();
             }
@@ -741,6 +816,17 @@ impl SettingsForm {
                 };
                 *this.errors.slot(field) = error.clone().map(Into::into);
                 if error.is_some() {
+                    if !this.queue.iter().any(|(queued, _)| *queued == field) {
+                        match field {
+                            Field::Memory => this.requested_memory = None,
+                            Field::Args => this.requested_args = None,
+                            Field::Name => this.requested_name = None,
+                            Field::Window => this.requested_window = None,
+                            Field::Java => this.requested_java = None,
+                            Field::Gc => this.requested_gc = None,
+                            Field::Global => this.requested_global = None,
+                        }
+                    }
                     this.seen = None;
                 }
                 this.model.update(cx, |model, cx| model.refresh(cx));
@@ -773,7 +859,7 @@ impl SettingsForm {
             return;
         };
         let text = self.name.read(cx).value().trim().to_string();
-        if text == config.name {
+        if self.requested_name.as_ref().unwrap_or(&config.name) == &text {
             self.errors.name = None;
             cx.notify();
             return;
@@ -788,6 +874,7 @@ impl SettingsForm {
             return;
         }
         self.errors.name = None;
+        self.requested_name = Some(text.clone());
         self.save(Field::Name, window, cx, move |store, id| {
             store.rename(id, &text).map(drop)
         });
@@ -807,7 +894,10 @@ impl SettingsForm {
             return;
         };
         // Nothing to commit while the global settings apply.
-        if config.java_override.is_none() {
+        if self
+            .requested_global
+            .unwrap_or(config.java_override.is_none())
+        {
             return;
         }
         let (min, max) = match self.read_memory(cx) {
@@ -821,9 +911,14 @@ impl SettingsForm {
         self.errors.memory = None;
         cx.notify();
         let saved = config.java_override.as_ref();
-        if saved.is_none_or(|j| j.min_mem_mib == min && j.max_mem_mib == max) {
+        if self
+            .requested_memory
+            .or_else(|| saved.map(|j| (j.min_mem_mib, j.max_mem_mib)))
+            == Some((min, max))
+        {
             return;
         }
+        self.requested_memory = Some((min, max));
         self.update_config(Field::Memory, window, cx, move |config| {
             if let Some(java) = &mut config.java_override {
                 java.min_mem_mib = min;
@@ -850,7 +945,10 @@ impl SettingsForm {
         let Some(config) = self.config(cx) else {
             return;
         };
-        if config.java_override.is_none() {
+        if self
+            .requested_global
+            .unwrap_or(config.java_override.is_none())
+        {
             return;
         }
         let text = self.args.read(cx).value().to_string();
@@ -859,9 +957,15 @@ impl SettingsForm {
             return;
         }
         let saved = config.java_override.as_ref();
-        if saved.is_none_or(|j| j.extra_jvm_args == text) {
+        if self
+            .requested_args
+            .as_deref()
+            .or_else(|| saved.map(|j| j.extra_jvm_args.as_str()))
+            == Some(text.as_str())
+        {
             return;
         }
+        self.requested_args = Some(text.clone());
         self.update_config(Field::Args, window, cx, move |config| {
             if let Some(java) = &mut config.java_override {
                 java.extra_jvm_args = text;
@@ -874,6 +978,7 @@ impl SettingsForm {
         if preset != GcPreset::None {
             self.gc_reset_for = None;
         }
+        self.requested_gc = Some(preset);
         self.update_config(Field::Gc, window, cx, move |config| {
             if let Some(java) = &mut config.java_override {
                 java.gc_preset = preset;
@@ -890,6 +995,9 @@ impl SettingsForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.java_choice_revision += 1;
+        self.java_file_pending = None;
+        self.requested_java = Some(path.clone());
         self.errors.java = None;
         self.update_config(Field::Java, window, cx, move |config| {
             if let Some(java) = &mut config.java_override {
@@ -903,6 +1011,10 @@ impl SettingsForm {
 
     /// "选择文件…": asks for a Java executable, then checks and uses it.
     fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.java_choice_revision += 1;
+        let choice = self.java_choice_revision;
+        self.java_file_pending = None;
+        cx.notify();
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -914,8 +1026,12 @@ impl SettingsForm {
                 return;
             };
             if let Some(path) = paths.into_iter().next() {
-                this.update_in(cx, |this, window, cx| this.use_java_file(path, window, cx))
-                    .ok();
+                this.update_in(cx, |this, window, cx| {
+                    if this.java_choice_revision == choice {
+                        this.use_java_file(path, window, cx).detach();
+                    }
+                })
+                .ok();
             }
         })
         .detach();
@@ -923,36 +1039,57 @@ impl SettingsForm {
 
     /// Checks that `path` runs as a Java, then uses it. Not a Java: says
     /// so and saves nothing.
-    pub fn use_java_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn use_java_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        self.java_choice_revision += 1;
+        let choice = self.java_choice_revision;
+        self.java_file_pending = Some(path.clone());
+        self.errors.java = None;
+        cx.notify();
+        let probe = Core::global(cx).probe_java.clone();
         let job = run_blocking(cx, {
             let path = path.clone();
             move || probe(&path)
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(Some(install)) => {
-                    this.probed.insert(path.clone(), Some(install.major));
-                    this.set_java(Some(path), Some(install.major), window, cx);
+            this.update_in(cx, |this, window, cx| {
+                if this.java_choice_revision != choice {
+                    return;
                 }
-                _ => {
-                    this.errors.java =
-                        Some(t!("instance_settings.java_not_java").to_string().into());
-                    cx.notify();
+                this.java_file_pending = None;
+                match result {
+                    Ok(Some(install)) => {
+                        this.probed.insert(path.clone(), Some(install.major));
+                        this.set_java(Some(path), Some(install.major), window, cx);
+                    }
+                    _ => {
+                        this.errors.java =
+                            Some(t!("instance_settings.java_not_java").to_string().into());
+                        cx.notify();
+                    }
                 }
             })
             .ok();
         })
-        .detach();
     }
 
     /// Turns "使用全局设置" on (no override; the override is kept for
     /// turning it off again) or off (the kept override, else one seeded
     /// from the global config).
     fn set_use_global(&mut self, global: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.java_choice_revision += 1;
+        self.java_file_pending = None;
+        let revision = self.mode_revision.start();
+        self.mode_seed_pending = false;
         // What was typed belongs to the override that is going away.
         if global {
             drop(self.flush(window, cx));
+            self.requested_global = Some(true);
             let kept = self.discarded.clone();
             self.update_config(Field::Global, window, cx, move |config| {
                 if let Some(old) = config.java_override.take() {
@@ -961,11 +1098,18 @@ impl SettingsForm {
             });
             return;
         }
+        self.requested_global = Some(false);
+        self.mode_seed_pending = true;
+        cx.notify();
         let config = Core::read_config(cx);
         let kept = self.discarded.clone();
         cx.spawn_in(window, async move |this, cx| {
             let seed = config.await.map(|c| c.java).unwrap_or_default();
             this.update_in(cx, |this, window, cx| {
+                if !this.mode_revision.is_current(revision) {
+                    return;
+                }
+                this.mode_seed_pending = false;
                 this.update_config(Field::Global, window, cx, move |config| {
                     if config.java_override.is_none() {
                         let old = kept.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -981,6 +1125,7 @@ impl SettingsForm {
     fn set_window_mode(&mut self, custom: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.errors.window = None;
         if !custom {
+            self.requested_window = Some(None);
             self.update_config(Field::Window, window, cx, |config| config.window = None);
             return;
         }
@@ -988,6 +1133,7 @@ impl SettingsForm {
             width: DEFAULT_WINDOW.0,
             height: DEFAULT_WINDOW.1,
         });
+        self.requested_window = Some(Some(size));
         self.update_config(Field::Window, window, cx, move |config| {
             config.window = Some(size);
         });
@@ -1007,7 +1153,7 @@ impl SettingsForm {
             return;
         };
         // Only a custom size has inputs to commit.
-        let Some(saved) = config.window else {
+        let Some(saved) = self.requested_window.unwrap_or(config.window) else {
             return;
         };
         let Some(size) = self.read_window(cx) else {
@@ -1027,6 +1173,7 @@ impl SettingsForm {
         self.errors.window = None;
         cx.notify();
         if size != saved {
+            self.requested_window = Some(Some(size));
             self.update_config(Field::Window, window, cx, move |config| {
                 config.window = Some(size);
             });
@@ -1152,7 +1299,10 @@ impl SettingsForm {
             .display_name(&self.id)
             .unwrap_or_else(|| self.id.clone());
         let form = cx.entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        let footer_focus = cx.focus_handle();
+        let first_draw = std::cell::Cell::new(true);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            crate::content::focus_first_button(&footer_focus, &first_draw, window, cx);
             let title = SharedString::from(t!("instance_settings.delete_title", name = name));
             let form = form.clone();
             alert
@@ -1164,13 +1314,28 @@ impl SettingsForm {
                         .test_support(),
                 )
                 .description(t!("instance_settings.delete_body").to_string())
-                .confirm()
-                .ok_text(t!("instance_settings.delete_confirm").to_string())
-                .ok_variant(ButtonVariant::Danger)
-                .cancel_text(t!("instance_settings.delete_cancel").to_string())
-                .on_ok(move |_, window, cx| {
-                    form.update(cx, |form, cx| form.delete(window, cx));
-                    true
+                .footer(
+                    div().w_full().track_focus(&footer_focus).child(
+                        DialogFooter::new()
+                            .child(
+                                Button::new("cancel")
+                                    .label(t!("instance_settings.delete_cancel").to_string())
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("ok")
+                                    .danger()
+                                    .label(t!("instance_settings.delete_confirm").to_string())
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        form.update(cx, |form, cx| form.delete(window, cx));
+                                    }),
+                            ),
+                    ),
+                )
+                .on_ok(|_, _, cx| {
+                    cx.propagate();
+                    false
                 })
         });
     }
@@ -1349,7 +1514,9 @@ impl SettingsForm {
         config: &InstanceConfig,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let global = config.java_override.is_none();
+        let global = self
+            .requested_global
+            .unwrap_or(config.java_override.is_none());
         let section = Self::section(
             "settings-java-memory",
             t!("instance_settings.java_memory").to_string(),
@@ -1372,7 +1539,7 @@ impl SettingsForm {
                     cx,
                 )),
         );
-        let Some(java) = &config.java_override else {
+        let Some(java) = config.java_override.as_ref().filter(|_| !global) else {
             return section;
         };
         section
@@ -1387,8 +1554,10 @@ impl SettingsForm {
         java: &JavaSettings,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let options = self.java_options(java.java_path.as_ref(), cx);
-        let selected = options.iter().position(|o| o.path == java.java_path);
+        let chosen = self.requested_java.as_ref().unwrap_or(&java.java_path);
+        let current = self.java_file_pending.as_ref().or(chosen.as_ref());
+        let options = self.java_options(current, cx);
+        let selected = options.iter().position(|o| o.path.as_ref() == current);
         let detecting = self.java_list.read(cx).installs.is_none();
         let radios: Vec<Radio> = options
             .iter()
@@ -1429,6 +1598,13 @@ impl SettingsForm {
                         .on_click(cx.listener(|this, _, window, cx| this.choose_file(window, cx))),
                 ),
             )
+            .when(self.java_file_pending.is_some(), |field| {
+                field.child(Self::hint(
+                    "settings-java-checking",
+                    t!("instance_settings.java_checking").to_string(),
+                    cx,
+                ))
+            })
             .children(Self::error(
                 "settings-java-error",
                 self.errors.java.as_ref(),
@@ -1507,7 +1683,11 @@ impl SettingsForm {
         Self::field(t!("instance_settings.gc").to_string(), cx)
             .child(
                 RadioGroup::new("settings-gc")
-                    .selected_index(GC_PRESETS.iter().position(|p| *p == java.gc_preset))
+                    .selected_index(
+                        GC_PRESETS
+                            .iter()
+                            .position(|p| *p == self.requested_gc.unwrap_or(java.gc_preset)),
+                    )
                     .children(radios)
                     .on_click(cx.listener(|this, ix: &usize, window, cx| {
                         if let Some(preset) = GC_PRESETS.get(*ix) {
@@ -1557,7 +1737,7 @@ impl SettingsForm {
         config: &InstanceConfig,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let custom = config.window.is_some();
+        let custom = self.requested_window.unwrap_or(config.window).is_some();
         Self::section(
             "settings-window",
             t!("instance_settings.window").to_string(),
@@ -1696,5 +1876,143 @@ impl Render for SettingsForm {
                     .child(self.render_danger(busy.as_ref(), cx)),
             );
         scroll_y(content, &self.scroll).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core_bridge::testing::{self, FakeCatalog};
+    use gpui_kit::TestAppContext;
+    use patina_core::paths::DataDirs;
+
+    struct Host {
+        model: Entity<InstancesModel>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn completed_write_with_stale_listing_keeps_the_reverted_intent(cx: &mut TestAppContext) {
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        let core = testing::core(
+            rt.handle().clone(),
+            DataDirs::new(dir.path()),
+            Arc::new(FakeCatalog::new().with_manifest_error("offline")),
+        );
+        let store = core.store.clone();
+        let inst = store.create("Alpha", "1.21.1").unwrap();
+        store
+            .update(&inst.id, |c| {
+                c.java_override = Some(JavaSettings::default())
+            })
+            .unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(core);
+        });
+        cx.executor().allow_parking();
+        let window = cx.add_window(|window, cx| Host {
+            model: cx.new(|cx| InstancesModel::new(window, cx)),
+        });
+        let model = window.read_with(cx, |h, _| h.model.clone()).unwrap();
+        model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+        let form = cx
+            .update_window(window.into(), |_, window, cx| {
+                cx.new(|cx| SettingsForm::new(model.clone(), inst.id.clone(), window, cx))
+            })
+            .unwrap();
+        // Hold the pump, commit through the real methods, and complete the
+        // captured production jobs without delivering their listing yet.
+        let jobs = cx
+            .update_window(window.into(), |_, window, cx| {
+                form.update(cx, |f, cx| {
+                    f.saving = true;
+                    set_inputs_for_test(f, "768", "-Dpending=true", window, cx);
+                    f.commit_memory(window, cx);
+                    f.commit_args(window, cx);
+                    f.queue.drain(..).collect::<Vec<_>>()
+                })
+            })
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        for (_, job) in jobs {
+            let store = store.clone();
+            let id = inst.id.clone();
+            cx.update(|cx| run_blocking(cx, move || job(&store, &id)))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        form.update(cx, |f, _| f.saving = false);
+        assert_eq!(
+            form.read_with(cx, |f, cx| f
+                .config(cx)
+                .unwrap()
+                .java_override
+                .unwrap()
+                .min_mem_mib),
+            512
+        );
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(inst.dir.join(patina_core::instance::CONFIG_LOCK_FILE))
+            .unwrap();
+        lock.lock().unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            form.update(cx, |f, cx| {
+                set_inputs_for_test(f, "512", "", window, cx);
+                f.commit_memory(window, cx);
+                f.commit_args(window, cx);
+                assert_eq!(f.requested_memory, Some((512, None)));
+                assert_eq!(f.requested_args.as_deref(), Some(""));
+            })
+        })
+        .unwrap();
+        // Deliver the older readback (768) while the latest request is 512.
+        model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+        cx.update_window(window.into(), |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.apply_config(window, cx, false);
+                assert_eq!(f.min_mem.read(cx).value().as_ref(), "512");
+                assert!(f.args.read(cx).value().is_empty());
+            })
+        })
+        .unwrap();
+        drop(lock);
+        let drained = cx
+            .update_window(window.into(), |_, window, cx| {
+                form.update(cx, |f, cx| f.flush(window, cx))
+            })
+            .unwrap();
+        drained.await;
+        model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+        cx.update_window(window.into(), |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.apply_config(window, cx, false);
+                assert!(f.requested_memory.is_none());
+                assert!(f.requested_args.is_none());
+            })
+        })
+        .unwrap();
+        let saved = store.load(&inst.id).unwrap().config.java_override.unwrap();
+        assert_eq!(saved.min_mem_mib, 512);
+        assert!(saved.extra_jvm_args.is_empty());
+    }
+
+    fn set_inputs_for_test(
+        f: &mut SettingsForm,
+        memory: &str,
+        args: &str,
+        window: &mut Window,
+        cx: &mut Context<SettingsForm>,
+    ) {
+        SettingsForm::set_text(&f.min_mem, memory, true, window, cx);
+        f.args
+            .update(cx, |input, cx| input.set_value(args, window, cx));
     }
 }

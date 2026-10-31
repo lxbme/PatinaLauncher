@@ -32,8 +32,8 @@ use gpui_kit::component::{ActiveTheme, Disableable, Sizable, WindowExt, h_flex, 
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, rems,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, div, rems,
 };
 use patina_core::instance::InstanceConfig;
 use patina_core::loader::ops::{LoaderAction, OpOutcome};
@@ -55,6 +55,25 @@ use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
 const DIALOG_W: f32 = 25.;
 /// Width of the actions column.
 const ACTIONS_W: f32 = 16.;
+
+actions!(
+    versions_components,
+    [
+        NextComponent,
+        PreviousComponent,
+        FirstComponent,
+        LastComponent
+    ]
+);
+
+pub(super) fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("down", NextComponent, Some("VersionsComponents")),
+        KeyBinding::new("up", PreviousComponent, Some("VersionsComponents")),
+        KeyBinding::new("home", FirstComponent, Some("VersionsComponents")),
+        KeyBinding::new("end", LastComponent, Some("VersionsComponents")),
+    ]);
+}
 
 /// A row of the component list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +106,7 @@ pub struct VersionsTab {
     model: Entity<InstancesModel>,
     id: String,
     row: Row,
+    components_focus: FocusHandle,
     /// The Java the instance's Minecraft version needs, once read.
     java: Option<u32>,
     java_mc: Option<String>,
@@ -119,6 +139,7 @@ impl VersionsTab {
             model,
             id,
             row: Row::Minecraft,
+            components_focus: cx.focus_handle().tab_stop(true),
             java: None,
             java_mc: None,
             java_revision: Revision::default(),
@@ -260,7 +281,6 @@ impl VersionsTab {
             .items_center()
             .border_b_1()
             .border_color(theme.border)
-            .cursor_pointer()
             .when(selected, |r| r.bg(active))
             .when(!selected, |r| r.hover(move |s| s.bg(hover)))
             .child(
@@ -286,7 +306,10 @@ impl VersionsTab {
                     })),
             )
             .child(h_flex().gap_1().children(spec.tags))
-            .on_click(cx.listener(move |this, _, _, cx| this.select(row, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.components_focus.focus(window, cx);
+                this.select(row, cx);
+            }))
     }
 
     fn render_actions(
@@ -431,6 +454,7 @@ impl Render for VersionsTab {
         let loader = config.loader().map(|(k, c)| (k, c.version.clone()));
         let theme = cx.theme();
         let (fg, muted) = (theme.foreground, theme.muted_foreground);
+        let ring = theme.ring;
         let name = |text: String| {
             div()
                 .text_size(TEXT_PRIMARY)
@@ -538,6 +562,23 @@ impl Render for VersionsTab {
             .size_full()
             .child(
                 v_flex()
+                    .id("versions-components")
+                    .test_support()
+                    .track_focus(&self.components_focus)
+                    .key_context("VersionsComponents")
+                    .focus_visible(move |style| style.border_color(ring).border_1())
+                    .on_action(
+                        cx.listener(|this, _: &NextComponent, _, cx| this.select(Row::Loader, cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &PreviousComponent, _, cx| {
+                        this.select(Row::Minecraft, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &FirstComponent, _, cx| {
+                        this.select(Row::Minecraft, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &LastComponent, _, cx| this.select(Row::Loader, cx)),
+                    )
                     .flex_1()
                     .min_w_0()
                     .child(mc_row)

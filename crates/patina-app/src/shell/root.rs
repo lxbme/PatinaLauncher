@@ -75,9 +75,10 @@ impl RootView {
             target.focus(window, cx);
         });
         let page = instances.downgrade();
+        let settings_page = settings.downgrade();
         let closing = Rc::new(Cell::new(false));
         window.on_window_should_close(cx, move |window, cx| {
-            close_after_saving(&page, &closing, window, cx)
+            close_after_saving(&page, &settings_page, &closing, window, cx)
         });
         Self {
             title_bar: cx.new(|cx| {
@@ -247,11 +248,12 @@ fn after_launch_step(setting: AfterLaunch, record_saved: bool, busy: bool) -> Af
 /// runtime's shutdown budget.
 const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Whether the window may close now. With a settings form open, what was
-/// typed into it is saved first (waiting at most [`CLOSE_BUDGET`]), then
-/// the window closes by itself.
+/// Whether the window may close now. Instance and global settings validate
+/// focused inputs and drain queued saves together (at most [`CLOSE_BUDGET`]),
+/// then the window closes by itself.
 fn close_after_saving(
     page: &WeakEntity<InstancesPage>,
+    settings: &WeakEntity<SettingsPage>,
     closing: &Rc<Cell<bool>>,
     window: &mut Window,
     cx: &mut App,
@@ -262,11 +264,27 @@ fn close_after_saving(
     let form = page
         .upgrade()
         .and_then(|page| page.read(cx).detail().read(cx).settings_view().cloned());
-    let Some(form) = form else {
+    let settings = settings.upgrade();
+    if form.is_none() && settings.is_none() {
         return true;
-    };
+    }
     closing.set(true);
-    let saved = form.update(cx, |form, cx| form.flush(window, cx));
+    let instance_saved = form.map(|form| form.update(cx, |form, cx| form.flush(window, cx)));
+    let global_saved = settings.map(|page| page.update(cx, |page, cx| page.flush(window, cx)));
+    let saved = async move {
+        futures::join!(
+            async move {
+                if let Some(saved) = instance_saved {
+                    saved.await;
+                }
+            },
+            async move {
+                if let Some(saved) = global_saved {
+                    saved.await;
+                }
+            }
+        );
+    };
     window
         .spawn(cx, async move |cx| {
             let budget = cx.background_executor().timer(CLOSE_BUDGET);

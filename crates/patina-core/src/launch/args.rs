@@ -160,11 +160,13 @@ fn expand(list: &[ArgValue], env: &RuleEnv) -> Vec<String> {
 /// Removes `--width X` / `--height Y` (and `--width=X` forms) from `args[from..]`.
 fn strip_size_options(args: &mut Vec<String>, from: usize) {
     let tail = args.split_off(from);
-    let mut it = tail.into_iter();
+    let mut it = tail.into_iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--width" | "--height" => {
-                it.next();
+                if it.peek().is_some_and(|next| !next.starts_with('-')) {
+                    it.next();
+                }
             }
             _ if a.starts_with("--width=") || a.starts_with("--height=") => {}
             _ => args.push(a),
@@ -501,5 +503,21 @@ mod tests {
         let mut v = HashMap::new();
         v.insert("a", "1".to_string());
         assert_eq!(substitute("${a}-${b}", &v), "1-${b}");
+    }
+    #[test]
+    fn malformed_size_does_not_swallow_the_next_option() {
+        let mut args = [
+            "prefix",
+            "--width",
+            "--username",
+            "Dev",
+            "--height",
+            "600",
+            "--demo",
+        ]
+        .map(String::from)
+        .to_vec();
+        strip_size_options(&mut args, 1);
+        assert_eq!(args, ["prefix", "--username", "Dev", "--demo"]);
     }
 }

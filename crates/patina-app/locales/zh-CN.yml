@@ -225,6 +225,7 @@ instance_settings:
   java: "Java"
   java_auto: "自动（托管运行时）"
   java_detecting: "正在检测 Java…"
+  java_checking: "正在检查 Java…"
   java_option: "Java %{major} · %{version} · %{path}"
   java_choose: "选择文件…"
   java_not_java: "所选文件不是可用的 Java"
@@ -262,6 +263,7 @@ instance_settings:
   gc_reset: "%{preset}需要 Java %{major} 或更高版本，已改为不使用预设"
   mem_too_big: "不能超过 %{max} MiB"
 content:
+  open_failed: "无法打开“%{path}”：%{error}"
   filter:
     placeholder: "按名称筛选"
   refresh: "刷新"
@@ -363,12 +365,14 @@ accounts:
   set_current: "设为当前"
   remove: "移除…"
   remove_title: '移除"%{name}"？'
-  remove_body: "只从启动器中移除，之后可以重新添加。"
+  remove_body: "仅从 Patina 移除。此版本尚不支持微软登录，暂时无法在此重新添加该账号。"
+  remove_body_dev: "仅从 Patina 移除。开发用离线账号可重新添加。"
   remove_confirm: "移除"
   remove_failed: '无法移除"%{name}"：%{error}'
   switch_failed: "无法切换账号：%{error}"
   cancel: "取消"
-  empty: "还没有账号。添加账号后才能启动游戏。"
+  empty: "暂无账号。此版本尚不支持微软登录。"
+  empty_dev: "暂无账号。可添加离线账号用于开发；微软登录尚不可用。"
   failed_hint: "启动器不会改动这个文件。修好或移走它之后，点“重新读取”。"
   reload: "重新读取"
   switcher:
@@ -381,7 +385,7 @@ accounts:
     copy: "复制"
     copied: "已复制"
     open: "打开 %{site}"
-    waiting: "等待你在浏览器中完成登录…"
+    waiting: "等待浏览器登录…"
     done_not_added: "开发构建：流程演示完成，未添加账号"
     unavailable: "微软登录暂未开放"
     cancel: "取消"

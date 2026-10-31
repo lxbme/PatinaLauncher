@@ -21,7 +21,14 @@ pub(super) fn load(instance: &Instance) -> io::Result<Vec<LocalItem>> {
         .into_iter()
         .map(|pack| LocalItem {
             key: pack.name.clone(),
-            title: pack.name,
+            title: if pack.is_dir {
+                pack.name.clone()
+            } else {
+                std::path::Path::new(&pack.name).file_stem().map_or_else(
+                    || pack.name.clone(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            },
             path: pack.path,
             description: None,
             last_played: None,

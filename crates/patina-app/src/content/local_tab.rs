@@ -360,7 +360,7 @@ impl LocalTab {
         }
         let prefix = self.kind.prefix();
         let this = cx.weak_entity();
-        let title = SharedString::from(t!("content.delete_title", name = item.title));
+        let title = SharedString::from(t!("content.delete_title", name = item.key));
         let body = if item.is_dir {
             t!("content.delete_body_dir")
         } else {
@@ -512,7 +512,7 @@ impl LocalTab {
             notify(Notification::warning(text.clone()), text, window, cx);
             self.list.update(cx, |list, cx| list.mutated(cx));
         } else {
-            let text = t!("content.delete_failed", name = item.title, error = error).to_string();
+            let text = t!("content.delete_failed", name = item.key, error = error).to_string();
             notify(Notification::error(text.clone()), text, window, cx);
         }
     }
@@ -625,6 +625,7 @@ impl LocalTab {
                 item.image_key(self.kind, &self.id),
                 move || kind.read_icon(&path),
                 ICON,
+                self.kind.placeholder(),
                 cx,
             );
         }
@@ -842,7 +843,7 @@ impl LocalTab {
         let refresh = self.list.clone();
         ContentToolbar::new(
             &self.filter,
-            move |_, cx| open_folder(dir.clone(), cx),
+            move |window, cx| open_folder(dir.clone(), window, cx),
             move |_, cx| refresh.update(cx, |list, cx| list.reload(cx)),
         )
         .refreshing(list.is_reloading())

@@ -80,25 +80,24 @@ fn read(dir: &Path) -> Result<Option<AppSettings>, String> {
 }
 
 /// The settings in `dir`. Missing → defaults; unreadable or unparsable →
-/// renamed to `gui.toml.bak`, defaults.
+/// backed up to the first free `gui.toml.bak[.N]`, then removed; defaults.
 pub fn load(dir: &Path) -> AppSettings {
     let err = match read(dir) {
         Ok(s) => return s.unwrap_or_default(),
         Err(err) => err,
     };
-    let (file, bak) = (
-        dir.join(SETTINGS_FILE),
-        dir.join(format!("{SETTINGS_FILE}.bak")),
-    );
-    match fs::rename(&file, &bak) {
-        Ok(()) => tracing::warn!(
-            file = %file.display(), %err, bak = %bak.display(),
-            "invalid settings backed up; using defaults"
-        ),
-        Err(e) => tracing::warn!(
-            file = %file.display(), %err, backup_error = %e,
-            "invalid settings; using defaults"
-        ),
+    let file = dir.join(SETTINGS_FILE);
+    match crate::core_bridge::back_up(&file) {
+        Ok(Some(bak)) => {
+            if let Err(e) = fs::remove_file(&file) {
+                tracing::warn!(%e, "removing backed-up invalid settings failed");
+            }
+            tracing::warn!(file = %file.display(), %err, bak = %bak.display(), "invalid settings backed up; using defaults");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(file = %file.display(), %err, backup_error = %e, "invalid settings; using defaults")
+        }
     }
     AppSettings::default()
 }
@@ -348,6 +347,23 @@ mod tests {
             load(dir.path()),
             with_scale(0.8),
             "drop writes the pending save"
+        );
+    }
+    #[test]
+    fn repeated_corruption_preserves_both_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        for text in ["first [broken", "second [broken"] {
+            std::fs::write(&file, text).unwrap();
+            load(dir.path());
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("gui.toml.bak")).unwrap(),
+            "first [broken"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("gui.toml.bak.1")).unwrap(),
+            "second [broken"
         );
     }
 }

@@ -1024,6 +1024,13 @@ fn broken_delete_requires_confirmation(cx: &mut TestAppContext) {
     assert!(broken.exists());
     assert_eq!(changed.get(), 0);
 
+    // Initial Enter must cancel, without first moving focus.
+    click(&app, cx, "broken-delete");
+    press(&app, cx, "enter");
+    cx.run_until_parked();
+    assert!(!shows(&app, cx, "dialog"));
+    assert!(broken.exists());
+
     // 删除 deletes it, refreshes the list and tells the status bar.
     click(&app, cx, "broken-delete");
     cx.update_window(app.handle, |_, window, cx| {
@@ -3047,6 +3054,44 @@ fn with_account(dir: &Path) {
 }
 
 #[gpui_kit::test]
+async fn content_mutation_checks_live_record_despite_idle_model(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let inst = store.create("Alpha", "1.21.1").unwrap();
+    let file = inst.game_dir().join("keep.txt");
+    std::fs::create_dir_all(inst.game_dir()).unwrap();
+    std::fs::write(&file, "unchanged").unwrap();
+    let app = boot_games(cx, tmp.path(), FakeGames::running("sleep 30 & wait"));
+    let games = StopGames::new(app._rt.handle());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let session = app._rt.block_on(async {
+        GameSession::prepare_launch_with_command(
+            &inst,
+            fake_game(&inst.id, "sleep 30 & wait"),
+            vec![],
+        )
+        .unwrap()
+        .launch(None)
+        .await
+        .unwrap()
+    });
+    games.add(session.killer());
+    drop(session);
+    assert!(run_state(&model, cx, &inst.id).is_none());
+    let target = file.clone();
+    let result = cx
+        .update(|cx| {
+            patina_app::content::with_instance_lock(&model, &inst.id, cx, move || {
+                std::fs::write(target, "changed")
+            })
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "unchanged");
+}
+
+#[gpui_kit::test]
 fn second_launch_is_busy_with_display_name(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
@@ -3630,6 +3675,24 @@ fn wait_calls(ops: &FakeVersionOps, cx: &mut TestAppContext, n: usize) {
     settle(cx, |_| ops.calls().len() >= n);
     // The operation ends and the list refreshes.
     cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn versions_loader_action_is_keyboard_reachable(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    click(&app, cx, "tab-overview");
+    press(&app, cx, "ctrl-tab");
+    tab_to(&app, cx, "versions-components");
+    press(&app, cx, "down");
+    assert_eq!(
+        element(&app, cx, "versions-row-loader").unwrap().selected(),
+        Some(true)
+    );
+    tab_to(&app, cx, "versions-repair");
+    press(&app, cx, "enter");
+    wait_calls(&ops, cx, 1);
+    assert_eq!(ops.calls(), [OpCall::Reinstall { id: "Pack".into() }]);
 }
 
 #[gpui_kit::test]
@@ -4649,6 +4712,12 @@ fn delete_disabled_while_running(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(store.load("Alpha").is_ok());
 
+    sclick(&app, cx, "settings-delete");
+    press(&app, cx, "enter");
+    cx.run_until_parked();
+    assert!(!sshows(&app, cx, "dialog"));
+    assert!(store.load("Alpha").is_ok());
+
     // 删除 deletes it and selects the next one.
     let changed = Rc::new(std::cell::Cell::new(0));
     let _subscription = cx.update(|cx| {
@@ -4747,6 +4816,131 @@ fn name_and_icon_save(cx: &mut TestAppContext) {
     settle(cx, |_| {
         saved(&store, "Alpha").icon == Some(InstanceIcon::Builtin("sword".into()))
     });
+}
+
+#[gpui_kit::test]
+async fn instance_name_window_and_java_reverts_keep_latest_intent(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, store) = settings_app(
+        cx,
+        tmp.path(),
+        &["Alpha"],
+        vec![java_install("/opt/j21/bin/java", 21)],
+    );
+    override_on(&app, cx, &store, "Alpha");
+    store
+        .update("Alpha", |c| {
+            c.window = Some(patina_core::instance::WindowSize {
+                width: 854,
+                height: 480,
+            })
+        })
+        .unwrap();
+    model.update(cx, |m, cx| m.refresh_and_wait(cx)).await;
+    cx.run_until_parked();
+    let original = saved(&store, "Alpha").window.unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            store
+                .load("Alpha")
+                .unwrap()
+                .dir
+                .join(patina_core::instance::CONFIG_LOCK_FILE),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    replace_text(&app, cx, "settings-name", "Renamed");
+    press(&app, cx, "enter");
+    replace_text(&app, cx, "settings-name", "Alpha");
+    press(&app, cx, "enter");
+    replace_text(&app, cx, "settings-width", "1200");
+    blur(&app, cx);
+    replace_text(&app, cx, "settings-width", &original.width.to_string());
+    blur(&app, cx);
+    click_radio(&app, cx, "settings-java", 1);
+    click_radio(&app, cx, "settings-java", 0);
+    let form = settings_form(&app, cx);
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drop(lock);
+    drained.await;
+    assert_eq!(saved(&store, "Alpha").name, "Alpha");
+    assert_eq!(saved(&store, "Alpha").window, Some(original));
+    assert_eq!(saved_java(&store, "Alpha").unwrap().java_path, None);
+}
+
+#[gpui_kit::test]
+async fn instance_global_mode_revert_supersedes_a_held_seed_read(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let held = cx.update(|cx| {
+        Core::update_config(cx, move |_| {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+        })
+    });
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    sclick(&app, cx, "settings-use-global");
+    sclick(&app, cx, "settings-use-global");
+    release.send(()).unwrap();
+    held.await.unwrap().unwrap();
+    let form = settings_form(&app, cx);
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drained.await;
+    cx.run_until_parked();
+    assert!(saved_java(&store, "Alpha").is_none());
+}
+
+#[gpui_kit::test]
+async fn instance_revert_while_save_is_held_preserves_latest_intent(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(
+            store
+                .load("Alpha")
+                .unwrap()
+                .dir
+                .join(patina_core::instance::CONFIG_LOCK_FILE),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    replace_text(&app, cx, "settings-min-mem", "768");
+    blur(&app, cx);
+    replace_text(&app, cx, "settings-args", "-Dpending=true");
+    blur(&app, cx);
+    replace_text(&app, cx, "settings-min-mem", "512");
+    blur(&app, cx);
+    replace_text(&app, cx, "settings-args", "");
+    press(&app, cx, "backspace");
+    blur(&app, cx);
+    let form = settings_form(&app, cx);
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drop(lock);
+    drained.await;
+    assert_eq!(saved_java(&store, "Alpha").unwrap().min_mem_mib, 512);
+    assert!(
+        saved_java(&store, "Alpha")
+            .unwrap()
+            .extra_jvm_args
+            .is_empty()
+    );
 }
 
 #[gpui_kit::test]
@@ -4989,6 +5183,192 @@ fn a_saved_gc_preset_is_reset_when_the_java_turns_out_old(cx: &mut TestAppContex
 }
 
 #[gpui_kit::test]
+async fn late_java_probe_cannot_override_a_direct_choice(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let gate = std::sync::Mutex::new(Some(gate));
+    let app = boot_core(cx, tmp.path(), AppSettings::default(), move |rt, data| {
+        let mut core = testing::core(rt, data, catalog());
+        core.probe_java = Arc::new(move |path| {
+            if let Some(gate) = gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+            }
+            Some(java_install(path.to_str().unwrap(), 21))
+        });
+        core
+    });
+    open_settings(&app, cx, vec![java_install("/opt/newest/bin/java", 21)]);
+    override_on(&app, cx, &store, "Alpha");
+    let form = settings_form(&app, cx);
+    let probe = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.use_java_file("/slow/bin/java".into(), window, cx)
+            })
+        })
+        .unwrap();
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    click_radio(&app, cx, "settings-java", 1);
+    release.send(()).unwrap();
+    probe.await;
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drained.await;
+    assert_eq!(
+        saved_java(&store, "Alpha").unwrap().java_path,
+        Some("/opt/newest/bin/java".into())
+    );
+}
+
+#[gpui_kit::test]
+async fn late_java_probe_cannot_override_automatic(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let gate = std::sync::Mutex::new(Some(gate));
+    let app = boot_core(cx, tmp.path(), AppSettings::default(), move |rt, data| {
+        let mut core = testing::core(rt, data, catalog());
+        core.probe_java = Arc::new(move |path| {
+            if let Some(gate) = gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+            }
+            Some(java_install(path.to_str().unwrap(), 21))
+        });
+        core
+    });
+    open_settings(&app, cx, vec![java_install("/opt/newest/bin/java", 21)]);
+    override_on(&app, cx, &store, "Alpha");
+    let form = settings_form(&app, cx);
+    let probe = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.use_java_file("/slow/bin/java".into(), window, cx)
+            })
+        })
+        .unwrap();
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    click_radio(&app, cx, "settings-java", 0);
+    release.send(()).unwrap();
+    probe.await;
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drained.await;
+    assert_eq!(saved_java(&store, "Alpha").unwrap().java_path, None);
+}
+
+#[gpui_kit::test]
+async fn late_java_probe_cannot_override_global_mode(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let gate = std::sync::Mutex::new(Some(gate));
+    let app = boot_core(cx, tmp.path(), AppSettings::default(), move |rt, data| {
+        let mut core = testing::core(rt, data, catalog());
+        core.probe_java = Arc::new(move |path| {
+            if let Some(gate) = gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+            }
+            Some(java_install(path.to_str().unwrap(), 21))
+        });
+        core
+    });
+    open_settings(&app, cx, vec![java_install("/opt/newest/bin/java", 21)]);
+    override_on(&app, cx, &store, "Alpha");
+    let form = settings_form(&app, cx);
+    let probe = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.use_java_file("/slow/bin/java".into(), window, cx)
+            })
+        })
+        .unwrap();
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    sclick(&app, cx, "settings-use-global");
+    release.send(()).unwrap();
+    probe.await;
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drained.await;
+    assert!(saved_java(&store, "Alpha").is_none());
+}
+
+#[gpui_kit::test]
+async fn java_file_probes_apply_only_the_latest_request(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let gate = std::sync::Mutex::new(Some(gate));
+    let app = boot_core(cx, tmp.path(), AppSettings::default(), move |rt, data| {
+        let mut core = testing::core(rt, data, catalog());
+        core.probe_java = Arc::new(move |path| {
+            if path == Path::new("/old/bin/java") {
+                if let Some(gate) = gate.lock().unwrap().take() {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                }
+                None
+            } else {
+                Some(java_install(path.to_str().unwrap(), 21))
+            }
+        });
+        core
+    });
+    open_settings(&app, cx, vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    let form = settings_form(&app, cx);
+    let old = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.use_java_file("/old/bin/java".into(), window, cx)
+            })
+        })
+        .unwrap();
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let latest = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| {
+                f.use_java_file("/latest/bin/java".into(), window, cx)
+            })
+        })
+        .unwrap();
+    latest.await;
+    release.send(()).unwrap();
+    old.await;
+    let drained = cx
+        .update_window(app.handle, |_, window, cx| {
+            form.update(cx, |f, cx| f.flush(window, cx))
+        })
+        .unwrap();
+    drained.await;
+    assert_eq!(
+        saved_java(&store, "Alpha").unwrap().java_path,
+        Some("/latest/bin/java".into())
+    );
+    assert!(!sshows(&app, cx, "settings-java-error"));
+}
+
+#[gpui_kit::test]
 fn a_file_that_is_no_java_is_refused(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
@@ -4997,6 +5377,7 @@ fn a_file_that_is_no_java_is_refused(cx: &mut TestAppContext) {
     cx.update_window(app.handle, |_, window, cx| {
         form.update(cx, |form, cx| {
             form.use_java_file("/nonexistent/not-a-java".into(), window, cx)
+                .detach()
         })
     })
     .unwrap();
@@ -5289,6 +5670,17 @@ fn toggle_after_external_change_refreshes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn content_folder_creation_failure_is_notified(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _tab, mods) = mods_app(cx, tmp.path(), |_| {});
+    std::fs::remove_dir_all(&mods).unwrap();
+    std::fs::write(&mods, "not a directory").unwrap();
+    click(&app, cx, "content-open-folder");
+    settle(cx, |cx| notification_count(&app, cx) == 1);
+    assert_eq!(std::fs::read_to_string(&mods).unwrap(), "not a directory");
+}
+
+#[gpui_kit::test]
 fn delete_requires_confirmation(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let (app, tab, mods) = mods_app(cx, tmp.path(), |dir| {
@@ -5328,7 +5720,6 @@ fn delete_requires_confirmation(cx: &mut TestAppContext) {
 
     // Enter on the focused 取消 cancels too.
     click(&app, cx, mod_delete_id("a.jar"));
-    tab_to(&app, cx, "cancel");
     press(&app, cx, "enter");
     assert!(!shows(&app, cx, "dialog"));
     assert_eq!(tab.read_with(cx, |t, _| t.changes_in_flight()), 0);
@@ -5515,9 +5906,13 @@ fn mod_rows_are_keyboard_reachable(cx: &mut TestAppContext) {
     press(&app, cx, "home");
     assert_eq!(selected(cx).as_deref(), Some("a.jar"));
 
-    // Enter in the confirmation (no button chosen) deletes.
+    // Initial Enter cancels; Enter on the explicit Delete button deletes.
     press(&app, cx, "delete");
     assert!(shows(&app, cx, "dialog"));
+    press(&app, cx, "enter");
+    assert!(mods.join("a.jar").exists());
+    press(&app, cx, "delete");
+    tab_to(&app, cx, "ok");
     press(&app, cx, "enter");
     settle(cx, |_| !mods.join("a.jar").exists());
     assert!(!shows(&app, cx, "dialog"));
@@ -5938,6 +6333,17 @@ fn packs_show_description_and_icon(cx: &mut TestAppContext) {
         ["Faithful", "Plain.zip", "Zipped.zip"],
         "folders and zips only"
     );
+    assert_eq!(
+        tab.read_with(cx, |t, cx| t
+            .list()
+            .read(cx)
+            .items()
+            .iter()
+            .map(|i| i.title.clone())
+            .collect::<Vec<_>>()),
+        ["Faithful", "Plain", "Zipped"]
+    );
+
     let text = |cx: &mut TestAppContext, id: String| label_of(&app, cx, id);
     assert_eq!(
         text(cx, "pack-detail-Faithful".into()).as_deref(),
@@ -5997,6 +6403,17 @@ fn shader_option_files_hidden(cx: &mut TestAppContext) {
         std::fs::write(dir.join("readme.md"), "x").unwrap();
     });
     assert_eq!(local_keys(&tab, cx), ["bsl", "Complementary.zip"]);
+    assert_eq!(
+        tab.read_with(cx, |t, cx| t
+            .list()
+            .read(cx)
+            .items()
+            .iter()
+            .map(|i| i.title.clone())
+            .collect::<Vec<_>>()),
+        ["bsl", "Complementary"]
+    );
+
     assert!(shows(&app, cx, local_row_id(LocalKind::Shaders, "bsl")));
     assert!(shows(
         &app,
@@ -7752,6 +8169,19 @@ uuid = "00000000-0000-0000-0000-000000000002"
     }
 
     #[gpui_kit::test]
+    fn empty_account_guidance_matches_the_build(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open_page(&app, cx);
+        let guidance = label_of(&app, cx, "accounts-empty").unwrap();
+        assert!(
+            guidance.contains("Microsoft sign-in isn’t available"),
+            "{guidance}"
+        );
+        assert_eq!(guidance.contains("offline"), cfg!(feature = "dev-offline"));
+    }
+
+    #[gpui_kit::test]
     fn remove_requires_confirmation(cx: &mut TestAppContext) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("accounts.toml"), TWO).unwrap();
@@ -8258,6 +8688,39 @@ mod settings_page {
     }
 
     #[gpui_kit::test]
+    fn after_launch_close_is_skipped_while_runtime_removal_is_pending(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = runtime(tmp.path(), "java-runtime-gamma", "17.0.8");
+        let mut settings = AppSettings::default();
+        settings.after_launch = settings::AfterLaunch::Close;
+        let app = boot(cx, tmp.path(), settings);
+        let page = open(&app, cx);
+        settle(cx, |cx| {
+            page.read_with(cx, |p, _| p.runtimes().is_some_and(|r| r.len() == 1))
+        });
+        let model = instances_model(&app, cx);
+        pclick(&app, cx, runtime_delete_id("java-runtime-gamma"));
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("dialog").click("prefs-runtime-ok", cx);
+            assert!(page.read(cx).is_removing_runtime());
+            assert!(!model.read(cx).activity().read(cx).has_work_in_flight());
+            model.update(cx, |_, cx| {
+                cx.emit(patina_app::launch::LaunchEvent::Spawned {
+                    id: "test-spawn".into(),
+                    warnings: vec![],
+                    record_saved: true,
+                })
+            });
+        })
+        .unwrap();
+        settle(cx, |cx| notification_count(&app, cx) == 1);
+        settle(cx, |cx| !page.read_with(cx, |p, _| p.is_removing_runtime()));
+        assert!(!home.exists());
+        assert!(cx.update(|cx| !cx.windows().is_empty()));
+    }
+
+    #[gpui_kit::test]
     fn runtime_delete_requires_confirmation(cx: &mut TestAppContext) {
         let tmp = tempfile::tempdir().unwrap();
         let gamma = runtime(tmp.path(), "java-runtime-gamma", "17.0.8");
@@ -8315,6 +8778,148 @@ mod settings_page {
         model.update(cx, |m, cx| m.set_run_state(&alpha, None, cx));
         cx.run_until_parked();
         assert!(!disabled(&app, cx, runtime_delete_id("java-runtime-delta")));
+    }
+
+    #[gpui_kit::test]
+    async fn global_revert_while_save_is_held_preserves_latest_intent(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = cx.update(|cx| {
+            Core::update_config(cx, move |_| {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+            })
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        replace(&app, cx, "prefs-min-mem", "768");
+        leave(&app, cx);
+        replace(&app, cx, "prefs-args", "-Dpending=true");
+        leave(&app, cx);
+        replace(&app, cx, "prefs-min-mem", "512");
+        leave(&app, cx);
+        replace(&app, cx, "prefs-args", "");
+        press(&app, cx, "backspace");
+        leave(&app, cx);
+        pclick_radio(&app, cx, "prefs-source", 2);
+        pclick_radio(&app, cx, "prefs-source", 0);
+        pclick_radio(&app, cx, "prefs-gc", 1);
+        pclick_radio(&app, cx, "prefs-gc", 0);
+        release.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        saves_done(&page, cx);
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 512);
+        assert!(on_disk(tmp.path()).java.extra_jvm_args.is_empty());
+        assert_eq!(on_disk(tmp.path()).java.gc_preset, GcPreset::None);
+        assert_eq!(on_disk(tmp.path()).download.source, SourceChoice::Auto);
+    }
+
+    #[gpui_kit::test]
+    async fn global_revert_while_actual_readback_is_held_keeps_latest_intent(
+        cx: &mut TestAppContext,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        let page = open(&app, cx);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = Rc::new(std::cell::RefCell::new(None));
+        let _observe = cx.update(|cx| {
+            let held = held.clone();
+            let epoch = patina_app::core_bridge::ConfigChanged::epoch(cx);
+            let mut block = Some(move |_: &mut GlobalConfig| {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+            });
+            cx.observe(&epoch, move |_, cx| {
+                if let Some(block) = block.take() {
+                    *held.borrow_mut() = Some(Core::update_config(cx, block));
+                    started.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            })
+        });
+        replace(&app, cx, "prefs-min-mem", "768");
+        leave(&app, cx);
+        saves_done(&page, cx);
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
+        assert_eq!(
+            page.read_with(cx, |p, _| p.config().unwrap().java.min_mem_mib),
+            512,
+            "the write finished, but readback is held"
+        );
+        replace(&app, cx, "prefs-min-mem", "512");
+        leave(&app, cx);
+        release.send(()).unwrap();
+        let held = held.borrow_mut().take().unwrap();
+        held.await.unwrap().unwrap();
+        saves_done(&page, cx);
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 512);
+    }
+
+    #[gpui_kit::test]
+    async fn global_close_drains_queued_memory_and_focused_arguments(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open(&app, cx);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let held = cx.update(|cx| {
+            Core::update_config(cx, move |_| {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+            })
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        replace(&app, cx, "prefs-min-mem", "768");
+        leave(&app, cx);
+        replace(&app, cx, "prefs-args", "-Dclose=true");
+        let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
+        assert!(!window.simulate_close());
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        release.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
+        assert_eq!(on_disk(tmp.path()).java.extra_jvm_args, "-Dclose=true");
+    }
+
+    #[gpui_kit::test]
+    async fn closing_without_showing_globals_preserves_saved_arguments(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = GlobalConfig::default();
+        config.java.extra_jvm_args = "-Dkeep=true".into();
+        config
+            .save(&DataDirs::new(tmp.path()).config_file())
+            .unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        cx.update(Core::read_config).await.unwrap();
+        settle(cx, |cx| {
+            page(&app, cx).read_with(cx, |p, _| p.config().is_some())
+        });
+        let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
+        assert!(!window.simulate_close());
+        settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+        assert_eq!(on_disk(tmp.path()).java.extra_jvm_args, "-Dkeep=true");
+    }
+
+    #[gpui_kit::test]
+    fn focused_global_edit_is_flushed_on_close(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        open(&app, cx);
+        settle(cx, |cx| {
+            element(&app, cx, "prefs-min-mem")
+                .and_then(|e| e.value().map(str::to_owned))
+                .as_deref()
+                == Some("512")
+        });
+        replace(&app, cx, "prefs-min-mem", "768");
+        let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
+        assert!(!window.simulate_close());
+        settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+        assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 768);
     }
 
     #[gpui_kit::test]

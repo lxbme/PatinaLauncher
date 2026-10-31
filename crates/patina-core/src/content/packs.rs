@@ -128,7 +128,12 @@ pub fn read_pack_icon(path: &Path) -> Option<Vec<u8>> {
 /// forged path cannot reach outside the packs folder); a symlink is removed
 /// itself, never followed.
 pub fn delete_pack(dir: &Path, path: &Path) -> io::Result<()> {
-    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "not a pack in this folder");
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            rust_i18n::t!("errors.content.invalid_pack_path").to_string(),
+        )
+    };
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -437,6 +442,32 @@ mod tests {
         assert!(delete_pack(&d, &d.join("gone.zip")).is_err());
         assert!(outside.exists());
         assert!(d.exists());
+    }
+
+    #[test]
+    fn refused_pack_path_is_localized_without_mutating_the_file() {
+        let _locale = crate::i18n::locale_lock();
+        let previous = rust_i18n::locale().to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad\\name.zip");
+        std::fs::write(&path, "keep").unwrap();
+        for (language, expected) in [
+            (
+                crate::i18n::Language::En,
+                "This pack path is not a safe direct child of this folder.",
+            ),
+            (
+                crate::i18n::Language::ZhCn,
+                "此内容包路径不是该文件夹下的安全直接子项。",
+            ),
+        ] {
+            crate::i18n::set_language(language);
+            let error = delete_pack(tmp.path(), &path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
+        }
+        rust_i18n::set_locale(&previous);
     }
 
     #[cfg(unix)]

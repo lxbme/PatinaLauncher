@@ -5,8 +5,8 @@
 //! desktop file manager. These are not screenshot or click-only evidence.
 //!
 //! The suite builds only with the `e2e` feature (which brings
-//! `dev-offline` and `test-support`), and every test is `#[ignore]`d on top:
-//! they need the network, a real Java, minutes of time, and
+//! `dev-offline` and `test-support`). Real-data tests are `#[ignore]`d;
+//! the offline fixture/readiness helper regressions run normally. Real tests need the network, a real Java, minutes of time, and
 //! `PATINA_DATA_DIR` set to a disposable data dir that has
 //!
 //! - an offline account (`e2e` builds with `dev-offline`),
@@ -1205,21 +1205,105 @@ const JARS: [(&str, &str, Option<&str>); 4] = [
     ("e2e-plain.jar", "e2e-plain", None),
 ];
 
-/// Writes the jar `file` with `entries` into `dir`.
-fn jar(dir: &Path, file: &str, entries: &[(&str, &[u8])]) {
-    use std::io::Write as _;
-    let mut w = zip::ZipWriter::new(std::fs::File::create(dir.join(file)).unwrap());
-    for (name, bytes) in entries {
-        w.start_file(*name, zip::write::SimpleFileOptions::default())
-            .unwrap();
-        w.write_all(bytes).unwrap();
+/// Owns only the fixture files it exclusively created, including a jar
+/// renamed to its disabled name. Open handles identify ownership on cleanup.
+struct OwnedJars {
+    dir: PathBuf,
+    lock: std::fs::File,
+    files: Vec<(std::fs::File, [PathBuf; 2])>,
+}
+
+impl OwnedJars {
+    fn new(dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(".patina-e2e-jars"))?;
+        let guard = Self {
+            dir: dir.to_path_buf(),
+            lock,
+            files: Vec::new(),
+        };
+        for name in JARS.iter().map(|j| j.0).chain(["e2e-late.jar"]) {
+            guard.refuse_collisions(name)?;
+        }
+        Ok(guard)
     }
-    w.finish().unwrap();
+
+    fn paths(&self, name: &str) -> [PathBuf; 2] {
+        [
+            self.dir.join(name),
+            self.dir.join(format!("{name}.disabled")),
+        ]
+    }
+
+    fn refuse_collisions(&self, name: &str) -> std::io::Result<()> {
+        for path in self.paths(name) {
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("fixture collision: {}", path.display()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn jar(&mut self, name: &str, entries: &[(&str, &[u8])]) -> std::io::Result<()> {
+        self.refuse_collisions(name)?;
+        let paths = self.paths(name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&paths[0])?;
+        let owned = match file.try_clone() {
+            Ok(owned) => owned,
+            Err(error) => {
+                remove_owned(&file, &paths[0]);
+                return Err(error);
+            }
+        };
+        self.files.push((owned, paths));
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .map_err(std::io::Error::other)?;
+            zip.write_all(bytes)?;
+        }
+        zip.finish().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+}
+
+fn remove_owned(file: &std::fs::File, path: &Path) {
+    if let (Ok(owned), Ok(current)) = (file.metadata(), std::fs::symlink_metadata(path))
+        && patina_core::platform::same_file(&owned, &current)
+    {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+impl Drop for OwnedJars {
+    fn drop(&mut self) {
+        for (file, paths) in &self.files {
+            for path in paths {
+                remove_owned(file, path);
+            }
+        }
+        remove_owned(&self.lock, &self.dir.join(".patina-e2e-jars"));
+    }
 }
 
 /// Puts the [`JARS`] into `mods` by hand (as a player would, outside the
 /// downloads page), with the bundled icons as their logos.
-fn place_jars(mods: &Path) {
+fn place_jars(mods: &Path) -> OwnedJars {
+    let mut fixtures = OwnedJars::new(mods).expect("fixture paths must be unused");
     let icon = |name: &str| {
         std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("assets/instance-icons/{name}.png")),
@@ -1228,14 +1312,15 @@ fn place_jars(mods: &Path) {
     };
     std::fs::create_dir_all(mods).unwrap();
     let fabric = br#"{"schemaVersion":1,"id":"e2e_fabric","version":"1.2.3","name":"E2E Fabric Mod","authors":["Patina"],"icon":"assets/e2e/icon.png"}"#;
-    jar(
-        mods,
-        JARS[0].0,
-        &[
-            ("fabric.mod.json", fabric),
-            ("assets/e2e/icon.png", &icon("axe")),
-        ],
-    );
+    fixtures
+        .jar(
+            JARS[0].0,
+            &[
+                ("fabric.mod.json", fabric),
+                ("assets/e2e/icon.png", &icon("axe")),
+            ],
+        )
+        .unwrap();
     let neo = br#"modLoader = "javafml"
 loaderVersion = "[1,)"
 license = "MIT"
@@ -1246,32 +1331,104 @@ displayName = "E2E Neo Mod"
 authors = "Patina"
 logoFile = "logo.png"
 "#;
-    jar(
-        mods,
-        JARS[1].0,
-        &[
-            ("META-INF/neoforge.mods.toml", neo),
-            ("logo.png", &icon("sword")),
-        ],
-    );
+    fixtures
+        .jar(
+            JARS[1].0,
+            &[
+                ("META-INF/neoforge.mods.toml", neo),
+                ("logo.png", &icon("sword")),
+            ],
+        )
+        .unwrap();
     let legacy = br#"[{"modid":"e2elegacy","name":"E2E Legacy Mod","version":"0.9","authorList":["Patina"],"logoFile":"logo.png"}]"#;
-    jar(
-        mods,
-        JARS[2].0,
-        &[("mcmod.info", legacy), ("logo.png", &icon("pickaxe"))],
-    );
-    jar(mods, JARS[3].0, &[("readme.txt", b"no metadata here")]);
+    fixtures
+        .jar(
+            JARS[2].0,
+            &[("mcmod.info", legacy), ("logo.png", &icon("pickaxe"))],
+        )
+        .unwrap();
+    fixtures
+        .jar(JARS[3].0, &[("readme.txt", b"no metadata here")])
+        .unwrap();
+    fixtures
 }
 
-/// Removes the hand-made jars (enabled or not) when dropped.
-struct RemoveJars(PathBuf);
-impl Drop for RemoveJars {
-    fn drop(&mut self) {
-        for (file, _, _) in JARS {
-            std::fs::remove_file(self.0.join(file)).ok();
-            std::fs::remove_file(self.0.join(format!("{file}.disabled"))).ok();
+#[test]
+fn fixture_cleanup_preserves_an_unowned_disabled_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("e2e-fabric.jar.disabled");
+    std::fs::write(&file, "not ours").unwrap();
+    assert!(OwnedJars::new(tmp.path()).is_err());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "not ours");
+}
+
+#[test]
+fn fixture_jar_refuses_to_overwrite_a_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixtures = OwnedJars::new(tmp.path()).unwrap();
+    let file = tmp.path().join("e2e-fabric.jar");
+    std::fs::write(&file, "not ours").unwrap();
+    assert!(fixtures.jar("e2e-fabric.jar", &[("x", b"x")]).is_err());
+    drop(fixtures);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "not ours");
+}
+
+#[test]
+fn fixture_guard_is_exclusive_and_cleans_owned_disabled_and_late_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixtures = OwnedJars::new(tmp.path()).unwrap();
+    assert!(OwnedJars::new(tmp.path()).is_err());
+    fixtures.jar("e2e-fabric.jar", &[("x", b"x")]).unwrap();
+    std::fs::rename(
+        tmp.path().join("e2e-fabric.jar"),
+        tmp.path().join("e2e-fabric.jar.disabled"),
+    )
+    .unwrap();
+    fixtures.jar("e2e-late.jar", &[("x", b"x")]).unwrap();
+    drop(fixtures);
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    let fixtures = place_jars(tmp.path());
+    std::fs::remove_file(tmp.path().join("e2e-fabric.jar")).unwrap();
+    std::fs::write(tmp.path().join("e2e-fabric.jar"), "replacement").unwrap();
+    drop(fixtures);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("e2e-fabric.jar")).unwrap(),
+        "replacement"
+    );
+}
+
+#[test]
+fn fixture_guard_refuses_every_reserved_name_and_cleans_on_unwind() {
+    for name in JARS.iter().map(|j| j.0).chain(["e2e-late.jar"]) {
+        for suffix in ["", ".disabled"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(format!("{name}{suffix}"));
+            std::fs::write(&path, "not ours").unwrap();
+            assert!(OwnedJars::new(tmp.path()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "not ours");
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
         }
     }
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(
+        std::panic::catch_unwind(|| {
+            let mut fixtures = place_jars(tmp.path());
+            fixtures.jar("e2e-late.jar", &[("late", b"late")]).unwrap();
+            panic!("an assertion after creating the late jar");
+        })
+        .is_err()
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+fn game_ready(log: &str) -> bool {
+    log.contains("Setting user:")
+}
+
+#[test]
+fn readiness_requires_the_user_log_milestone() {
+    assert!(!game_ready("stalled"));
+    assert!(game_ready("Setting user: Dev"));
 }
 
 fn mods_tab(app: &Booted, cx: &mut TestAppContext) -> Entity<ModsTab> {
@@ -1308,8 +1465,7 @@ fn e2e_08_mods_tab_and_folders(cx: &mut TestAppContext) {
     let app = boot(cx);
     loaded(&app, cx);
     let mods = app.data.instances().join(MODS_HOME).join("minecraft/mods");
-    let _remove = RemoveJars(mods.clone());
-    place_jars(&mods);
+    let mut fixtures = place_jars(&mods);
 
     select(&app, cx, MODS_HOME);
     click(&app, cx, "tab-mods");
@@ -1374,7 +1530,9 @@ fn e2e_08_mods_tab_and_folders(cx: &mut TestAppContext) {
     assert!(mods.join(file).is_file() && !mods.join(&off).exists());
 
     // A jar added outside the app shows after 刷新.
-    jar(&mods, "e2e-late.jar", &[("readme.txt", b"late")]);
+    fixtures
+        .jar("e2e-late.jar", &[("readme.txt", b"late")])
+        .unwrap();
     click(&app, cx, "content-refresh");
     mods_settled(&tab, cx);
     assert!(
@@ -1459,8 +1617,7 @@ fn e2e_09_global_search_jumps(cx: &mut TestAppContext) {
     let app = boot(cx);
     let m = loaded(&app, cx);
     let mods = app.data.instances().join(MODS_HOME).join("minecraft/mods");
-    let _remove = RemoveJars(mods.clone());
-    place_jars(&mods);
+    let _fixtures = place_jars(&mods);
     let model = search_model(&app, cx);
     wait_for(cx, Duration::from_secs(60), "index", |cx| {
         model.read_with(cx, |m, _| m.is_indexed() && !m.is_refreshing())
@@ -1757,11 +1914,12 @@ fn launch_noting(app: &Booted, cx: &mut TestAppContext, id: &str) -> Launched {
         args.iter().any(|a| a.starts_with("-Xmx"))
     });
     // The JVM took its flags if the game gets as far as its user.
-    let start = Instant::now();
-    wait_for(cx, Duration::from_secs(300), "game log", |cx| {
-        log_text(app, cx, id).contains("Setting user:")
-            || (start.elapsed() > Duration::from_secs(150) && !gone(pid))
-    });
+    wait_for(
+        cx,
+        Duration::from_secs(300),
+        "game user-log milestone",
+        |cx| game_ready(&log_text(app, cx, id)),
+    );
     assert!(!gone(pid), "the game still runs with these flags");
     Launched {
         pid,

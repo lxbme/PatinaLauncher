@@ -68,10 +68,14 @@ impl SettingsPage {
         let Some(java) = self.config.as_ref().map(|c| c.java.clone()) else {
             return;
         };
-        set_text(&self.min_mem, &java.min_mem_mib.to_string(), window, cx);
-        let max = java.max_mem_mib.map(|m| m.to_string()).unwrap_or_default();
-        set_text(&self.max_mem, &max, window, cx);
-        if self.args.read(cx).value() != java.extra_jvm_args.as_str()
+        self.inputs_ready = true;
+        if self.requested_memory.is_none() {
+            set_text(&self.min_mem, &java.min_mem_mib.to_string(), window, cx);
+            let max = java.max_mem_mib.map(|m| m.to_string()).unwrap_or_default();
+            set_text(&self.max_mem, &max, window, cx);
+        }
+        if self.requested_args.is_none()
+            && self.args.read(cx).value() != java.extra_jvm_args.as_str()
             && !self.args.focus_handle(cx).is_focused(window)
         {
             self.args.update(cx, |args, cx| {
@@ -97,9 +101,14 @@ impl SettingsPage {
         };
         self.errors.memory = None;
         cx.notify();
-        if saved.min_mem_mib == min && saved.max_mem_mib == max {
+        if self
+            .requested_memory
+            .unwrap_or((saved.min_mem_mib, saved.max_mem_mib))
+            == (min, max)
+        {
             return;
         }
+        self.requested_memory = Some((min, max));
         self.edit(Field::Memory, window, cx, move |c| {
             c.java.min_mem_mib = min;
             c.java.max_mem_mib = max;
@@ -130,18 +139,24 @@ impl SettingsPage {
             self.args_changed(cx);
             return;
         }
-        if saved == text {
+        if self.requested_args.as_ref().unwrap_or(&saved) == &text {
             return;
         }
+        self.requested_args = Some(text.clone());
         self.edit(Field::Args, window, cx, move |c| {
             c.java.extra_jvm_args = text
         });
     }
 
     fn set_gc(&mut self, preset: GcPreset, window: &mut Window, cx: &mut Context<Self>) {
-        if self.config.as_ref().map(|c| c.java.gc_preset) == Some(preset) {
+        if self
+            .requested_gc
+            .or_else(|| self.config.as_ref().map(|c| c.java.gc_preset))
+            == Some(preset)
+        {
             return;
         }
+        self.requested_gc = Some(preset);
         self.edit(Field::Gc, window, cx, move |c| c.java.gc_preset = preset);
     }
 
@@ -324,7 +339,9 @@ impl SettingsPage {
     /// versions, and one whose Java cannot run the preset launches without
     /// it (with a warning), so the choice is not gated by any one Java.
     fn render_gc(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let preset = self.config.as_ref().map(|c| c.java.gc_preset);
+        let preset = self
+            .requested_gc
+            .or_else(|| self.config.as_ref().map(|c| c.java.gc_preset));
         let radios: Vec<Radio> = GC_PRESETS
             .iter()
             .map(|p| Radio::new("gc").label(p.display_name()))

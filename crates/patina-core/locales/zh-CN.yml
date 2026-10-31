@@ -1,4 +1,6 @@
 errors:
+  content:
+    invalid_pack_path: "此内容包路径不是该文件夹下的安全直接子项。"
   config:
     io: "读取或写入配置文件失败：%{error}"
     parse: "配置文件格式错误：%{error}"

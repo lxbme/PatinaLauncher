@@ -125,6 +125,7 @@ pub struct Core {
     /// Looks for the Java installs on this machine (blocking: it runs
     /// them), injectable for UI tests; an offline test core finds none.
     pub detect_java: DetectJava,
+    pub probe_java: ProbeJava,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
@@ -141,6 +142,8 @@ impl Global for Core {}
 
 /// Finds the Java installs on this machine (see `Core.detect_java`).
 pub type DetectJava = Arc<dyn Fn() -> Vec<JavaInstall> + Send + Sync>;
+/// Checks an explicitly chosen executable on the blocking pool.
+pub type ProbeJava = Arc<dyn Fn(&Path) -> Option<JavaInstall> + Send + Sync>;
 
 /// What a config save did besides saving.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -316,6 +319,7 @@ impl Core {
             login,
             speed_test,
             detect_java,
+            probe_java: Arc::new(patina_core::java::probe),
             config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),
@@ -480,7 +484,10 @@ impl Core {
                 tracing::warn!(%error, "saving the accounts failed; reading them back");
                 match AccountStore::load(&data) {
                     Ok(on_disk) => *store = on_disk,
-                    Err(e) => tracing::warn!(error = %e, "reading the accounts back failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "reading the accounts back failed");
+                        *loaded = Err(LoadError::Failed(Arc::new(e)));
+                    }
                 }
                 return Err(error.to_string());
             }
@@ -681,7 +688,7 @@ fn config_signal_after<R: Send + 'static>(
 /// Copies `file` to `<file>.bak`, or to `<file>.bak.N` with the first
 /// free N: an existing backup is never written over. `Ok(None)` when there
 /// is no file to keep.
-fn back_up(file: &Path) -> std::io::Result<Option<PathBuf>> {
+pub(crate) fn back_up(file: &Path) -> std::io::Result<Option<PathBuf>> {
     use std::io::ErrorKind;
     let mut source = match std::fs::File::open(file) {
         Ok(source) => source,
@@ -1099,6 +1106,35 @@ uuid = "00000000-0000-0000-0000-00000000000b"
         let refused = cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("a")));
         assert!(refused.await.is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not [valid");
+    }
+
+    #[gpui_kit::test]
+    async fn account_double_failure_marks_memory_unavailable(cx: &mut TestAppContext) {
+        let rt = crate::runtime::start();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("accounts.toml");
+        std::fs::write(&file, TWO_ACCOUNTS).unwrap();
+        let core = offline_core(rt.handle(), dir.path());
+        cx.update(|cx| {
+            cx.set_global(core);
+            AccountsChanged::init(cx);
+        });
+        cx.executor().allow_parking();
+        cx.update(|cx| Core::with_accounts(cx, |_| ()))
+            .await
+            .unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(
+            cx.update(|cx| Core::update_accounts(cx, |s| s.set_current("b")))
+                .await
+                .is_err()
+        );
+        assert!(
+            cx.update(|cx| Core::with_accounts(cx, |a| a.is_err()))
+                .await
+                .unwrap()
+        );
     }
 
     #[gpui_kit::test]

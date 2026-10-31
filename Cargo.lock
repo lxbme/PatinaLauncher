@@ -5374,6 +5374,7 @@ dependencies = [
  "chrono",
  "futures",
  "gpui-kit",
+ "image",
  "patina-app",
  "patina-core",
  "reqwest",

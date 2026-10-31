@@ -27,6 +27,7 @@ mod accounts_changed;
 mod config_changed;
 mod launch;
 mod service;
+pub(crate) use service::back_up;
 mod speed;
 mod task;
 #[cfg(any(test, feature = "test-support"))]
@@ -38,7 +39,7 @@ pub use config_changed::{ConfigChanged, ConfigEpoch};
 pub use launch::LaunchBackend;
 pub use service::{
     Catalog, ConfigSaveError, ConfigSaved, Core, DetectJava, InitError, LoadError, LoadedAccounts,
-    LoadedConfig, SpeedTested, config_reason,
+    LoadedConfig, ProbeJava, SpeedTested, config_reason,
 };
 pub use speed::{MirrorProbe, SpeedTest, SpeedTestResult, latency_text, mirror_name};
 pub use task::{

@@ -620,6 +620,7 @@ impl InstanceStore {
         if std::fs::canonicalize(parent)? != std::fs::canonicalize(&self.root)? {
             return Err(refuse());
         }
+        crate::launch::running::refuse_while_running(&b.dir, &b.id)?;
         std::fs::remove_dir_all(&b.dir)?;
         Ok(())
     }
@@ -1098,6 +1099,25 @@ mod tests {
         // The game is gone: its stale record no longer holds the instance.
         store.delete(&a.id).unwrap();
         assert!(!a.dir.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broken_delete_refuses_a_live_record_without_valid_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path());
+        let inst = store.create("Running broken", "1.21").unwrap();
+        let _game = crate::launch::running::FakeGame::start(&inst.dir, &inst.id);
+        std::fs::write(inst.dir.join(CONFIG_FILE), "not [toml").unwrap();
+        let broken = store.list().unwrap().broken.remove(0);
+        assert!(matches!(
+            store.delete_broken(&broken),
+            Err(InstanceError::Busy(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(inst.dir.join(CONFIG_FILE)).unwrap(),
+            "not [toml"
+        );
     }
 
     #[test]

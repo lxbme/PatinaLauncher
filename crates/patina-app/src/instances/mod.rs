@@ -97,6 +97,7 @@ pub fn init(cx: &mut gpui_kit::App) {
     list::init(cx);
     icon_picker::init(cx);
     version_picker::init(cx);
+    versions_tab::init(cx);
 }
 
 /// Element id of the text of a notification made with [`labelled`].

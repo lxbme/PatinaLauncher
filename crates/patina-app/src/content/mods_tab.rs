@@ -625,7 +625,9 @@ impl ModsTab {
         // The footer's region, to tell whether one of its buttons has the
         // keyboard.
         let footer_focus = cx.focus_handle();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        let first_draw = std::cell::Cell::new(true);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            super::focus_first_button(&footer_focus, &first_draw, window, cx);
             let delete: Rc<WindowAction> = {
                 let (this, file) = (this.clone(), item.file_name.clone());
                 Rc::new(move |window, cx| {
@@ -952,6 +954,7 @@ impl ModsTab {
                 item.image_key(&self.id),
                 move || read_mod_meta(&path, prefer).and_then(|meta| meta.icon),
                 ICON,
+                Lucide::Puzzle,
                 cx,
             )
         } else {
@@ -1202,7 +1205,7 @@ impl ModsTab {
             });
         ContentToolbar::new(
             &self.filter,
-            move |_, cx| open_folder(dir.clone(), cx),
+            move |window, cx| open_folder(dir.clone(), window, cx),
             move |_, cx| refresh.update(cx, |list, cx| list.reload(cx)),
         )
         .refreshing(list.is_reloading())

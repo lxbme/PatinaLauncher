@@ -46,8 +46,9 @@ pub fn running_game(inst: &Instance) -> Option<RunningInfo> {
 /// Refuses (as [`BusyKind::Running`]) while the game of instance `id` in
 /// `dir` runs, so an operation never changes or deletes the files of a
 /// running game, even one no lock guards (left running by a launcher that
-/// quit). Read-only, like [`running_game`].
-pub(crate) fn refuse_while_running(dir: &Path, id: &str) -> Result<(), Busy> {
+/// quit). Read-only, like [`running_game`]. Mutation callers must hold the
+/// instance lock before checking and keep it until the mutation is done.
+pub fn refuse_while_running(dir: &Path, id: &str) -> Result<(), Busy> {
     let running = read_record_at(&dir.join(RUNNING_FILE))
         .is_some_and(|rec| rec.instance_id == id && verify(&rec));
     if running {
@@ -174,7 +175,12 @@ impl FakeGame {
         let child = spawn_detached(
             &super::LaunchCommand {
                 program: "sh".into(),
-                args: vec!["-c".into(), "sleep 60 & wait".into(), "x".into(), marker],
+                args: vec![
+                    "-c".into(),
+                    "printf 'ready\\n'; sleep 60 & wait".into(),
+                    "x".into(),
+                    marker,
+                ],
                 cwd: std::env::temp_dir(),
             },
             &dir.join(CURRENT_LOG),
@@ -190,6 +196,19 @@ impl FakeGame {
             started_at: 0,
             log: CURRENT_LOG.into(),
         };
+        // A start token alone is not readiness: a shell can temporarily
+        // expose an empty command line during initialization. Publish only
+        // after its own milestone and the production identity check agree.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read(dir.join(CURRENT_LOG)).ok().as_deref() != Some(b"ready\n")
+            || !verify(&rec)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake game did not become ready"
+            );
+            std::thread::yield_now();
+        }
         let data = serde_json::to_vec_pretty(&rec).unwrap();
         crate::fsutil::write_atomic(&dir.join(RUNNING_FILE), &data).unwrap();
         game
@@ -249,6 +268,19 @@ mod tests {
             dir: dir.to_path_buf(),
             config: Default::default(),
         }
+    }
+
+    #[test]
+    fn fake_game_publishes_only_after_shell_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = inst(dir.path());
+        let _game = FakeGame::start(&instance.dir, &instance.id);
+        assert_eq!(
+            std::fs::read_to_string(instance.dir.join(CURRENT_LOG)).unwrap(),
+            "ready\n"
+        );
+        assert!(verify(&read_record(&instance).unwrap()));
+        assert!(refuse_while_running(&instance.dir, &instance.id).is_err());
     }
 
     #[test]

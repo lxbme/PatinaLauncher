@@ -13,6 +13,8 @@ use patina_core::launch::{GameSession, Log4jXmlParser, LogLine, SessionExit, Str
 const DRAIN_GRACE: Duration = Duration::from_secs(3);
 /// How often [`follow_file`] looks for new output.
 const FILE_POLL: Duration = Duration::from_millis(200);
+/// Same raw-line bound as the session tailer.
+const RAW_LINE_MAX: usize = 1024 * 1024;
 
 /// Prints the log file at `path` of a game whose session another process
 /// holds: everything already in it, then new lines as they are written,
@@ -29,6 +31,7 @@ pub async fn follow_file(
     let mut file = std::fs::File::open(path)?;
     let mut parser = Log4jXmlParser::new();
     let mut partial: Vec<u8> = Vec::new();
+    let mut truncated = false;
     let mut buf = vec![0u8; 64 * 1024];
     tokio::pin!(stop);
     loop {
@@ -36,19 +39,35 @@ pub async fn follow_file(
         // in the file by the time this read reaches its end.
         let alive = running();
         loop {
+            // Yield and sample cancellation between bounded reads, even
+            // when the producer never lets us reach EOF.
+            tokio::select! {
+                biased;
+                _ = &mut stop => return Ok(false),
+                _ = tokio::task::yield_now() => {}
+            }
             let n = file.read(&mut buf)?;
             if n == 0 {
                 break;
             }
-            partial.extend_from_slice(&buf[..n]);
-            while let Some(i) = partial.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = partial.drain(..=i).collect();
-                emit(&mut parser, &line[..i], &mut out);
+            for chunk in buf[..n].split_inclusive(|&b| b == b'\n') {
+                let (body, complete) = match chunk.strip_suffix(b"\n") {
+                    Some(body) => (body, true),
+                    None => (chunk, false),
+                };
+                let room = RAW_LINE_MAX.saturating_sub(partial.len());
+                truncated |= body.len() > room;
+                partial.extend_from_slice(&body[..body.len().min(room)]);
+                if complete {
+                    emit(&mut parser, &partial, truncated, &mut out);
+                    partial.clear();
+                    truncated = false;
+                }
             }
         }
         if !alive {
             if !partial.is_empty() {
-                emit(&mut parser, &partial, &mut out);
+                emit(&mut parser, &partial, truncated, &mut out);
             }
             parser.finish(Stream::Stdout).into_iter().for_each(&mut out);
             return Ok(true);
@@ -60,9 +79,12 @@ pub async fn follow_file(
     }
 }
 
-fn emit(parser: &mut Log4jXmlParser, raw: &[u8], out: &mut impl FnMut(LogLine)) {
+fn emit(parser: &mut Log4jXmlParser, raw: &[u8], truncated: bool, out: &mut impl FnMut(LogLine)) {
     let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    let text = String::from_utf8_lossy(raw);
+    let mut text = String::from_utf8_lossy(raw).into_owned();
+    if truncated {
+        text.push('…');
+    }
     parser
         .push_line(&text, Stream::Stdout)
         .into_iter()
@@ -234,6 +256,76 @@ mod tests {
         assert_eq!(*lines.lock().unwrap(), ["one", "two", "three"]);
         // The file is only read.
         assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\r\nthree");
+    }
+
+    #[tokio::test]
+    async fn huge_partial_line_is_bounded_and_ready_stop_preempts_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("huge.log");
+        let bytes = vec![b'x'; 8 * 1024 * 1024];
+        std::fs::write(&path, &bytes).unwrap();
+        let mut lines = Vec::new();
+        assert!(
+            follow_file(
+                &path,
+                |l| lines.push(l.text),
+                || false,
+                std::future::pending()
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].len() <= 1024 * 1024 + 3);
+        assert!(lines[0].ends_with('…'));
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut count = 0;
+        assert!(
+            !follow_file(&path, |_| count += 1, || true, std::future::ready(()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count, 0,
+            "a ready cancellation preempts even the initial drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_observed_while_the_log_keeps_growing() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut stop = Some(stop);
+        let mut count = 0;
+        let ended = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_file(
+                &path,
+                |_| {
+                    count += 1;
+                    writer.write_all(b"another line\n").unwrap();
+                    if count == 4 {
+                        stop.take().unwrap().send(()).unwrap();
+                    }
+                },
+                || true,
+                async {
+                    stopped.await.ok();
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!ended);
+        assert_eq!(count, 4);
     }
 
     #[tokio::test]

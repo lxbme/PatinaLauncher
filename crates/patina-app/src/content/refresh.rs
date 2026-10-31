@@ -3,9 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::{App, Entity, Task};
+use gpui_kit::component::{WindowExt as _, notification::Notification};
+use gpui_kit::{App, Entity, Task, Window};
 use patina_core::instance::InstanceStore;
 use patina_core::locks::{BusyKind, InstanceGuard};
+use rust_i18n::t;
 
 use crate::core_bridge::{Core, run_blocking};
 use crate::instances::InstancesModel;
@@ -14,18 +16,26 @@ use crate::launch::{RunState, busy_message};
 /// Opens `dir` in the system file manager, creating it first when it does
 /// not exist yet (a fresh instance has no `mods` folder). The creation runs
 /// on the blocking pool.
-pub fn open_folder(dir: PathBuf, cx: &mut App) {
-    open_folder_with(dir, cx, |dir, cx| cx.open_with_system(dir)).detach();
+pub fn open_folder(dir: PathBuf, window: &mut Window, cx: &mut App) {
+    let open = open_folder_with(dir, cx, |dir, cx| cx.open_with_system(dir));
+    window
+        .spawn(cx, async move |cx| {
+            if let Err(error) = open.await {
+                cx.update(|window, cx| window.push_notification(Notification::error(error), cx))
+                    .ok();
+            }
+        })
+        .detach();
 }
 
 /// [`open_folder`] with the opener injected, for tests (the headless
 /// platform cannot open anything). The returned task finishes after
-/// `opener` ran, or after the directory could not be created (logged).
+/// `opener` ran, or returns the localized failure to show to the user.
 pub fn open_folder_with(
     dir: PathBuf,
     cx: &mut App,
     opener: impl FnOnce(&Path, &mut App) + 'static,
-) -> Task<()> {
+) -> Task<Result<(), String>> {
     let create = {
         let dir = dir.clone();
         run_blocking(cx, move || std::fs::create_dir_all(&dir))
@@ -33,11 +43,15 @@ pub fn open_folder_with(
     cx.spawn(async move |cx| match create.await {
         Ok(Ok(())) => {
             cx.update(|cx| opener(&dir, cx));
+            Ok(())
         }
         Ok(Err(error)) => {
-            tracing::warn!(%error, dir = %dir.display(), "creating the folder failed")
+            tracing::warn!(%error, dir = %dir.display(), "creating the folder failed");
+            Err(t!("content.open_failed", path = dir.display(), error = error).to_string())
         }
-        Err(error) => tracing::warn!(%error, "creating the folder was interrupted"),
+        Err(error) => {
+            Err(t!("content.open_failed", path = dir.display(), error = error).to_string())
+        }
     })
 }
 
@@ -92,9 +106,12 @@ pub fn with_instance_lock<T: Send + 'static>(
         return Task::ready(Err(busy_message(&what, name_of)));
     }
     let store = Core::global(cx).store.clone();
+    let dir = Core::global(cx).data.instances().join(id);
     let id = id.to_string();
     let work = run_blocking(cx, move || {
-        let _guard = lock_blocking(&store, &id, name_of)?;
+        let _guard = lock_blocking(&store, &id, &name_of)?;
+        patina_core::launch::running::refuse_while_running(&dir, &id)
+            .map_err(|busy| busy_message(&busy.what, name_of))?;
         Ok(mutate())
     });
     cx.spawn(async move |_| match work.await {

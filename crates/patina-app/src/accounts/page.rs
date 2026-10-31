@@ -202,7 +202,12 @@ impl AccountsPage {
                         })
                 });
             let footer_focus = footer_focus.clone();
-            let body = t!("accounts.remove_body").to_string();
+            let body = if cfg!(feature = "dev-offline") {
+                t!("accounts.remove_body_dev")
+            } else {
+                t!("accounts.remove_body")
+            }
+            .to_string();
             alert
                 .title(
                     div()
@@ -450,7 +455,11 @@ fn offline_entry(_: bool, _: &App) -> Option<Button> {
 
 /// No accounts yet: what to do next.
 fn render_empty(cx: &App) -> impl IntoElement {
-    let text = SharedString::from(t!("accounts.empty"));
+    let text = SharedString::from(if cfg!(feature = "dev-offline") {
+        t!("accounts.empty_dev")
+    } else {
+        t!("accounts.empty")
+    });
     v_flex()
         .size_full()
         .items_center()

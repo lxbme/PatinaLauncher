@@ -292,6 +292,7 @@ impl GlobalSearch {
                     ImageKey::new(INDEX_ICONS, file, 0, None),
                     move || read_icon_file(&path),
                     ICON,
+                    Lucide::Puzzle,
                     cx,
                 )
             }

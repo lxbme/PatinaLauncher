@@ -1,29 +1,32 @@
 //! [`ImageCache`]: icon images of local content (mod icons, pack icons,
 //! world icons) keyed by where they came from.
 //!
-//! The bytes are read and wrapped into an `Arc<gpui::Image>` on the blocking
-//! pool; gpui then decodes the PNG on its own background executor the first
-//! time the image is drawn, so nothing here or at draw time blocks the main
-//! thread. Until an entry is cached [`icon_tile`] shows a placeholder block.
+//! PNGs are decoded with icon-sized limits and normalized on the blocking
+//! pool before GPUI sees them. Cache accounting includes the retained PNG
+//! and an upper bound for GPUI's decoded raster.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::{
     AnyElement, Context, Global, Image, ImageFormat, ImageSource, IntoElement, ObjectFit, Rems,
-    Styled as _, StyledImage as _, Task, div, img, rems,
+    Styled as _, StyledImage as _, Task, img, rems,
 };
+use gpui_kit::{ParentElement as _, assets::IconName};
 
 use crate::core_bridge::run_blocking;
 
 /// Most images kept; beyond it the least recently used goes first.
 pub const CAPACITY: usize = 512;
-/// Most bytes of PNG data kept; the least recently used go first beyond it.
+/// Most retained encoded and decoded bytes; the least recently used go first beyond it.
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Icons larger than this are not loaded (the placeholder stays).
 pub const MAX_ICON_BYTES: usize = 256 * 1024;
+const ICON_SIDE: u32 = 64;
+const DECODED_ICON_BYTES: usize = (ICON_SIDE * ICON_SIDE * 4) as usize;
+const MAX_SOURCE_SIDE: u32 = 1024;
 
 /// Where an image came from: instance id, file name inside the content
 /// directory, and the file's size and modification time, so a changed file
@@ -147,7 +150,7 @@ impl ImageCache {
     pub fn insert(&mut self, key: ImageKey, image: Arc<Image>) -> Vec<Arc<Image>> {
         self.tick += 1;
         self.pending.remove(&key);
-        let bytes = image.bytes.len();
+        let bytes = image.bytes.len() + DECODED_ICON_BYTES;
         let mut evicted = Vec::new();
         let entry = Entry {
             image,
@@ -177,9 +180,27 @@ impl ImageCache {
         evicted
     }
 
-    /// Wraps PNG `bytes` as an image.
-    pub fn image_from_png(bytes: Vec<u8>) -> Arc<Image> {
-        Arc::new(Image::from_bytes(ImageFormat::Png, bytes))
+    /// Validates and normalizes a PNG on the blocking pool, never the UI thread.
+    fn image_from_png(bytes: Vec<u8>) -> Option<Arc<Image>> {
+        use std::io::Cursor;
+        let mut reader =
+            image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_SOURCE_SIDE);
+        limits.max_image_height = Some(MAX_SOURCE_SIDE);
+        limits.max_alloc = Some(4 * 1024 * 1024);
+        reader.limits(limits);
+        let image = reader
+            .decode()
+            .ok()?
+            .thumbnail(ICON_SIDE, ICON_SIDE)
+            .into_rgba8();
+        let mut png = Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).ok()?;
+        Some(Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            png.into_inner(),
+        )))
     }
 }
 
@@ -213,7 +234,7 @@ pub fn request_image<V: 'static>(
     let load = run_blocking(cx, move || {
         read()
             .filter(|bytes| bytes.len() <= MAX_ICON_BYTES)
-            .map(ImageCache::image_from_png)
+            .and_then(ImageCache::image_from_png)
     });
     cx.spawn(async move |this, cx| {
         let loaded = load.await.ok().flatten();
@@ -238,6 +259,7 @@ pub fn icon_tile<V: 'static>(
     key: ImageKey,
     read: impl FnOnce() -> Option<Vec<u8>> + Send + 'static,
     size: Rems,
+    fallback: IconName,
     cx: &mut Context<V>,
 ) -> AnyElement {
     let radius = rems(size.0 * 0.22);
@@ -252,11 +274,14 @@ pub fn icon_tile<V: 'static>(
     }
     request_image(key, read, cx).detach();
     let theme = cx.theme();
-    div()
+    h_flex()
         .flex_none()
         .size(size)
         .rounded(radius)
+        .justify_center()
         .bg(theme.muted)
+        .text_color(theme.muted_foreground)
+        .child(Icon::new(fallback).size(rems(size.0 * 0.5)))
         .into_any_element()
 }
 
@@ -276,7 +301,7 @@ mod tests {
     }
 
     fn image() -> Arc<Image> {
-        ImageCache::image_from_png(vec![1, 2, 3])
+        Arc::new(Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]))
     }
 
     #[test]
@@ -297,19 +322,19 @@ mod tests {
 
     #[test]
     fn bytes_are_capped_too() {
-        let mut cache = ImageCache::with_limits(100, 10);
-        let big = |n: u8| ImageCache::image_from_png(vec![n; 4]);
+        let mut cache = ImageCache::with_limits(100, 2 * (DECODED_ICON_BYTES + 4));
+        let big = |n: u8| Arc::new(Image::from_bytes(ImageFormat::Png, vec![n; 4]));
         let _ = cache.insert(key(0), big(0));
         let _ = cache.insert(key(1), big(1));
-        assert_eq!(cache.bytes(), 8);
-        // 12 > 10: the oldest goes, the bytes follow.
+        assert_eq!(cache.bytes(), 2 * (DECODED_ICON_BYTES + 4));
+        // A third raster exceeds the budget: the oldest and its bytes go.
         assert_eq!(cache.insert(key(2), big(2)).len(), 1);
-        assert_eq!(cache.bytes(), 8);
+        assert_eq!(cache.bytes(), 2 * (DECODED_ICON_BYTES + 4));
         assert!(!cache.contains(&key(0)));
         assert!(cache.contains(&key(2)));
         // Replacing a key does not double count it.
         assert_eq!(cache.insert(key(2), big(3)).len(), 1);
-        assert_eq!(cache.bytes(), 8);
+        assert_eq!(cache.bytes(), 2 * (DECODED_ICON_BYTES + 4));
     }
 
     #[test]
@@ -335,6 +360,49 @@ mod tests {
         assert!(read_icon_file(&small).is_some());
         assert!(read_icon_file(&big).is_none());
         assert!(read_icon_file(&dir.path().join("missing.png")).is_none());
+    }
+
+    #[gpui_kit::test]
+    async fn oversized_compressible_and_corrupt_pngs_are_rejected(cx: &mut TestAppContext) {
+        use image::ImageEncoder as _;
+        let (_rt, _dir) = boot(cx);
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &vec![0; 2048 * 2048],
+                2048,
+                2048,
+                image::ExtendedColorType::L8,
+            )
+            .unwrap();
+        assert!(png.len() < MAX_ICON_BYTES);
+        let view = cx.new(|_| View);
+        for (n, bytes) in [(10, png), (11, b"\x89PNG\r\n\x1a\ncorrupt".to_vec())] {
+            view.update(cx, |_, cx| request_image(key(n), move || Some(bytes), cx))
+                .await;
+            assert!(!cx.update(|cx| cx.global::<ImageCache>().contains(&key(n))));
+            assert!(!cx.update(|cx| cx.global::<ImageCache>().is_pending(&key(n))));
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn accepted_icons_are_normalized_and_accounted_as_rasters(cx: &mut TestAppContext) {
+        use image::ImageEncoder as _;
+        let (_rt, _dir) = boot(cx);
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&vec![0; 512 * 512], 512, 512, image::ExtendedColorType::L8)
+            .unwrap();
+        let view = cx.new(|_| View);
+        view.update(cx, |_, cx| request_image(key(12), move || Some(png), cx))
+            .await;
+        let (image, retained) = cx.update(|cx| {
+            let cache = cx.global_mut::<ImageCache>();
+            (cache.get(&key(12)).unwrap(), cache.bytes())
+        });
+        let decoded = image::load_from_memory(&image.bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
+        assert_eq!(retained, image.bytes.len() + 16_384);
     }
 
     struct View;
@@ -367,7 +435,7 @@ mod tests {
                 k.clone(),
                 move || {
                     gate.lock().unwrap().recv().ok();
-                    Some(vec![1, 2, 3])
+                    Some(include_bytes!("../../assets/instance-icons/axe.png").to_vec())
                 },
                 cx,
             )

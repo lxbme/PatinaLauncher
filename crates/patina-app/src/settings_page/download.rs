@@ -30,9 +30,14 @@ pub fn speed_row_id(id: &str) -> ElementId {
 
 impl SettingsPage {
     fn set_source(&mut self, choice: SourceChoice, window: &mut Window, cx: &mut Context<Self>) {
-        if self.config.as_ref().map(|c| c.download.source) == Some(choice) {
+        if self
+            .requested_source
+            .or_else(|| self.config.as_ref().map(|c| c.download.source))
+            == Some(choice)
+        {
             return;
         }
+        self.requested_source = Some(choice);
         self.edit(Field::Source, window, cx, move |c| {
             c.download.source = choice
         });
@@ -79,7 +84,9 @@ impl SettingsPage {
     }
 
     pub(super) fn render_download(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let source = self.config.as_ref().map(|c| c.download.source);
+        let source = self
+            .requested_source
+            .or_else(|| self.config.as_ref().map(|c| c.download.source));
         let radios: Vec<Radio> = SOURCES
             .iter()
             .map(|choice| Radio::new("source").label(choice.display_name()))

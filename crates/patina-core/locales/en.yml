@@ -1,4 +1,6 @@
 errors:
+  content:
+    invalid_pack_path: "This pack path is not a safe direct child of this folder."
   config:
     io: "Failed to read or write the config file: %{error}"
     parse: "Invalid config file format: %{error}"
