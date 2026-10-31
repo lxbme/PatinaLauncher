@@ -17,6 +17,9 @@ pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = crate::instances::asset_bytes(path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         match ExtraIcons.load(path)? {
             Some(bytes) => Ok(Some(bytes)),
             None => gpui_kit::assets::Assets.load(path),
@@ -26,6 +29,12 @@ impl AssetSource for AppAssets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut all = gpui_kit::assets::Assets.list(path)?;
         all.extend(ExtraIcons.list(path)?);
+        all.extend(
+            crate::instances::BUILTIN_ICONS
+                .iter()
+                .map(|name| SharedString::from(format!("instance-icons/{name}.png")))
+                .filter(|asset| asset.starts_with(path)),
+        );
         all.sort();
         all.dedup();
         Ok(all)
@@ -51,6 +60,10 @@ mod tests {
             IconName::Close,
         ] {
             let path = icon.path();
+            assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");
+        }
+        for name in crate::instances::BUILTIN_ICONS {
+            let path = format!("instance-icons/{name}.png");
             assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");
         }
         assert!(!matches!(

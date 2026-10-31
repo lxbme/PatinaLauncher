@@ -36,6 +36,11 @@ shell:
     version: "Patina %{version}"
 
 instances:
+  icon:
+    upload: "Upload image…"
+    letter: "Use letter"
+    unsupported: "Use a PNG, JPEG or WebP image"
+    picker_failed: "Couldn’t open the file picker"
   title: "Instances"
   add: "Add instance…"
   vanilla: "Vanilla"

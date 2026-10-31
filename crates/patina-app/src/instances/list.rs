@@ -20,7 +20,10 @@ use patina_core::loader::LoaderKind;
 use rust_i18n::t;
 
 use super::model::{Entry, InstancesModel};
-use super::{AddInstance, icon_tile, loader_color, loader_name, now_secs, row_id, tile, time_ago};
+use super::{
+    AddInstance, icon_for, instance_icon, loader_color, loader_name, now_secs, row_id, tile,
+    time_ago,
+};
 use crate::fonts::Strong;
 use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY};
 
@@ -30,7 +33,8 @@ use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY};
 pub const LIST_W: Rems = Rems(24.5);
 /// Row height (two lines), 48 px.
 const ROW_H: Rems = Rems(3.);
-const ICON: Rems = Rems(1.75);
+/// Row icon, 32 px: half the 64 px built-in PNGs at scale 1.0.
+const ICON: Rems = Rems(2.);
 const CHIPS_H: Rems = Rems(2.25);
 
 actions!(
@@ -373,7 +377,7 @@ fn healthy_row(instance: &Instance, running: bool, cx: &App) -> impl IntoElement
     let icon = div()
         .relative()
         .flex_none()
-        .child(icon_tile(&instance.id, &config.name, ICON, cx))
+        .child(instance_icon(&icon_for(instance), ICON, cx))
         .when(running, |d| {
             d.child(
                 div()

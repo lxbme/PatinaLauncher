@@ -10,6 +10,8 @@
 mod broken;
 mod detail;
 mod empty;
+mod icon;
+mod icon_picker;
 mod list;
 mod model;
 mod overview;
@@ -19,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext, Context, ElementId, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Rems, Render, SharedString, Styled,
-    Subscription, Window, actions, div, rems,
+    InteractiveElement, IntoElement, ParentElement, Rems, Render, Styled, Subscription, Window,
+    actions, div, rems,
 };
 use patina_core::instance::InstanceConfig;
 use rust_i18n::t;
@@ -30,6 +32,11 @@ use crate::layout::TEXT_PRIMARY;
 use crate::theme::ProductColors;
 
 pub use detail::{DetailTab, DetailView};
+pub use icon::{
+    BUILTIN_ICONS, IconChoice, IconSource, asset_bytes, forget_cached_image, icon_for,
+    instance_icon, save_icon, tint_for,
+};
+pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
 pub use model::{Entry, InstancesChanged, InstancesModel, RunState};
 pub use overview::OverviewStats;
@@ -46,8 +53,9 @@ actions!(
 /// Key context of the instances page.
 pub const INSTANCES_CONTEXT: &str = "Instances";
 
-/// Icon tile of the detail headers (healthy and broken), 56 px.
-pub(crate) const HEADER_ICON: Rems = Rems(3.5);
+/// Icon tile of the detail headers (healthy and broken), 64 px: the size of
+/// the built-in PNGs at scale 1.0.
+pub(crate) const HEADER_ICON: Rems = Rems(4.);
 /// Title size of the detail headers (22 px), also the letter on their tile.
 pub(crate) const HEADER_TITLE: Rems = Rems(1.375);
 
@@ -55,6 +63,7 @@ pub(crate) const HEADER_TITLE: Rems = Rems(1.375);
 /// instance list has the keyboard.
 pub fn init(cx: &mut gpui_kit::App) {
     list::init(cx);
+    icon_picker::init(cx);
 }
 
 /// Element id of the list row of entry `id` (healthy or broken).
@@ -200,22 +209,6 @@ pub(crate) fn date(secs: u64) -> String {
         .ok()
         .and_then(|s| Local.timestamp_opt(s, 0).single())
         .map_or_else(String::new, |d| d.format("%Y-%m-%d").to_string())
-}
-
-/// Stand-in instance icon until the icon set exists (plan 4b task 7): the
-/// name's first letter on a tile tinted by the instance id.
-pub(crate) fn icon_tile(id: &str, name: &str, size: Rems, cx: &gpui_kit::App) -> gpui_kit::Div {
-    let tint = id
-        .bytes()
-        .fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
-    let color = ProductColors::get(cx).tint(tint);
-    let initial: SharedString = name
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().collect::<String>())
-        .unwrap_or_default()
-        .into();
-    tile(color, size, cx).child(initial)
 }
 
 /// A rounded tile on a faint fill of `color` (icons, broken entries).

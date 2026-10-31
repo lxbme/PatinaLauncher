@@ -12,7 +12,9 @@ use patina_app::core_bridge::testing::{self, FakeCatalog};
 use patina_app::core_bridge::{AccountsChanged, Core, LoadError};
 use patina_app::i18n::Language;
 use patina_app::instances::{
-    AddInstance, Filter, InstanceList, InstancesChanged, InstancesModel, RunState, row_id,
+    AddInstance, Filter, IconChoice, IconPicked, IconPicker, IconSource, InstanceList,
+    InstancesChanged, InstancesModel, RunState, forget_cached_image, icon_for, instance_icon,
+    pick_id, row_id, save_icon,
 };
 use patina_app::settings::{self, AppSettings, SettingsStore};
 use patina_app::shell::{AccountLabel, Nav, RootView, StatusBar};
@@ -20,7 +22,7 @@ use patina_app::single_instance;
 use patina_app::theme::{self, ProductColors};
 use patina_core::accounts::AccountStore;
 use patina_core::config::SourceChoice;
-use patina_core::instance::{Component, ComponentUid, InstanceStore};
+use patina_core::instance::{Component, ComponentUid, InstanceIcon, InstanceStore};
 use patina_core::paths::DataDirs;
 
 /// The booted app: its main window, root view, and the runtime the core
@@ -875,4 +877,302 @@ fn english_filter_chips_fit(cx: &mut TestAppContext) {
         assert!(window.find(Filter::CHIPS[5].chip_id()).visible());
     })
     .unwrap();
+}
+
+/// Waits for the save task and returns its result.
+fn finish_save(
+    task: gpui_kit::Task<Result<(), gpui_kit::SharedString>>,
+    cx: &mut TestAppContext,
+) -> Result<(), gpui_kit::SharedString> {
+    let slot = Rc::new(std::cell::RefCell::new(None));
+    let out = slot.clone();
+    cx.update(|cx| {
+        cx.spawn(async move |_| *out.borrow_mut() = Some(task.await))
+            .detach()
+    });
+    settle(cx, |_| slot.borrow().is_some());
+    slot.take().unwrap()
+}
+
+/// A builtin PNG as a stand-in for a user's upload.
+fn sample_png(dir: &Path) -> std::path::PathBuf {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/instance-icons/sword.png");
+    let to = dir.join("upload.png");
+    std::fs::copy(from, &to).unwrap();
+    to
+}
+
+#[gpui_kit::test]
+fn invalid_upload_keeps_old_icon(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    store.set_builtin_icon("Alpha", "stone").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    let junk = tmp.path().join("junk.png");
+    std::fs::write(&junk, b"definitely not a png").unwrap();
+    let saved = cx.update(|cx| save_icon(&model, "Alpha".into(), IconChoice::Custom(junk), cx));
+    let error = finish_save(saved, cx).unwrap_err();
+    assert!(!error.is_empty());
+    assert_eq!(
+        store.load("Alpha").unwrap().config.icon,
+        Some(InstanceIcon::Builtin("stone".into())),
+        "the config is unchanged"
+    );
+    assert!(!store.load("Alpha").unwrap().dir.join("icon.png").exists());
+
+    // The picker shows the error and clears it on the next pick.
+    let window = cx.add_window(|_, cx| IconPicker::new(IconChoice::Builtin("stone".into()), cx));
+    let picker = window.root(cx).unwrap();
+    picker.update(cx, |p, cx| p.set_error(Some(error.clone()), cx));
+    let shown = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, w, cx| {
+            w.render_frame(cx);
+            w.try_find("icon-error").is_some()
+        })
+        .unwrap()
+    };
+    assert!(shown(cx));
+    cx.update_window(window.into(), |_, w, cx| w.click(pick_id("sword"), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!shown(cx));
+}
+
+#[gpui_kit::test]
+fn custom_upload_saves_then_clears(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let icon_of = |cx: &mut TestAppContext| model.read_with(cx, |m, _| icon_for(&m.instances()[0]));
+    assert!(matches!(icon_of(cx), IconSource::Letter { ch: 'A', .. }));
+
+    let png = sample_png(tmp.path());
+    let task = cx.update(|cx| save_icon(&model, "Alpha".into(), IconChoice::Custom(png), cx));
+    finish_save(task, cx).unwrap();
+    list_settled(&model, cx);
+    let IconSource::Custom(path) = icon_of(cx) else {
+        panic!("the list shows the custom icon");
+    };
+    assert!(path.is_file());
+
+    let task = cx.update(|cx| {
+        save_icon(
+            &model,
+            "Alpha".into(),
+            IconChoice::Builtin("axe".into()),
+            cx,
+        )
+    });
+    finish_save(task, cx).unwrap();
+    list_settled(&model, cx);
+    assert_eq!(icon_of(cx), IconSource::Builtin("axe"));
+    assert!(!path.exists(), "the uploaded file is gone");
+
+    let task = cx.update(|cx| save_icon(&model, "Alpha".into(), IconChoice::None, cx));
+    finish_save(task, cx).unwrap();
+    list_settled(&model, cx);
+    assert!(matches!(icon_of(cx), IconSource::Letter { .. }));
+}
+
+#[gpui_kit::test]
+fn picker_emits_the_chosen_icon(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let _app = boot(cx, tmp.path(), AppSettings::default());
+    let window = cx.add_window(|_, cx| IconPicker::new(IconChoice::None, cx));
+    let picker = window.root(cx).unwrap();
+    let got = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = got.clone();
+    let _sub = cx.update(|cx| {
+        cx.subscribe(&picker, move |_, IconPicked(choice): &IconPicked, _| {
+            sink.borrow_mut().push(choice.clone())
+        })
+    });
+    for id in [pick_id("lava"), "icon-letter".into()] {
+        cx.update_window(window.into(), |_, w, cx| {
+            w.render_frame(cx);
+            w.click(id, cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        *got.borrow(),
+        [IconChoice::Builtin("lava".into()), IconChoice::None]
+    );
+}
+
+fn press_in(window: gpui_kit::WindowHandle<IconPicker>, cx: &mut TestAppContext, key: &str) {
+    cx.update_window(window.into(), |_, w, cx| {
+        w.render_frame(cx);
+        w.press(key, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn picker_grid_is_keyboard_reachable(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let _app = boot(cx, tmp.path(), AppSettings::default());
+    let window = cx.add_window(|_, cx| IconPicker::new(IconChoice::None, cx));
+    let picker = window.root(cx).unwrap();
+    let got = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = got.clone();
+    let _sub = cx.update(|cx| {
+        cx.subscribe(&picker, move |_, IconPicked(choice): &IconPicked, _| {
+            sink.borrow_mut().push(choice.clone())
+        })
+    });
+    let grid_focused = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, w, cx| {
+            w.render_frame(cx);
+            w.find("icon-grid").focused()
+        })
+        .unwrap()
+    };
+    let cursor = |cx: &mut TestAppContext| picker.read_with(cx, |p, _| p.cursor_name());
+    assert_ne!(grid_focused(cx), Some(true));
+
+    // What the Tab key does inside an app window's root (a bare test window
+    // has no root to bind it).
+    cx.update_window(window.into(), |_, w, cx| {
+        w.render_frame(cx);
+        w.focus_next(cx)
+    })
+    .unwrap();
+    assert_eq!(grid_focused(cx), Some(true), "tab reaches the grid");
+    assert_eq!(cursor(cx), "grass-block");
+    press_in(window, cx, "left");
+    press_in(window, cx, "up");
+    assert_eq!(cursor(cx), "grass-block", "stays at the corner");
+    press_in(window, cx, "right");
+    press_in(window, cx, "down");
+    assert_eq!(cursor(cx), "lava", "second row, second column");
+    assert!(got.borrow().is_empty());
+
+    press_in(window, cx, "enter");
+    assert_eq!(*got.borrow(), [IconChoice::Builtin("lava".into())]);
+    assert_eq!(
+        picker.read_with(cx, |p, _| p.current().clone()),
+        IconChoice::Builtin("lava".into())
+    );
+    press_in(window, cx, "right");
+    press_in(window, cx, "space");
+    assert_eq!(got.borrow()[1], IconChoice::Builtin("ice".into()));
+
+    // A failed save restores the mark from before the pick.
+    picker.update(cx, |p, cx| p.set_error(Some("nope".into()), cx));
+    assert_eq!(
+        picker.read_with(cx, |p, _| p.current().clone()),
+        IconChoice::Builtin("lava".into())
+    );
+}
+
+/// Draws a custom icon, as a list row does.
+struct IconProbe {
+    model: Entity<InstancesModel>,
+    path: std::path::PathBuf,
+}
+
+impl gpui_kit::Render for IconProbe {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        instance_icon(
+            &IconSource::Custom(self.path.clone()),
+            gpui_kit::rems(2.),
+            cx,
+        )
+    }
+}
+
+#[gpui_kit::test]
+fn reupload_and_replacing_evict_the_cached_image(cx: &mut TestAppContext) {
+    use gpui_kit::ImageSource;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let first = sample_png(tmp.path());
+    let path = store
+        .set_custom_icon("Alpha", &first)
+        .unwrap()
+        .icon_path()
+        .unwrap();
+
+    // The core and a model, but no app window that would redraw the icon
+    // by itself.
+    let rt = patina_app::runtime::start();
+    let core = testing::core(
+        rt.handle().clone(),
+        DataDirs::new(tmp.path()),
+        Arc::new(FakeCatalog::new()),
+    );
+    cx.executor().allow_parking();
+    cx.update(|cx| cx.set_global(core));
+    let window = cx.add_window(|window, cx| IconProbe {
+        model: cx.new(|cx| InstancesModel::new(window, cx)),
+        path: path.clone(),
+    });
+    let model = window
+        .root(cx)
+        .unwrap()
+        .read_with(cx, |p, _| p.model.clone());
+    list_settled(&model, cx);
+
+    let cached = |cx: &mut TestAppContext| {
+        cx.update(|cx| ImageSource::from(path.as_path()).is_asset_cached(cx))
+    };
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, w, cx| w.render_frame(cx))
+            .unwrap();
+    };
+    draw(cx);
+    settle(cx, |cx| cached(cx));
+
+    // A re-upload keeps the path: the cached image must go.
+    let second = tmp.path().join("second.png");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/instance-icons/axe.png"),
+        &second,
+    )
+    .unwrap();
+    let task = cx.update(|cx| save_icon(&model, "Alpha".into(), IconChoice::Custom(second), cx));
+    finish_save(task, cx).unwrap();
+    assert!(!cached(cx), "re-upload evicts the old image");
+    draw(cx);
+    settle(cx, |cx| cached(cx));
+
+    // Replacing the custom icon with a built-in one evicts the old path too.
+    let task = cx.update(|cx| {
+        save_icon(
+            &model,
+            "Alpha".into(),
+            IconChoice::Builtin("axe".into()),
+            cx,
+        )
+    });
+    finish_save(task, cx).unwrap();
+    assert!(!cached(cx), "built-in replaces the custom image");
+    assert!(!path.exists());
+
+    // Same for clearing.
+    store.set_custom_icon("Alpha", &first).unwrap();
+    draw(cx);
+    settle(cx, |cx| cached(cx));
+    let task = cx.update(|cx| save_icon(&model, "Alpha".into(), IconChoice::None, cx));
+    finish_save(task, cx).unwrap();
+    assert!(!cached(cx), "clearing evicts the custom image");
+    // The helper alone does it as well.
+    draw(cx);
+    cx.update(|cx| forget_cached_image(&path, cx));
+    assert!(!cached(cx));
 }

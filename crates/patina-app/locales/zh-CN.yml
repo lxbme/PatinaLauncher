@@ -36,6 +36,11 @@ shell:
     version: "Patina %{version}"
 
 instances:
+  icon:
+    upload: "上传图片…"
+    letter: "使用首字母"
+    unsupported: "仅支持 PNG、JPEG 或 WebP 图片"
+    picker_failed: "无法打开文件选择器"
   title: "实例"
   add: "添加实例…"
   vanilla: "原版"

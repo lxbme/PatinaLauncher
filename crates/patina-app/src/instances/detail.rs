@@ -16,7 +16,10 @@ use rust_i18n::t;
 
 use super::model::{Entry, InstancesModel};
 use super::overview::{self, OverviewStats};
-use super::{HEADER_ICON, HEADER_TITLE, icon_tile, loader_color, loader_full, now_secs, time_ago};
+use super::{
+    HEADER_ICON, HEADER_TITLE, icon_for, instance_icon, loader_color, loader_full, now_secs,
+    time_ago,
+};
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
@@ -258,7 +261,7 @@ impl DetailView {
             .pt(rems(1.125))
             .pb(rems(1.))
             .gap(rems(0.875))
-            .child(icon_tile(&instance.id, &config.name, HEADER_ICON, cx))
+            .child(instance_icon(&icon_for(instance), HEADER_ICON, cx))
             .child(
                 v_flex()
                     .flex_1()
