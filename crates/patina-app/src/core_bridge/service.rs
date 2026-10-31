@@ -226,7 +226,9 @@ impl Core {
     }
 
     /// Runs `f` with the account store on the blocking pool (the store does
-    /// file I/O).
+    /// file I/O). A caller that changes the accounts must call
+    /// [`AccountsChanged::bump`](super::AccountsChanged::bump) once the task
+    /// has finished, so views showing accounts read them again.
     pub fn with_accounts<R: Send + 'static>(
         cx: &mut App,
         f: impl FnOnce(&mut LoadedAccounts) -> R + Send + 'static,

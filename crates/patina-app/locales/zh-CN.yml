@@ -15,3 +15,22 @@ startup_failed:
 
 notice:
   close: "关闭"
+
+shell:
+  nav:
+    instances: "实例"
+    downloads: "下载"
+    accounts: "账号"
+    settings: "设置"
+  search:
+    placeholder: "按 / 搜索实例、Mod"
+  title:
+    signed_out: "未登录"
+  placeholder:
+    coming_later: "即将在后续版本提供"
+  status:
+    source: "下载源：%{source}"
+    runtimes: "Java 运行时 %{count} 个"
+    instances: "实例 %{count} 个 · 共 %{size}"
+    instances_partial: "实例 %{count} 个 · 至少 %{size}"
+    version: "Patina %{version}"

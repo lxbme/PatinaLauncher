@@ -7,23 +7,25 @@ pub mod assets;
 pub mod core_bridge;
 pub mod fonts;
 pub mod i18n;
+pub mod layout;
 pub mod logging;
 pub mod notice;
 pub mod platform;
 pub mod runtime;
 pub mod scale;
 pub mod settings;
+pub mod shell;
 pub mod single_instance;
 pub mod theme;
 
-use gpui_kit::component::ActiveTheme;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, IntoElement, Render, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, Entity, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, px, size,
 };
 use rust_i18n::t;
 
 use crate::settings::SettingsStore;
+use crate::shell::RootView;
 
 // Offline accounts exist only for development (`cargo app`); a build without
 // the feature must not get them from patina-core through feature unification.
@@ -34,12 +36,14 @@ const _: () = assert!(!patina_core::DEV_OFFLINE);
 pub const APP_ID: &str = "patina";
 
 /// Sets up the app-wide state the windows rely on: the settings, the CJK
-/// font and the zoom keys. Call once, after `gpui_kit::init` and before
-/// [`open_main_window`].
+/// font, the zoom keys, the shell's keys and the accounts-changed signal. Call once, after
+/// `gpui_kit::init` and before [`open_main_window`].
 pub fn init(settings: SettingsStore, cx: &mut App) {
     cx.set_global(settings);
     fonts::init(cx);
     scale::init(cx);
+    shell::init(cx);
+    core_bridge::AccountsChanged::init(cx);
     cx.on_app_quit(|cx| {
         SettingsStore::flush(cx);
         async {}
@@ -54,22 +58,9 @@ pub(crate) fn style_window(ui_scale: f32, window: &mut Window, cx: &mut App) {
     scale::apply_scale(ui_scale, cx);
 }
 
-/// The main window's content until the shell takes it over: the themed
-/// background, nothing else.
-pub struct EmptyRoot;
-
-impl Render for EmptyRoot {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .font_features(fonts::tnum())
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-    }
-}
-
-/// Opens the main window (1280×800, at least 960×600). Call after [`init`].
-pub fn open_main_window(cx: &mut App) -> gpui_kit::Result<(AnyWindowHandle, Entity<EmptyRoot>)> {
+/// Opens the main window (1280×800, at least 960×600). Call after [`init`],
+/// with the [`core_bridge::Core`] global set.
+pub fn open_main_window(cx: &mut App) -> gpui_kit::Result<(AnyWindowHandle, Entity<RootView>)> {
     // Window geometry is in logical pixels by the platform's definition; the
     // content inside is rem-based and follows the UI scale.
     let options = WindowOptions {
@@ -89,7 +80,7 @@ pub fn open_main_window(cx: &mut App) -> gpui_kit::Result<(AnyWindowHandle, Enti
     gpui_kit::open_window(options, cx, |window, cx| {
         let ui_scale = SettingsStore::get(cx).ui_scale;
         style_window(ui_scale, window, cx);
-        cx.new(|_| EmptyRoot)
+        cx.new(|cx| RootView::new(window, cx))
     })
 }
 

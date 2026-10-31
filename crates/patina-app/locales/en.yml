@@ -15,3 +15,22 @@ startup_failed:
 
 notice:
   close: "Close"
+
+shell:
+  nav:
+    instances: "Instances"
+    downloads: "Downloads"
+    accounts: "Accounts"
+    settings: "Settings"
+  search:
+    placeholder: "Press / to search instances and mods"
+  title:
+    signed_out: "Not signed in"
+  placeholder:
+    coming_later: "Coming in a later version"
+  status:
+    source: "Download source: %{source}"
+    runtimes: "Java runtimes: %{count}"
+    instances: "Instances: %{count} · %{size}"
+    instances_partial: "Instances: %{count} · at least %{size}"
+    version: "Patina %{version}"

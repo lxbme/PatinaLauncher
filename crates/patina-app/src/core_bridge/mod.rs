@@ -9,18 +9,21 @@
 //!   dropping that task cancels the work if it has not started (or, for
 //!   async work, at its next await);
 //! - the config and the accounts are reached through [`Core::read_config`],
-//!   [`Core::update_config`] and [`Core::with_accounts`];
+//!   [`Core::update_config`] and [`Core::with_accounts`]; whoever changes
+//!   the accounts then calls [`AccountsChanged::bump`] so views re-read them;
 //! - a stream of progress reaches a view through [`forward_progress`], at most
 //!   about 30 times a second;
 //! - every result is checked against the request that is current when it
 //!   arrives ([`Revision`], or the id of the instance it is for) and dropped
 //!   if it is stale.
 
+mod accounts_changed;
 mod service;
 mod task;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
+pub use accounts_changed::{AccountsChanged, AccountsEpoch};
 pub use service::{Catalog, Core, InitError, LoadError, LoadedAccounts, LoadedConfig};
 pub use task::{
     BridgeError, PROGRESS_MIN_GAP, Revision, RevisionId, forward_progress, run, run_blocking,
