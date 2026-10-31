@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub(crate) mod credentials;
+#[cfg(test)]
+mod credentials_tests;
 pub mod error;
 mod http;
 pub mod login;
@@ -21,6 +24,10 @@ pub use http::{DEFAULT_MSA_CLIENT_ID, msa_client_id};
 /// Isolated collaborators for downstream tests; absent from production builds.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
+    pub use super::credentials::{
+        CredentialError, CredentialStore,
+        testing::{MemoryCredentials, credential_store},
+    };
     pub use super::http::AuthHttp;
     pub use super::msa::{AuthClock, MsaClient};
 }

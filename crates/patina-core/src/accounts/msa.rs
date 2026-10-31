@@ -47,20 +47,40 @@ impl MicrosoftTokens {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MinecraftSession {
     access_token: SecretString,
+    issued_at: u64,
     expires_at: u64,
+    profile_uuid: Uuid,
+    xuid: Option<String>,
 }
 impl MinecraftSession {
-    #[allow(
-        dead_code,
-        reason = "Task 3 serializes the protected Minecraft session"
-    )]
+    #[allow(dead_code, reason = "Task 4 detects backwards wall clock")]
+    pub(crate) fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+    #[allow(dead_code, reason = "Task 4 binds cached session to account identity")]
+    pub(crate) fn profile_uuid(&self) -> Uuid {
+        self.profile_uuid
+    }
+    #[allow(dead_code, reason = "Task 4 builds authenticated launch identity")]
+    pub(crate) fn xuid(&self) -> Option<&str> {
+        self.xuid.as_deref()
+    }
+    pub(crate) fn valid_persisted(&self) -> bool {
+        !self.access_token().expose().is_empty()
+            && self.access_token().expose().len() <= 32_768
+            && self.issued_at < self.expires_at()
+            && !self.profile_uuid.is_nil()
+            && self.xuid.as_ref().is_none_or(|x| {
+                !x.is_empty() && x.len() <= 32 && x.bytes().all(|b| b.is_ascii_digit())
+            })
+    }
     pub(crate) fn access_token(&self) -> &SecretString {
         &self.access_token
     }
-    #[allow(dead_code, reason = "Task 3 persists and Task 4 checks session expiry")]
     pub(crate) fn expires_at(&self) -> u64 {
         self.expires_at
     }
@@ -387,15 +407,13 @@ impl MsaClient {
         if !mc.token_type.eq_ignore_ascii_case("bearer") {
             return Err(invalid(AuthStage::MinecraftToken));
         }
-        let session = MinecraftSession {
-            access_token: mc.access_token,
-            expires_at: self.expiry(mc.expires_in, AuthStage::MinecraftToken)?,
-        };
+        let issued_at = self.clock.unix_seconds();
+        let expires_at = self.expiry(mc.expires_in, AuthStage::MinecraftToken)?;
         let response = self
             .http
             .send(
                 AuthRequest::Entitlement {
-                    access_token: session.access_token.clone(),
+                    access_token: mc.access_token.clone(),
                 },
                 cancel.clone(),
             )
@@ -412,7 +430,7 @@ impl MsaClient {
             .http
             .send(
                 AuthRequest::Profile {
-                    access_token: session.access_token.clone(),
+                    access_token: mc.access_token.clone(),
                 },
                 cancel,
             )
@@ -449,11 +467,17 @@ impl MsaClient {
             profile: MinecraftProfile {
                 uuid,
                 username: profile.name,
-                xuid: xsts.xuid.or(xbox.xuid),
+                xuid: xsts.xuid.clone().or(xbox.xuid.clone()),
                 skin_hash,
             },
             refresh_token: tokens.refresh_token,
-            session,
+            session: MinecraftSession {
+                access_token: mc.access_token,
+                issued_at,
+                expires_at,
+                profile_uuid: uuid,
+                xuid: xsts.xuid.or(xbox.xuid),
+            },
             verified_at: self.clock.unix_seconds(),
         })
     }

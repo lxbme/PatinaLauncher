@@ -5404,6 +5404,7 @@ dependencies = [
  "image",
  "lzma-rust2",
  "md-5 0.11.0",
+ "oo7",
  "quick-xml 0.42.0",
  "regex",
  "reqwest",
@@ -5423,6 +5424,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "zbus",
  "zeroize",
  "zip",
 ]
@@ -7582,6 +7584,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -9615,6 +9618,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",
