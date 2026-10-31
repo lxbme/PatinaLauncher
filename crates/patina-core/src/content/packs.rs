@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use zip::ZipArchive;
 
+use crate::fsutil::is_safe_name;
+
 use super::{
     ENTRY_MAX_BYTES, ICON_MAX_BYTES, MAX_ZIP_ENTRIES, PNG_SIGNATURE, list_sorted, read_capped,
     read_file_capped, read_png_file,
@@ -28,6 +30,20 @@ pub struct PackEntry {
     pub description: Option<String>,
     /// PNG bytes of `pack.png`.
     pub icon: Option<Vec<u8>>,
+    pub is_dir: bool,
+}
+
+/// A resource pack as a list shows it: [`PackEntry`] without the icon's
+/// bytes. They are read on demand with [`read_pack_icon`], so a long list
+/// holds no icons in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackSummary {
+    pub name: String,
+    pub path: PathBuf,
+    pub description: Option<String>,
+    /// Whether the pack has a `pack.png` (not checked to be a valid PNG:
+    /// [`read_pack_icon`] does that).
+    pub has_icon: bool,
     pub is_dir: bool,
 }
 
@@ -61,6 +77,79 @@ pub fn scan_resource_packs(dir: &Path) -> io::Result<Vec<PackEntry>> {
             }
         })
         .collect())
+}
+
+/// Like [`scan_resource_packs`], but without reading any icon: only whether
+/// a `pack.png` exists. Read one with [`read_pack_icon`].
+pub fn list_resource_packs(dir: &Path) -> io::Result<Vec<PackSummary>> {
+    Ok(list_sorted(dir)?
+        .into_iter()
+        .filter(|(name, _, is_dir)| *is_dir || is_zip_name(name))
+        .map(|(name, path, is_dir)| {
+            let (mcmeta, has_icon) = if is_dir {
+                (
+                    read_file_capped(&path.join("pack.mcmeta"), ENTRY_MAX_BYTES),
+                    std::fs::metadata(path.join("pack.png")).is_ok_and(|m| m.is_file()),
+                )
+            } else {
+                match open_zip(&path) {
+                    Some(mut ar) => (
+                        read_capped(&mut ar, "pack.mcmeta", ENTRY_MAX_BYTES),
+                        ar.by_name("pack.png").is_ok_and(|f| f.is_file()),
+                    ),
+                    None => (None, false),
+                }
+            };
+            PackSummary {
+                description: mcmeta.as_deref().and_then(parse_description),
+                name,
+                path,
+                has_icon,
+                is_dir,
+            }
+        })
+        .collect())
+}
+
+/// The `pack.png` of the resource pack at `path` (a folder or a zip),
+/// size-capped and signature-checked; `None` when there is none or it is
+/// unusable.
+pub fn read_pack_icon(path: &Path) -> Option<Vec<u8>> {
+    if std::fs::metadata(path).ok()?.is_dir() {
+        read_png_file(&path.join("pack.png"))
+    } else {
+        let mut ar = open_zip(path)?;
+        read_capped(&mut ar, "pack.png", ICON_MAX_BYTES).filter(|b| b.starts_with(&PNG_SIGNATURE))
+    }
+}
+
+/// Deletes the pack at `path`: a file is removed, a folder with all its
+/// contents. `path` must be a direct child of `dir` with a safe name (so a
+/// forged path cannot reach outside the packs folder); a symlink is removed
+/// itself, never followed.
+pub fn delete_pack(dir: &Path, path: &Path) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "not a pack in this folder");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_safe_name(n))
+        .ok_or_else(invalid)?;
+    if path.parent() != Some(dir) {
+        return Err(invalid());
+    }
+    let target = dir.join(name);
+    if std::fs::symlink_metadata(&target)?.is_dir() {
+        std::fs::remove_dir_all(&target)
+    } else {
+        std::fs::remove_file(&target)
+    }
+}
+
+fn open_zip(path: &Path) -> Option<ZipArchive<File>> {
+    File::open(path)
+        .ok()
+        .and_then(|f| ZipArchive::new(f).ok())
+        .filter(|ar| ar.len() <= MAX_ZIP_ENTRIES)
 }
 
 /// Shader packs: `*.zip` files and folders; option files such as
@@ -288,5 +377,80 @@ mod tests {
         let packs = scan_resource_packs(tmp.path()).unwrap();
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].description, None);
+    }
+
+    #[test]
+    fn listing_without_icons_matches_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let icon = png(10);
+        write_zip(
+            &d.join("beta.zip"),
+            &[
+                ("pack.mcmeta", mcmeta(r#""Zipped""#).as_bytes()),
+                ("pack.png", &icon),
+            ],
+        );
+        write_zip(&d.join("plain.zip"), &[("a.txt", b"x")]);
+        let folder = d.join("Alpha");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("pack.mcmeta"), mcmeta(r#""Folder""#)).unwrap();
+        std::fs::write(folder.join("pack.png"), &icon).unwrap();
+        std::fs::write(d.join("broken.zip"), "garbage").unwrap();
+
+        let scanned = scan_resource_packs(d).unwrap();
+        let listed = list_resource_packs(d).unwrap();
+        assert_eq!(scanned.len(), listed.len());
+        for (s, l) in scanned.iter().zip(&listed) {
+            assert_eq!(
+                (&s.name, &s.path, &s.description, s.is_dir),
+                (&l.name, &l.path, &l.description, l.is_dir)
+            );
+            assert_eq!(s.icon.is_some(), l.has_icon, "{}", s.name);
+            assert_eq!(read_pack_icon(&l.path), s.icon, "{}", s.name);
+        }
+        assert!(list_resource_packs(&d.join("missing")).unwrap().is_empty());
+        assert_eq!(read_pack_icon(&d.join("missing")), None);
+    }
+
+    #[test]
+    fn deleting_a_pack_stays_in_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("resourcepacks");
+        std::fs::create_dir(&d).unwrap();
+        let outside = tmp.path().join("outside.zip");
+        std::fs::write(&outside, "x").unwrap();
+        std::fs::write(d.join("a.zip"), "x").unwrap();
+        let folder = d.join("dir");
+        std::fs::create_dir_all(folder.join("assets/x")).unwrap();
+        std::fs::write(folder.join("assets/x/f"), "x").unwrap();
+
+        delete_pack(&d, &d.join("a.zip")).unwrap();
+        assert!(!d.join("a.zip").exists());
+        delete_pack(&d, &folder).unwrap();
+        assert!(!folder.exists());
+
+        // Not a direct child, not a safe name, or missing: refused.
+        assert!(delete_pack(&d, &outside).is_err());
+        assert!(delete_pack(&d, &d.join("../outside.zip")).is_err());
+        assert!(delete_pack(&d, &d).is_err());
+        assert!(delete_pack(&d, &d.join("gone.zip")).is_err());
+        assert!(outside.exists());
+        assert!(d.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_symlink_keeps_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("packs");
+        std::fs::create_dir(&d).unwrap();
+        let target = tmp.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(&target, d.join("link")).unwrap();
+        delete_pack(&d, &d.join("link")).unwrap();
+        assert!(!d.join("link").exists());
+        assert!(target.join("keep").exists());
     }
 }

@@ -28,29 +28,83 @@ pub struct WorldEntry {
     pub icon: Option<Vec<u8>>,
 }
 
+/// A world as a list shows it: [`WorldEntry`] without the icon's bytes.
+/// Read them on demand with [`read_world_icon`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldSummary {
+    pub dir_name: String,
+    pub path: PathBuf,
+    pub level_name: Option<String>,
+    /// Milliseconds since the Unix epoch.
+    pub last_played: Option<i64>,
+    /// Whether the world has an `icon.png` (not checked to be a valid PNG).
+    pub has_icon: bool,
+}
+
+/// Like [`scan_saves`] (same order), but without reading any icon.
+pub fn list_saves(dir: &Path) -> io::Result<Vec<WorldSummary>> {
+    Ok(scan_worlds(dir, false)?
+        .into_iter()
+        .map(|(w, has_icon)| WorldSummary {
+            dir_name: w.dir_name,
+            path: w.path,
+            level_name: w.level_name,
+            last_played: w.last_played,
+            has_icon,
+        })
+        .collect())
+}
+
+/// The `icon.png` of the world folder `path`, size-capped and
+/// signature-checked.
+pub fn read_world_icon(path: &Path) -> Option<Vec<u8>> {
+    read_png_file(&path.join("icon.png"))
+}
+
 /// Lists every folder under `saves`, newest `last_played` first; worlds
 /// without metadata come last, ordered by folder name. A missing directory
 /// yields an empty list.
 pub fn scan_saves(dir: &Path) -> io::Result<Vec<WorldEntry>> {
-    let mut out: Vec<WorldEntry> = list_sorted(dir)?
+    Ok(scan_worlds(dir, true)?
+        .into_iter()
+        .map(|(w, _)| w)
+        .collect())
+}
+
+/// The worlds of `dir` in list order, each with whether it has an
+/// `icon.png`; the icons' bytes are read only when `icons`.
+fn scan_worlds(dir: &Path, icons: bool) -> io::Result<Vec<(WorldEntry, bool)>> {
+    let mut out: Vec<(WorldEntry, bool)> = list_sorted(dir)?
         .into_iter()
         .filter(|(_, _, is_dir)| *is_dir)
         .map(|(dir_name, path, _)| {
             let meta = read_level(&path.join("level.dat"))
                 .or_else(|| read_level(&path.join("level.dat_old")))
                 .unwrap_or_default();
-            WorldEntry {
+            let icon_path = path.join("icon.png");
+            let (icon, has_icon) = if icons {
+                let icon = read_png_file(&icon_path);
+                let has = icon.is_some();
+                (icon, has)
+            } else {
+                (
+                    None,
+                    std::fs::metadata(&icon_path).is_ok_and(|m| m.is_file()),
+                )
+            };
+            let entry = WorldEntry {
                 level_name: meta.level_name,
                 last_played: meta.last_played,
-                icon: read_png_file(&path.join("icon.png")),
+                icon,
                 dir_name,
                 path,
-            }
+            };
+            (entry, has_icon)
         })
         .collect();
     // Stable sort keeps the case-insensitive name order from `list_sorted`
     // for ties; the explicit key adds the exact-name tie-break.
-    out.sort_by(|a, b| {
+    out.sort_by(|(a, _), (b, _)| {
         b.last_played
             .is_some()
             .cmp(&a.last_played.is_some())
@@ -162,6 +216,24 @@ mod tests {
         assert_eq!(worlds[0].icon.as_deref(), Some(icon.as_slice()));
         assert_eq!(worlds[1].icon, None);
         assert!(scan_saves(&d.join("missing")).unwrap().is_empty());
+
+        // The listing without icons: the same worlds in the same order;
+        // the icon is read on demand (an invalid PNG still "has" one).
+        let listed = list_saves(d).unwrap();
+        let got: Vec<_> = listed
+            .iter()
+            .map(|w| (w.dir_name.as_str(), w.level_name.as_deref(), w.last_played))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("new", Some("New 世界"), Some(5000)),
+                ("old", Some("Old World"), Some(1000)),
+            ]
+        );
+        assert!(listed[0].has_icon && listed[1].has_icon);
+        assert_eq!(read_world_icon(&listed[0].path), Some(icon));
+        assert_eq!(read_world_icon(&listed[1].path), None);
     }
 
     #[test]

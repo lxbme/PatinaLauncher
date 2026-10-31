@@ -259,6 +259,19 @@ content:
     resourcepacks: "还没有资源包。把 zip 放进文件夹，或去下载页获取。"
     shaders: "还没有光影包。把 zip 放进文件夹，或去下载页获取。"
     saves: "还没有存档。在游戏里创建的世界会出现在这里。"
+  busy: "%{reason}，暂时不能更改这个文件夹"
+  changed_outside: "文件已在外部被改动"
+  delete: '删除"%{name}"…'
+  delete_title: '删除"%{name}"？'
+  delete_body_file: "文件会被永久删除。"
+  delete_body_dir: "文件夹和里面的所有内容会被永久删除。"
+  delete_confirm: "删除"
+  cancel: "取消"
+  delete_failed: '无法删除"%{name}"：%{error}'
+  kind:
+    folder: "文件夹"
+    archive: "压缩包"
+  last_played: "上次游玩 %{when}"
 mods:
   online: "在线获取"
   format:

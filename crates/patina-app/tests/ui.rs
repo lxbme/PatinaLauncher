@@ -5749,3 +5749,514 @@ fn the_first_listing_tells_no_one(cx: &mut TestAppContext) {
     mods_settled(&tab, cx);
     assert_eq!(changed.get(), 0);
 }
+
+// ---- Resource packs, shaders and saves tabs ----
+
+use patina_app::content::{LocalKind, LocalTab, format_last_played, local_delete_id, local_row_id};
+
+fn local_tab_of(app: &Booted, cx: &mut TestAppContext, kind: LocalKind) -> Entity<LocalTab> {
+    cx.update(|cx| {
+        let detail = app.root.read(cx).instances().read(cx).detail().clone();
+        let detail = detail.read(cx);
+        match kind {
+            LocalKind::ResourcePacks => detail.packs_view(),
+            LocalKind::Shaders => detail.shaders_view(),
+            LocalKind::Saves => detail.saves_view(),
+        }
+        .cloned()
+        .expect("the tab was shown")
+    })
+}
+
+/// Instance "Alpha" whose `folder` of the game dir is filled by `fill`;
+/// the app booted, Alpha selected and the tab of `kind` shown with the
+/// listing landed. Returns the app, the tab and the folder.
+fn local_app(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    kind: LocalKind,
+    fill: impl FnOnce(&Path),
+) -> (Booted, Entity<LocalTab>, std::path::PathBuf) {
+    let store = InstanceStore::new(DataDirs::new(dir).instances());
+    let alpha = store.create("Alpha", "1.21.1").unwrap();
+    let folder = alpha.game_dir().join(match kind {
+        LocalKind::ResourcePacks => "resourcepacks",
+        LocalKind::Shaders => "shaderpacks",
+        LocalKind::Saves => "saves",
+    });
+    std::fs::create_dir_all(&folder).unwrap();
+    fill(&folder);
+    let app = boot(cx, dir, AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, row_id("Alpha"));
+    click(
+        &app,
+        cx,
+        match kind {
+            LocalKind::ResourcePacks => "tab-resource-packs",
+            LocalKind::Shaders => "tab-shaders",
+            LocalKind::Saves => "tab-worlds",
+        },
+    );
+    let tab = local_tab_of(&app, cx, kind);
+    local_settled(&tab, cx);
+    (app, tab, folder)
+}
+
+fn local_settled(tab: &Entity<LocalTab>, cx: &mut TestAppContext) {
+    settle(cx, |cx| {
+        tab.read_with(cx, |t, cx| {
+            let list = t.list().read(cx);
+            !list.is_reloading() && *list.state() == patina_app::content::LoadState::Loaded
+        })
+    });
+}
+
+fn local_keys(tab: &Entity<LocalTab>, cx: &mut TestAppContext) -> Vec<String> {
+    tab.read_with(cx, |t, cx| {
+        (t.list().read(cx).items().iter())
+            .map(|i| i.key.clone())
+            .collect()
+    })
+}
+
+fn tiny_png() -> Vec<u8> {
+    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/instance-icons/sword.png"))
+        .unwrap()
+}
+
+fn mcmeta(description: &str) -> String {
+    format!(r#"{{"pack":{{"pack_format":34,"description":"{description}"}}}}"#)
+}
+
+/// An uncompressed `level.dat` with the given name and last play.
+fn level_dat(name: Option<&str>, last_played: Option<i64>) -> Vec<u8> {
+    let mut v = vec![10, 0, 0, 10, 0, 4];
+    v.extend(b"Data");
+    if let Some(name) = name {
+        v.extend([8, 0, 9]);
+        v.extend(b"LevelName");
+        v.extend((name.len() as u16).to_be_bytes());
+        v.extend(name.as_bytes());
+    }
+    if let Some(ms) = last_played {
+        v.extend([4, 0, 10]);
+        v.extend(b"LastPlayed");
+        v.extend(ms.to_be_bytes());
+    }
+    v.extend([0, 0]);
+    v
+}
+
+fn world(saves: &Path, dir: &str, name: Option<&str>, last_played: Option<i64>) {
+    let path = saves.join(dir);
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("level.dat"), level_dat(name, last_played)).unwrap();
+}
+
+#[gpui_kit::test]
+fn packs_show_description_and_icon(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let png = tiny_png();
+    let (app, tab, _folder) = local_app(cx, tmp.path(), LocalKind::ResourcePacks, |dir| {
+        // A folder pack and a zip pack, both with an icon; a plain zip.
+        let folder = dir.join("Faithful");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("pack.mcmeta"), mcmeta("Looks like vanilla")).unwrap();
+        std::fs::write(folder.join("pack.png"), &png).unwrap();
+        jar_with(
+            dir,
+            "Zipped.zip",
+            &[
+                (
+                    "pack.mcmeta",
+                    mcmeta(&"A very long description ".repeat(20)).as_bytes(),
+                ),
+                ("pack.png", &png),
+            ],
+        );
+        jar_with(dir, "Plain.zip", &[("assets/x", b"x")]);
+        std::fs::write(dir.join("notes.txt"), "not a pack").unwrap();
+    });
+    assert_eq!(
+        local_keys(&tab, cx),
+        ["Faithful", "Plain.zip", "Zipped.zip"],
+        "folders and zips only"
+    );
+    let text = |cx: &mut TestAppContext, id: String| label_of(&app, cx, id);
+    assert_eq!(
+        text(cx, "pack-detail-Faithful".into()).as_deref(),
+        Some("Looks like vanilla")
+    );
+    assert_eq!(
+        text(cx, "pack-aside-Faithful".into()).as_deref(),
+        Some("Folder")
+    );
+    assert_eq!(
+        text(cx, "pack-aside-Zipped.zip".into()).as_deref(),
+        Some("Archive")
+    );
+    assert_eq!(
+        text(cx, "pack-detail-Plain.zip".into()).as_deref(),
+        Some("")
+    );
+    // The description is one line, whatever its length.
+    assert!(
+        text(cx, "pack-detail-Zipped.zip".into())
+            .unwrap()
+            .starts_with("A very long description A very")
+    );
+
+    // The icons of the rows on show are read on demand into the image
+    // cache; the items keep only whether there is one.
+    let cached = |cx: &mut TestAppContext| {
+        cx.update(|cx| cx.global::<patina_app::content::ImageCache>().len())
+    };
+    settle(cx, |cx| cached(cx) == 2);
+    let flags = tab.read_with(cx, |t, cx| {
+        (t.list().read(cx).items().iter())
+            .map(|i| i.has_icon)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(flags, [true, false, true]);
+
+    // Switching the language relabels the kind without a reload.
+    app.language(Language::ZhCn);
+    assert_eq!(
+        text(cx, "pack-aside-Faithful".into()).as_deref(),
+        Some("文件夹")
+    );
+    assert_eq!(
+        text(cx, "pack-aside-Zipped.zip".into()).as_deref(),
+        Some("压缩包")
+    );
+}
+
+#[gpui_kit::test]
+fn shader_option_files_hidden(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, _folder) = local_app(cx, tmp.path(), LocalKind::Shaders, |dir| {
+        jar_with(dir, "Complementary.zip", &[("shaders/a.fsh", b"x")]);
+        std::fs::write(dir.join("Complementary.zip.txt"), "opt=1").unwrap();
+        std::fs::create_dir(dir.join("bsl")).unwrap();
+        std::fs::write(dir.join("readme.md"), "x").unwrap();
+    });
+    assert_eq!(local_keys(&tab, cx), ["bsl", "Complementary.zip"]);
+    assert!(shows(&app, cx, local_row_id(LocalKind::Shaders, "bsl")));
+    assert!(shows(
+        &app,
+        cx,
+        local_row_id(LocalKind::Shaders, "Complementary.zip")
+    ));
+    assert!(!shows(
+        &app,
+        cx,
+        local_row_id(LocalKind::Shaders, "Complementary.zip.txt")
+    ));
+    assert_eq!(
+        label_of(&app, cx, "shader-aside-bsl").as_deref(),
+        Some("Folder")
+    );
+    assert_eq!(
+        label_of(&app, cx, "shader-aside-Complementary.zip").as_deref(),
+        Some("Archive")
+    );
+}
+
+#[gpui_kit::test]
+fn saves_sorted_and_formatted(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let older = 1_700_000_000_000;
+    let newer = 1_793_363_696_789;
+    let (app, tab, _folder) = local_app(cx, tmp.path(), LocalKind::Saves, |dir| {
+        world(dir, "w-old", Some("Old World"), Some(older));
+        world(dir, "w-new", Some("New 世界"), Some(newer));
+        // No name: the folder's. No metadata at all: last.
+        world(dir, "w-unnamed", None, Some(older + 1000));
+        std::fs::create_dir(dir.join("w-bare")).unwrap();
+        std::fs::write(dir.join("w-new").join("icon.png"), tiny_png()).unwrap();
+        std::fs::write(dir.join("stray.txt"), "x").unwrap();
+    });
+    // Newest first, worlds without a last play after them.
+    assert_eq!(
+        local_keys(&tab, cx),
+        ["w-new", "w-unnamed", "w-old", "w-bare"]
+    );
+    let titles = tab.read_with(cx, |t, cx| {
+        (t.list().read(cx).items().iter())
+            .map(|i| i.title.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(titles, ["New 世界", "w-unnamed", "Old World", "w-bare"]);
+
+    // The last play is local time, `YYYY-MM-DD HH:mm`.
+    let expect = |ms: i64| {
+        use chrono::TimeZone as _;
+        let t = chrono::Local.timestamp_millis_opt(ms).single().unwrap();
+        format!("Last played {}", t.format("%Y-%m-%d %H:%M"))
+    };
+    assert_eq!(format_last_played(newer).len(), "2026-10-30 12:34".len());
+    assert_eq!(label_of(&app, cx, "save-detail-w-new"), Some(expect(newer)));
+    assert_eq!(label_of(&app, cx, "save-detail-w-old"), Some(expect(older)));
+    // Nothing known, nothing shown.
+    assert_eq!(
+        label_of(&app, cx, "save-detail-w-bare").as_deref(),
+        Some("")
+    );
+    // The folder name sits at the right.
+    assert_eq!(
+        label_of(&app, cx, "save-aside-w-new").as_deref(),
+        Some("w-new")
+    );
+    // Only the world with an icon has one.
+    let cached = |cx: &mut TestAppContext| {
+        cx.update(|cx| cx.global::<patina_app::content::ImageCache>().len())
+    };
+    settle(cx, |cx| cached(cx) == 1);
+
+    app.language(Language::ZhCn);
+    assert_eq!(
+        label_of(&app, cx, "save-detail-w-old"),
+        Some(expect(older).replace("Last played", "上次游玩"))
+    );
+}
+
+#[gpui_kit::test]
+fn saves_have_no_delete(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, folder) = local_app(cx, tmp.path(), LocalKind::Saves, |dir| {
+        world(dir, "w1", Some("One"), Some(1));
+    });
+    assert!(shows(&app, cx, local_row_id(LocalKind::Saves, "w1")));
+    assert!(!shows(&app, cx, local_delete_id(LocalKind::Saves, "w1")));
+    // The Delete key does nothing either; open folder and refresh stay.
+    click(&app, cx, local_row_id(LocalKind::Saves, "w1"));
+    press(&app, cx, "delete");
+    assert!(!shows(&app, cx, "dialog"));
+    tab.update(cx, |t, _| assert_eq!(t.changes_in_flight(), 0));
+    assert!(folder.join("w1").exists());
+    assert!(shows(&app, cx, "content-open-folder"));
+    assert!(shows(&app, cx, "content-refresh"));
+    // Not even while the instance is idle for the busy line.
+    let model = instances_model(&app, cx);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    cx.run_until_parked();
+    assert!(!shows(&app, cx, "save-busy"));
+}
+
+#[gpui_kit::test]
+fn pack_delete_asks_with_focus_on_cancel(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, folder) = local_app(cx, tmp.path(), LocalKind::ResourcePacks, |dir| {
+        jar_with(dir, "a.zip", &[("pack.mcmeta", mcmeta("A").as_bytes())]);
+        let b = dir.join("b-folder");
+        std::fs::create_dir_all(b.join("assets/minecraft")).unwrap();
+        std::fs::write(b.join("assets/minecraft/f"), "x").unwrap();
+        jar_with(dir, "c.zip", &[]);
+    });
+    let id = |k: &str| local_row_id(LocalKind::ResourcePacks, k);
+    let selected =
+        |cx: &mut TestAppContext| tab.read_with(cx, |t, _| t.selected().map(str::to_owned));
+
+    // The rows are keyboard reachable.
+    click(&app, cx, id("a.zip"));
+    assert_eq!(selected(cx).as_deref(), Some("a.zip"));
+    press(&app, cx, "up");
+    assert_eq!(selected(cx).as_deref(), Some("a.zip"), "top stays");
+    press(&app, cx, "down");
+    assert_eq!(selected(cx).as_deref(), Some("b-folder"));
+    press(&app, cx, "end");
+    assert_eq!(selected(cx).as_deref(), Some("c.zip"));
+    press(&app, cx, "home");
+    assert_eq!(selected(cx).as_deref(), Some("a.zip"));
+
+    // Delete asks, naming the file; the keyboard is on 取消, and Enter
+    // there cancels.
+    press(&app, cx, "delete");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("dialog").find("pack-delete-title").label(),
+            Some("Delete “a.zip”?")
+        );
+        assert_eq!(
+            window.within("dialog").find("pack-delete-body").label(),
+            Some("The file will be deleted permanently.")
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("dialog").find("cancel").focused(),
+            Some(true),
+            "focus starts on 取消"
+        );
+    })
+    .unwrap();
+    press(&app, cx, "enter");
+    assert!(!shows(&app, cx, "dialog"));
+    cx.executor().advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    assert!(folder.join("a.zip").exists(), "Enter on 取消 cancels");
+
+    // Escape leaves it too.
+    press(&app, cx, "delete");
+    assert!(shows(&app, cx, "dialog"));
+    press(&app, cx, "escape");
+    assert!(!shows(&app, cx, "dialog"));
+    assert!(folder.join("a.zip").exists());
+
+    // 删除 on the folder pack says the folder goes with its contents.
+    click(
+        &app,
+        cx,
+        local_delete_id(LocalKind::ResourcePacks, "b-folder"),
+    );
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.within("dialog").find("pack-delete-body").label(),
+            Some("The folder and everything in it will be deleted permanently.")
+        );
+    })
+    .unwrap();
+    dialog_click(&app, cx, "ok");
+    settle(cx, |_| !folder.join("b-folder").exists());
+    settle(cx, |cx| {
+        !local_keys(&tab, cx).contains(&"b-folder".to_string())
+    });
+    assert_eq!(local_keys(&tab, cx), ["a.zip", "c.zip"]);
+    assert!(folder.join("a.zip").exists() && folder.join("c.zip").exists());
+    assert_eq!(selected(cx).as_deref(), Some("c.zip"), "the next row");
+}
+
+#[gpui_kit::test]
+fn pack_changes_are_refused_while_busy(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, folder) = local_app(cx, tmp.path(), LocalKind::Shaders, |dir| {
+        jar_with(dir, "s.zip", &[("shaders/a.fsh", b"x")]);
+    });
+    let model = instances_model(&app, cx);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    cx.run_until_parked();
+    assert!(disabled(
+        &app,
+        cx,
+        local_delete_id(LocalKind::Shaders, "s.zip")
+    ));
+    assert_eq!(
+        label_of(&app, cx, "shader-busy").as_deref(),
+        Some("The game is running, so this folder can’t be changed now")
+    );
+    click(&app, cx, local_row_id(LocalKind::Shaders, "s.zip"));
+    press(&app, cx, "delete");
+    assert!(!shows(&app, cx, "dialog"));
+    assert_eq!(tab.read_with(cx, |t, _| t.changes_in_flight()), 0);
+    assert!(folder.join("s.zip").exists());
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let notices = window.find_all(NOTICE_TEXT);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].label(),
+            Some("The game is running, so this folder can’t be changed now")
+        );
+    })
+    .unwrap();
+
+    // When the game ends, the tab lists again (it may have written).
+    jar_with(&folder, "t.zip", &[("shaders/b.fsh", b"x")]);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", None, cx));
+    settle(cx, |cx| local_keys(&tab, cx) == ["s.zip", "t.zip"]);
+    assert!(!shows(&app, cx, "shader-busy"));
+    assert!(!disabled(
+        &app,
+        cx,
+        local_delete_id(LocalKind::Shaders, "s.zip")
+    ));
+}
+
+#[gpui_kit::test]
+fn local_toolbar_and_empty_states(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    // No folder at all yet.
+    let (app, tab, folder) = local_app(cx, tmp.path(), LocalKind::Saves, |dir| {
+        std::fs::remove_dir(dir).unwrap();
+    });
+    for id in ["content-filter", "content-open-folder", "content-refresh"] {
+        assert!(shows(&app, cx, id), "{id} is on the toolbar");
+    }
+    assert_eq!(
+        label_of(&app, cx, "content-empty").as_deref(),
+        Some("No worlds yet. Worlds you create in the game appear here.")
+    );
+
+    // A world put in by hand shows after a refresh.
+    std::fs::create_dir_all(&folder).unwrap();
+    world(&folder, "w1", Some("One"), Some(5));
+    click(&app, cx, "content-refresh");
+    local_settled(&tab, cx);
+    assert!(shows(&app, cx, local_row_id(LocalKind::Saves, "w1")));
+
+    // A filter matches the world's name and its folder's.
+    click(&app, cx, "content-filter");
+    type_text(&app, cx, "zzz");
+    assert_eq!(
+        label_of(&app, cx, "content-empty").as_deref(),
+        Some("Nothing matches “zzz”.")
+    );
+}
+
+#[gpui_kit::test]
+fn a_hidden_local_tab_does_not_list(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, tab, folder) = local_app(cx, tmp.path(), LocalKind::ResourcePacks, |dir| {
+        jar_with(dir, "a.zip", &[]);
+    });
+    let list = tab.read_with(cx, |t, _| t.list().clone());
+    let listings = Rc::new(std::cell::Cell::new(0));
+    let _s = cx.update(|cx| {
+        let listings = listings.clone();
+        cx.subscribe(&list, move |_, _: &patina_app::content::Reloaded, _| {
+            listings.set(listings.get() + 1)
+        })
+    });
+    let refocus = |cx: &mut TestAppContext| {
+        gpui_kit::VisualTestContext::from_window(app.handle, cx).deactivate_window();
+        activate(&app, cx);
+    };
+    refocus(cx);
+    local_settled(&tab, cx);
+    assert_eq!(listings.get(), 1, "in view, the window listing again");
+
+    // On another page: neither the window nor the instance coming free.
+    click(&app, cx, "rail-downloads");
+    refocus(cx);
+    let model = instances_model(&app, cx);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    model.update(cx, |m, cx| m.set_run_state("Alpha", None, cx));
+    cx.run_until_parked();
+    assert!(!list.read_with(cx, |l, _| l.is_reloading()));
+    assert_eq!(listings.get(), 1);
+
+    // Back on the page, at once.
+    jar_with(&folder, "b.zip", &[]);
+    click(&app, cx, "rail-instances");
+    local_settled(&tab, cx);
+    assert_eq!(listings.get(), 2);
+    assert_eq!(local_keys(&tab, cx), ["a.zip", "b.zip"]);
+
+    // On another tab of the detail, the same.
+    click(&app, cx, "tab-overview");
+    refocus(cx);
+    assert!(!list.read_with(cx, |l, _| l.is_reloading()));
+    assert_eq!(listings.get(), 2);
+}

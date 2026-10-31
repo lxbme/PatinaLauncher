@@ -259,6 +259,19 @@ content:
     resourcepacks: "No resource packs yet. Put zip files in the folder, or get some from Downloads."
     shaders: "No shader packs yet. Put zip files in the folder, or get some from Downloads."
     saves: "No worlds yet. Worlds you create in the game appear here."
+  busy: "%{reason}, so this folder can’t be changed now"
+  changed_outside: "The file was changed outside Patina"
+  delete: "Delete “%{name}”…"
+  delete_title: "Delete “%{name}”?"
+  delete_body_file: "The file will be deleted permanently."
+  delete_body_dir: "The folder and everything in it will be deleted permanently."
+  delete_confirm: "Delete"
+  cancel: "Cancel"
+  delete_failed: "Couldn’t delete “%{name}”: %{error}"
+  kind:
+    folder: "Folder"
+    archive: "Archive"
+  last_played: "Last played %{when}"
 mods:
   online: "Get online"
   format:

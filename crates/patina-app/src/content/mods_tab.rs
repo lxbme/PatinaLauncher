@@ -68,11 +68,11 @@ use crate::theme::ProductColors;
 /// How long a row the global search jumped to stays highlighted.
 pub const HIGHLIGHT_FOR: Duration = Duration::from_secs(2);
 /// Row height (two lines), 48 px.
-const ROW_H: Rems = Rems(3.);
+pub(super) const ROW_H: Rems = Rems(3.);
 /// Row icon, 32 px.
-const ICON: Rems = Rems(2.);
+pub(super) const ICON: Rems = Rems(2.);
 /// The widest the file-name column gets.
-const FILE_W: Rems = Rems(14.);
+pub(super) const FILE_W: Rems = Rems(14.);
 
 /// Key context of the Mods tab's rows.
 pub const LIST_CONTEXT: &str = "ModList";
@@ -1232,10 +1232,10 @@ impl ModsTab {
 }
 
 /// A command run with the window (the delete confirmation's).
-type WindowAction = dyn Fn(&mut Window, &mut App);
+pub(super) type WindowAction = dyn Fn(&mut Window, &mut App);
 
 /// Shows `notification` (its text `text` labelled for tests).
-fn notify(notification: Notification, text: String, window: &mut Window, cx: &mut App) {
+pub(super) fn notify(notification: Notification, text: String, window: &mut Window, cx: &mut App) {
     window.push_notification(labelled(notification, text), cx);
 }
 

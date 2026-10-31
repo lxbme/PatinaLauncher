@@ -4,7 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{Tab as TabElement, Tabs};
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::progress::Progress;
@@ -26,12 +25,11 @@ use super::{
     HEADER_ICON, HEADER_TITLE, icon_for, instance_icon, loader_color, loader_full, now_secs,
     time_ago,
 };
-use crate::content::{ModsChanged, ModsEvents, ModsTab};
+use crate::content::{LocalKind, LocalTab, ModsChanged, ModsEvents, ModsTab};
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
 use crate::launch::{LogView, OpState, RunState, stop_dialog};
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
-use crate::shell::placeholder;
 use crate::theme::ProductColors;
 
 const TABS_H: Rems = Rems(2.25);
@@ -106,19 +104,6 @@ impl DetailTab {
         let ix = Self::ALL.iter().position(|t| *t == self).unwrap_or(0) as isize;
         Self::ALL[(ix + delta).rem_euclid(count) as usize]
     }
-
-    fn icon(self) -> Icon {
-        match self {
-            DetailTab::Overview => Icon::new(IconName::LayoutDashboard),
-            DetailTab::Versions => Icon::new(Lucide::Layers),
-            DetailTab::Mods => Icon::new(Lucide::Puzzle),
-            DetailTab::ResourcePacks => Icon::new(Lucide::Image),
-            DetailTab::Shaders => Icon::new(Lucide::SunMedium),
-            DetailTab::Worlds => Icon::new(Lucide::Earth),
-            DetailTab::Settings => Icon::new(IconName::Settings2),
-            DetailTab::Log => Icon::new(Lucide::ScrollText),
-        }
-    }
 }
 
 /// Where the overview's stats stand for the selected instance.
@@ -174,6 +159,11 @@ pub struct DetailView {
     settings: Option<Entity<SettingsForm>>,
     /// The Mods tab of the selected instance, made when it is first shown.
     mods: Option<Entity<ModsTab>>,
+    /// The resource packs, shaders and saves tabs of the selected
+    /// instance, made when each is first shown.
+    packs: Option<Entity<LocalTab>>,
+    shaders: Option<Entity<LocalTab>>,
+    saves: Option<Entity<LocalTab>>,
     /// Whether the instances page is the one on show (the shell may show
     /// another): a tab on a hidden page does no background listing.
     page_shown: bool,
@@ -219,6 +209,9 @@ impl DetailView {
             versions: None,
             settings: None,
             mods: None,
+            packs: None,
+            shaders: None,
+            saves: None,
             page_shown: true,
             tabs_scroll: ScrollHandle::new(),
             overview_scroll: ScrollHandle::new(),
@@ -256,6 +249,21 @@ impl DetailView {
         self.mods.as_ref()
     }
 
+    /// The resource packs tab of the selected instance, once shown.
+    pub fn packs_view(&self) -> Option<&Entity<LocalTab>> {
+        self.packs.as_ref()
+    }
+
+    /// The shaders tab of the selected instance, once shown.
+    pub fn shaders_view(&self) -> Option<&Entity<LocalTab>> {
+        self.shaders.as_ref()
+    }
+
+    /// The saves tab of the selected instance, once shown.
+    pub fn saves_view(&self) -> Option<&Entity<LocalTab>> {
+        self.saves.as_ref()
+    }
+
     /// Shows the Mods tab with mod file `file_name` scrolled to and
     /// highlighted (the global search's "installed mods" hits). The caller
     /// selects the instance first.
@@ -291,9 +299,9 @@ impl DetailView {
 
     pub fn set_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
         if self.tab != tab {
-            let was_shown = self.mods_shown();
+            let was_shown = self.shown_tab();
             self.tab = tab;
-            self.sync_mods_shown(was_shown, cx);
+            self.sync_shown(was_shown, cx);
             // A tab chosen out of view (scrolled away) comes into view.
             if let Some(ix) = DetailTab::ALL.iter().position(|t| *t == tab) {
                 self.tabs_scroll.scroll_to_item(ix);
@@ -359,35 +367,55 @@ impl DetailView {
     }
 
     /// The shell shows the instances page (`shown`) or another page. The
-    /// Mods tab lists its folder again when it comes back into view, and
-    /// not while out of it.
+    /// listing tabs (Mods, resource packs, shaders, saves) list their
+    /// folder again when they come back into view, and not while out of it.
     pub fn set_page_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
-        let was_shown = self.mods_shown();
+        let was_shown = self.shown_tab();
         self.page_shown = shown;
-        self.sync_mods_shown(was_shown, cx);
+        self.sync_shown(was_shown, cx);
     }
 
-    /// Whether the Mods tab is in view: its tab chosen on the page on show.
-    fn mods_shown(&self) -> bool {
-        self.page_shown && self.tab == DetailTab::Mods
+    /// The tab in view: the chosen one on the page on show.
+    fn shown_tab(&self) -> Option<DetailTab> {
+        self.page_shown.then_some(self.tab)
     }
 
-    /// Tells the Mods tab of the selection that it came into view (it lists
-    /// again) or went out of it, when that changed since `was_shown`. One
-    /// of another instance is replaced when drawn.
-    fn sync_mods_shown(&mut self, was_shown: bool, cx: &mut Context<Self>) {
-        let shown = self.mods_shown();
+    /// Tells the listing tab of the selection that it came into view (it
+    /// lists again) or went out of it, when that changed since `was_shown`.
+    /// One of another instance is replaced when drawn.
+    fn sync_shown(&mut self, was_shown: Option<DetailTab>, cx: &mut Context<Self>) {
+        let shown = self.shown_tab();
         if shown == was_shown {
             return;
         }
         let selected = self.model.read(cx).selected().map(str::to_owned);
-        let mods =
-            (self.mods.clone()).filter(|m| Some(m.read(cx).instance_id()) == selected.as_deref());
-        if let Some(mods) = mods {
-            if shown {
-                mods.update(cx, |mods, cx| mods.shown(cx));
-            } else {
-                mods.update(cx, |mods, _| mods.hidden());
+        let selected = selected.as_deref();
+        for (tab, visible) in [(was_shown, false), (shown, true)] {
+            let local = match tab {
+                Some(DetailTab::ResourcePacks) => self.packs.clone(),
+                Some(DetailTab::Shaders) => self.shaders.clone(),
+                Some(DetailTab::Worlds) => self.saves.clone(),
+                Some(DetailTab::Mods) => {
+                    let mods =
+                        (self.mods.clone()).filter(|m| Some(m.read(cx).instance_id()) == selected);
+                    if let Some(mods) = mods {
+                        if visible {
+                            mods.update(cx, |mods, cx| mods.shown(cx));
+                        } else {
+                            mods.update(cx, |mods, _| mods.hidden());
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let local = local.filter(|l| Some(l.read(cx).instance_id()) == selected);
+            if let Some(local) = local {
+                if visible {
+                    local.update(cx, |tab, cx| tab.shown(cx));
+                } else {
+                    local.update(cx, |tab, _| tab.hidden());
+                }
             }
         }
     }
@@ -406,6 +434,32 @@ impl DetailView {
         if !current {
             let model = self.model.clone();
             self.mods = Some(cx.new(|cx| ModsTab::new(model, instance, window, cx)));
+        }
+    }
+
+    /// Makes the resource packs, shaders or saves tab follow the selection;
+    /// made only when the tab is shown (it needs the window).
+    fn sync_local(&mut self, kind: LocalKind, window: &mut Window, cx: &mut Context<Self>) {
+        let instance = match self.model.read(cx).selected_entry() {
+            Some(Entry::Healthy(instance)) => instance.clone(),
+            _ => return,
+        };
+        let slot = match kind {
+            LocalKind::ResourcePacks => &self.packs,
+            LocalKind::Shaders => &self.shaders,
+            LocalKind::Saves => &self.saves,
+        };
+        let current = slot
+            .as_ref()
+            .is_some_and(|v| v.read(cx).instance_id() == instance.id);
+        if !current {
+            let model = self.model.clone();
+            let tab = cx.new(|cx| LocalTab::new(kind, model, instance, window, cx));
+            match kind {
+                LocalKind::ResourcePacks => self.packs = Some(tab),
+                LocalKind::Shaders => self.shaders = Some(tab),
+                LocalKind::Saves => self.saves = Some(tab),
+            }
         }
     }
 
@@ -945,13 +999,24 @@ impl DetailView {
                 .size_full()
                 .children(self.mods.clone())
                 .into_any_element(),
+            DetailTab::ResourcePacks => div()
+                .size_full()
+                .children(self.packs.clone())
+                .into_any_element(),
+            DetailTab::Shaders => div()
+                .size_full()
+                .children(self.shaders.clone())
+                .into_any_element(),
+            DetailTab::Worlds => div()
+                .size_full()
+                .children(self.saves.clone())
+                .into_any_element(),
             DetailTab::Overview => overview::render(
                 instance,
                 self.stats(&instance.id),
                 &self.overview_scroll,
                 cx,
             ),
-            tab => placeholder::page(tab.icon(), tab.label()).into_any_element(),
         }
     }
 }
@@ -961,6 +1026,9 @@ impl Render for DetailView {
         match self.tab {
             DetailTab::Settings => self.sync_settings(window, cx),
             DetailTab::Mods => self.sync_mods(window, cx),
+            DetailTab::ResourcePacks => self.sync_local(LocalKind::ResourcePacks, window, cx),
+            DetailTab::Shaders => self.sync_local(LocalKind::Shaders, window, cx),
+            DetailTab::Worlds => self.sync_local(LocalKind::Saves, window, cx),
             _ => {}
         }
         let bg = cx.theme().background;
