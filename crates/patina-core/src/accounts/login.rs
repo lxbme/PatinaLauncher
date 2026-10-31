@@ -1,6 +1,5 @@
-//! Microsoft device-code login events and service interface. The private protocol
-//! returns verified results; [`UnavailableLogin`] remains the production adapter
-//! until AccountService owns persistence and terminal events.
+//! Microsoft device-code events. AccountService owns persistence and terminal
+//! truth; UnavailableLogin remains only for consumers not yet migrated.
 
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -24,7 +23,7 @@ impl std::fmt::Debug for DeviceCode {
     }
 }
 
-/// Where credentials were durably saved (reported by Task 4's service).
+/// Where credentials were durably saved, reported by AccountService.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
     Keyring,
@@ -75,7 +74,9 @@ pub trait DeviceCodeLogin: Send + Sync {
     /// Cancellation: the attempt is cancelled when the watch value becomes
     /// `true` or the sender is dropped (`changed().await` returns `Err`). On
     /// cancel the implementation sends `Failed(Cancelled)` (ignoring a closed
-    /// event receiver) and returns.
+    /// event receiver) and returns. For AccountService this applies before the
+    /// metadata commit; closing the view after commit cannot undo publication
+    /// or turn a durably saved account into a Cancelled result.
     fn start(
         &self,
         events: UnboundedSender<LoginEvent>,

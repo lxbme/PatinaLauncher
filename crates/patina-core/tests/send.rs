@@ -46,11 +46,34 @@ fn prepare_launch_is_send(
     ));
 }
 
+/// Never called: account operations must remain runtime-spawnable.
+#[allow(dead_code)]
+fn account_operations_are_send(
+    service: &patina_core::accounts::AccountService,
+    cancel: patina_core::accounts::login::CancelToken,
+    grant: patina_core::accounts::LaunchGrant,
+    pending: patina_core::launch::session::PendingLaunch,
+) {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<patina_core::accounts::AccountService>();
+    let _: &dyn patina_core::accounts::login::DeviceCodeLogin = service;
+    assert_send(&service.snapshot());
+    assert_send(&service.reload());
+    assert_send(&service.set_current("id"));
+    assert_send(&service.remove("id"));
+    assert_send(&service.add_offline("Player"));
+    assert_send(&service.resolve_launch("id", cancel));
+    assert_send(&service.launch_pending(grant, pending, None));
+    #[cfg(feature = "dev-offline")]
+    assert_send(&service.add_dev_offline("Player"));
+}
+
 #[test]
 fn core_operation_futures_are_send() {
     // The checks above run at compile time; this keeps the file a test.
     let _ = (
         loader_ops_are_send as fn(_, _, _),
         prepare_launch_is_send as fn(_, _, _, _, _),
+        account_operations_are_send as fn(_, _, _, _),
     );
 }

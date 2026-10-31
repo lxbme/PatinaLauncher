@@ -202,3 +202,36 @@ fn special_files_and_bad_lock_journal_permissions_are_rejected() {
     .unwrap();
     assert!(dir.try_lock().is_err());
 }
+
+#[test]
+fn account_metadata_accepts_legacy_modes_but_rejects_links_and_unsafe_entries() {
+    let (tmp, data, _dir) = setup();
+    let metadata = tmp.path().join("accounts.toml");
+    fs::write(&metadata, b"legacy").unwrap();
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(read_account_metadata(&data).unwrap().unwrap(), b"legacy");
+    write_account_metadata(&data, b"durable", None).unwrap();
+    assert_eq!(
+        fs::metadata(&metadata).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(read_account_metadata(&data).unwrap().unwrap(), b"durable");
+    let linked = tmp.path().join("linked");
+    fs::hard_link(&metadata, &linked).unwrap();
+    assert_eq!(
+        read_account_metadata(&data).unwrap_err(),
+        crate::accounts::credentials::CredentialError::UnsafePath
+    );
+    assert!(write_account_metadata(&data, b"must-not-write", None).is_err());
+    fs::remove_file(&metadata).unwrap();
+    symlink(&linked, &metadata).unwrap();
+    assert!(read_account_metadata(&data).is_err());
+    assert!(write_account_metadata(&data, b"must-not-write", None).is_err());
+    assert_eq!(fs::read(&linked).unwrap(), b"durable");
+    fs::remove_file(&metadata).unwrap();
+    fs::write(&metadata, b"unsafe").unwrap();
+    fs::set_permissions(&metadata, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(read_account_metadata(&data).is_err());
+    assert!(write_account_metadata(&data, b"must-not-write", None).is_err());
+    assert_eq!(fs::read(&metadata).unwrap(), b"unsafe");
+}

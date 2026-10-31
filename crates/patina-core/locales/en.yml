@@ -16,6 +16,7 @@ errors:
     offline_conflict: "An offline account with this name already exists."
     busy: "Another account operation is in progress. Try again when it finishes."
     session_expired: "The game session expired. Try launching again."
+    launch: "Unable to start the game. Check the instance and try again."
     network: "Could not connect during %{stage}. Try again."
     http: "The service rejected %{stage} (HTTP %{status})."
     invalid_response: "The service returned an invalid response during %{stage}."

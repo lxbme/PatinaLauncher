@@ -16,8 +16,13 @@ mod credentials_tests;
 pub mod error;
 mod http;
 pub mod login;
+mod metadata;
 mod msa;
 mod secret;
+mod service;
+pub use service::{
+    AccountService, AccountSnapshot, AuthenticatedLaunchError, LaunchGrant, RemovalOutcome,
+};
 
 pub use http::{DEFAULT_MSA_CLIENT_ID, msa_client_id};
 
@@ -30,12 +35,15 @@ pub mod testing {
     };
     pub use super::http::AuthHttp;
     pub use super::msa::{AuthClock, MsaClient};
+    pub use super::service::testing::seed_verified;
 }
 
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod msa_tests;
+#[cfg(test)]
+mod service_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,14 +53,42 @@ pub enum AccountKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Account {
     pub id: String,
     pub kind: AccountKind,
     pub username: String,
     pub uuid: Uuid,
-    /// Reserved for the keyring reference (plan 3); always `None` for now.
+    /// Opaque credential reference; never a token.
     #[serde(default)]
     pub token_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification: Option<Verification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skin_hash: Option<String>,
+}
+
+/// Historical proof, produced only by an entitlement- and profile-verified commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verification {
+    profile_uuid: Uuid,
+    verified_at: u64,
+}
+impl Verification {
+    pub fn profile_uuid(&self) -> Uuid {
+        self.profile_uuid
+    }
+    pub fn verified_at(&self) -> u64 {
+        self.verified_at
+    }
+}
+impl Account {
+    pub fn verification(&self) -> Option<&Verification> {
+        self.verification.as_ref()
+    }
+    pub fn skin_hash(&self) -> Option<&str> {
+        self.skin_hash.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -108,6 +144,10 @@ impl AccountStore {
                 });
             }
         };
+        Ok(Self::from_file(path, file))
+    }
+
+    fn from_file(path: PathBuf, file: AccountsFile) -> Self {
         let mut seen = std::collections::HashSet::new();
         let unique: Vec<Account> = file
             .accounts
@@ -128,18 +168,31 @@ impl AccountStore {
             .filter(|id| accounts.iter().any(|a| &a.id == *id))
             .cloned()
             .or_else(|| accounts.first().map(|a| a.id.clone()));
-        Ok(AccountStore {
+        AccountStore {
             path,
             accounts,
             hidden,
             current,
             stored_current: file.current,
             current_changed: false,
-        })
+        }
     }
 
     pub fn save(&self) -> Result<(), AccountError> {
-        let file = AccountsFile {
+        let file = self.as_file();
+        let text = toml::to_string(&file).map_err(|e| AccountError::Parse(e.to_string()))?;
+        let io = |e: std::io::Error| AccountError::Io {
+            path: self.path.clone(),
+            error: e.to_string(),
+        };
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(io)?;
+        }
+        crate::fsutil::write_atomic(&self.path, text.as_bytes()).map_err(io)
+    }
+
+    fn as_file(&self) -> AccountsFile {
+        AccountsFile {
             current: if self.current_changed {
                 self.current.clone()
             } else {
@@ -161,16 +214,7 @@ impl AccountStore {
                 .chain(self.hidden.iter())
                 .cloned()
                 .collect(),
-        };
-        let text = toml::to_string(&file).map_err(|e| AccountError::Parse(e.to_string()))?;
-        let io = |e: std::io::Error| AccountError::Io {
-            path: self.path.clone(),
-            error: e.to_string(),
-        };
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(io)?;
         }
-        crate::fsutil::write_atomic(&self.path, text.as_bytes()).map_err(io)
     }
 
     pub fn accounts(&self) -> &[Account] {
@@ -206,7 +250,6 @@ impl AccountStore {
     }
 
     /// Makes `idx` the current account when there is none yet.
-    #[cfg(any(test, feature = "dev-offline"))]
     fn adopt_current(&mut self, idx: usize) {
         if self.current.is_none() {
             self.current = Some(self.accounts[idx].id.clone());
@@ -235,6 +278,8 @@ impl AccountStore {
                     username: username.to_string(),
                     uuid,
                     token_ref: None,
+                    verification: None,
+                    skin_hash: None,
                 });
                 self.accounts.len() - 1
             }
@@ -243,8 +288,7 @@ impl AccountStore {
         Ok(&self.accounts[idx])
     }
 
-    /// Entry point for plan 3's sign-in flow; only tests use it for now.
-    #[cfg(test)]
+    /// Internal identity insertion; service adds verified metadata before commit.
     pub(crate) fn add_msa(
         &mut self,
         username: &str,
@@ -265,6 +309,8 @@ impl AccountStore {
                     username: username.to_string(),
                     uuid,
                     token_ref,
+                    verification: None,
+                    skin_hash: None,
                 });
                 self.accounts.len() - 1
             }

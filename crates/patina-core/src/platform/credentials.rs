@@ -53,6 +53,7 @@ mod linux {
 
     pub(crate) struct PrivateCredentialDir {
         fd: OwnedFd,
+        metadata: bool,
     }
     pub(crate) struct CredentialLock {
         fd: OwnedFd,
@@ -143,8 +144,43 @@ mod linux {
         }
         Ok(())
     }
+    /// Nonsecret metadata shares the descriptor-relative replacement primitive,
+    /// but accepts legacy owner-controlled 0644 files. New files are still 0600.
+    pub(crate) fn read_account_metadata(
+        data: &DataDirs,
+    ) -> Result<Option<Vec<u8>>, CredentialError> {
+        let dir = PrivateCredentialDir {
+            fd: PrivateCredentialDir::open_root(data)?,
+            metadata: true,
+        };
+        let bytes = dir.read("accounts.toml")?;
+        if let Some(fd) = dir.existing("accounts.toml", OFlags::RDONLY)? {
+            // Reconcile a previous postrename error before journal cleanup can
+            // delete an old reference. Visible bytes alone are not durable proof.
+            fs::fsync(&fd).map_err(error)?;
+            fs::fsync(&dir.fd).map_err(error)?;
+        }
+        Ok(bytes)
+    }
+    pub(crate) fn write_account_metadata(
+        data: &DataDirs,
+        bytes: &[u8],
+        #[cfg(test)] fail: Option<WriteStage>,
+    ) -> Result<(), CredentialError> {
+        let dir = PrivateCredentialDir {
+            fd: PrivateCredentialDir::open_root(data)?,
+            metadata: true,
+        };
+        dir.write_with_temp(
+            "accounts.toml",
+            bytes,
+            &format!(".accounts-temp-{}", uuid::Uuid::new_v4()),
+            #[cfg(test)]
+            fail,
+        )
+    }
     impl PrivateCredentialDir {
-        pub(crate) fn open(data: &DataDirs) -> Result<Self, CredentialError> {
+        fn open_root(data: &DataDirs) -> Result<OwnedFd, CredentialError> {
             let path = data.root();
             let absolute = if path.is_absolute() {
                 path
@@ -198,6 +234,10 @@ mod linux {
                 }
             }
             check_dir(&fd, false)?;
+            Ok(fd)
+        }
+        pub(crate) fn open(data: &DataDirs) -> Result<Self, CredentialError> {
+            let fd = Self::open_root(data)?;
             match fs::mkdirat(&fd, "credentials", Mode::from_raw_mode(0o700)) {
                 Ok(()) => fs::fsync(&fd).map_err(error)?,
                 Err(Errno::EXIST) => {}
@@ -211,7 +251,10 @@ mod linux {
             )
             .map_err(error)?;
             check_dir(&fd, true)?;
-            Ok(Self { fd })
+            Ok(Self {
+                fd,
+                metadata: false,
+            })
         }
         fn existing(
             &self,
@@ -219,7 +262,7 @@ mod linux {
             flags: OFlags,
         ) -> Result<Option<OwnedFd>, CredentialError> {
             name(filename)?;
-            check_dir(&self.fd, true)?;
+            check_dir(&self.fd, !self.metadata)?;
             match fs::openat(
                 &self.fd,
                 filename,
@@ -227,7 +270,18 @@ mod linux {
                 Mode::empty(),
             ) {
                 Ok(fd) => {
-                    check_file(&fd)?;
+                    if self.metadata {
+                        let stat = fs::fstat(&fd).map_err(error)?;
+                        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                            || stat.st_nlink != 1
+                            || stat.st_uid != rustix::process::geteuid().as_raw()
+                            || stat.st_mode & 0o7022 != 0
+                        {
+                            return Err(CredentialError::UnsafePath);
+                        }
+                    } else {
+                        check_file(&fd)?;
+                    }
                     Ok(Some(fd))
                 }
                 Err(Errno::NOENT) => Ok(None),
@@ -353,7 +407,7 @@ mod linux {
             Ok(())
         }
         pub(crate) fn try_lock(&self) -> Result<Option<CredentialLock>, CredentialError> {
-            check_dir(&self.fd, true)?;
+            check_dir(&self.fd, !self.metadata)?;
             let fd = match self.existing("operation.lock", OFlags::RDWR)? {
                 Some(fd) => fd,
                 None => match fs::openat(
@@ -395,6 +449,12 @@ pub(crate) use unsupported::*;
 #[cfg(not(target_os = "linux"))]
 mod unsupported {
     use super::*;
+    pub(crate) fn read_account_metadata(_: &DataDirs) -> Result<Option<Vec<u8>>, CredentialError> {
+        Err(CredentialError::Unavailable)
+    }
+    pub(crate) fn write_account_metadata(_: &DataDirs, _: &[u8]) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable)
+    }
     pub(crate) struct PrivateCredentialDir;
     pub(crate) struct CredentialLock;
     impl PrivateCredentialDir {

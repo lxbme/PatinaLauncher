@@ -313,6 +313,7 @@ fn version_id(inst: &Instance) -> &str {
 /// a shared lock on the version; dropping it cancels the launch, releases
 /// both and spawns nothing.
 pub struct PendingLaunch {
+    prepared_account: Option<LaunchAccount>,
     inst: Instance,
     cmd: LaunchCommand,
     warnings: Vec<PrepareWarning>,
@@ -331,6 +332,17 @@ impl std::fmt::Debug for PendingLaunch {
 }
 
 impl PendingLaunch {
+    /// Bind the command's preparation identity to the service's live grant,
+    /// including the session token, not merely the profile UUID.
+    pub(crate) fn matches_account(&self, account: &LaunchAccount) -> bool {
+        self.prepared_account.as_ref().is_some_and(|prepared| {
+            prepared.name == account.name
+                && prepared.uuid == account.uuid
+                && prepared.access_token == account.access_token
+                && prepared.user_type == account.user_type
+                && prepared.xuid == account.xuid
+        })
+    }
     /// Findings from preparing the game, available before it starts.
     pub fn warnings(&self) -> &[PrepareWarning] {
         &self.warnings
@@ -355,6 +367,7 @@ impl PendingLaunch {
             warnings,
             instance_lock,
             version_lock,
+            prepared_account: _,
         } = self;
         let mut session = GameSession::spawn(&inst, cmd, instance_lock, version_lock)?;
         session
@@ -395,6 +408,7 @@ impl GameSession {
         refuse_if_running(inst)?;
         let prepared = launcher.prepare(inst, global, account, progress).await?;
         Ok(PendingLaunch {
+            prepared_account: Some(account.clone()),
             inst: inst.clone(),
             cmd: prepared.command,
             warnings: prepared.warnings,
@@ -433,12 +447,25 @@ impl GameSession {
         let version_lock = data.lock_version_shared(version_id(inst))?;
         refuse_if_running(inst)?;
         Ok(PendingLaunch {
+            prepared_account: None,
             inst: inst.clone(),
             cmd,
             warnings,
             instance_lock,
             version_lock,
         })
+    }
+
+    /// Isolated prepared identity/command fixture; no network or game preparation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prepare_launch_with_account_for_test(
+        inst: &Instance,
+        cmd: LaunchCommand,
+        account: &LaunchAccount,
+    ) -> Result<PendingLaunch, SessionError> {
+        let mut pending = Self::prepare_launch_with_command(inst, cmd, Vec::new())?;
+        pending.prepared_account = Some(account.clone());
+        Ok(pending)
     }
 
     /// Test entry: like `start` but with a ready-made command (no prepare).

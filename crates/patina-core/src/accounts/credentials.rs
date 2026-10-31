@@ -28,10 +28,6 @@ pub(crate) struct CredentialRecord {
     reauth_required: bool,
 }
 impl CredentialRecord {
-    #[allow(
-        dead_code,
-        reason = "Task 4 converts verified login into protected record"
-    )]
     pub(crate) fn new(
         refresh_token: SecretString,
         minecraft: Option<MinecraftSession>,
@@ -76,15 +72,12 @@ impl CredentialRecord {
         }
         Ok(bytes)
     }
-    #[allow(dead_code, reason = "Task 4 refresh reads protected record")]
     pub(crate) fn refresh_token(&self) -> &SecretString {
         &self.refresh_token
     }
-    #[allow(dead_code, reason = "Task 4 validates cached session")]
     pub(crate) fn minecraft(&self) -> Option<&MinecraftSession> {
         self.minecraft.as_ref()
     }
-    #[allow(dead_code, reason = "Task 4 refuses cached launch after invalid_grant")]
     pub(crate) fn reauth_required(&self) -> bool {
         self.reauth_required
     }
@@ -110,7 +103,6 @@ pub struct CredentialStore {
     files: Arc<dyn CredentialBackend>,
 }
 impl CredentialStore {
-    #[allow(dead_code, reason = "Task 4 constructs service lazily")]
     pub(crate) fn production(data: DataDirs) -> Self {
         Self::new(
             data.clone(),
@@ -129,7 +121,6 @@ impl CredentialStore {
             files,
         }
     }
-    #[allow(dead_code, reason = "Task 4 reads credentials under operation lock")]
     pub(crate) fn read(&self, reference: &str) -> Result<CredentialRecord, AuthError> {
         validate_reference(reference).map_err(read_error)?;
         if let Some(record) = self.files.read(reference).map_err(read_error)? {
@@ -142,7 +133,6 @@ impl CredentialStore {
     }
     /// Failure does not imply rollback: a local rename or remote mutation may
     /// already have occurred before its durability/acknowledgement failed.
-    #[allow(dead_code, reason = "Task 4 persists full login and rotated records")]
     pub(crate) fn write(
         &self,
         reference: &str,
@@ -163,23 +153,17 @@ impl CredentialStore {
             Err(e) => Err(write_error(e)),
         }
     }
-    #[allow(
-        dead_code,
-        reason = "Task 4 reconciles journal and deletes both stores"
-    )]
     pub(crate) fn delete(&self, reference: &str) -> Result<(), AuthError> {
         validate_reference(reference).map_err(read_error)?;
         let key = self.keyring.delete(reference);
         let file = self.files.delete(reference);
         key.and(file).map_err(write_error)
     }
-    #[allow(dead_code, reason = "Task 4 bounded cancellable lock retry")]
     pub(crate) fn try_lock(&self) -> Result<Option<CredentialLock>, AuthError> {
         PrivateCredentialDir::open(&self.data)
             .and_then(|d| d.try_lock())
             .map_err(write_error)
     }
-    #[allow(dead_code, reason = "Task 4 recovery reads nonsecret cleanup intents")]
     pub(crate) fn journal(&self) -> Result<Vec<String>, AuthError> {
         let dir = PrivateCredentialDir::open(&self.data).map_err(read_error)?;
         let Some(bytes) = dir.read("cleanup.json").map_err(read_error)? else {
@@ -192,7 +176,6 @@ impl CredentialStore {
         }
         Ok(refs)
     }
-    #[allow(dead_code, reason = "Task 4 owns intent/reconciliation policy")]
     pub(crate) fn write_journal(&self, references: &[String]) -> Result<(), AuthError> {
         for reference in references {
             validate_reference(reference).map_err(read_error)?;
@@ -203,14 +186,14 @@ impl CredentialStore {
             .map_err(write_error)
     }
 }
-fn read_error(e: CredentialError) -> AuthError {
+pub(super) fn read_error(e: CredentialError) -> AuthError {
     match e {
         CredentialError::Unavailable | CredentialError::Io => AuthError::StorageUnavailable,
         CredentialError::UnsafePath => AuthError::UnsafeCredentialPath,
         CredentialError::Corrupt | CredentialError::Ambiguous => AuthError::CredentialCorrupt,
     }
 }
-fn write_error(e: CredentialError) -> AuthError {
+pub(super) fn write_error(e: CredentialError) -> AuthError {
     match e {
         CredentialError::UnsafePath => AuthError::UnsafeCredentialPath,
         CredentialError::Corrupt | CredentialError::Ambiguous => AuthError::CredentialCorrupt,

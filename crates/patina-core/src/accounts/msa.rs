@@ -34,14 +34,9 @@ pub(crate) struct MicrosoftTokens {
     expires_at: u64,
 }
 impl MicrosoftTokens {
-    #[allow(
-        dead_code,
-        reason = "Task 4 persists rotation before complete_minecraft"
-    )]
     pub(crate) fn refresh_token(&self) -> &SecretString {
         &self.refresh_token
     }
-    #[allow(dead_code, reason = "Task 4 inspects Microsoft token validity")]
     pub(crate) fn expires_at(&self) -> u64 {
         self.expires_at
     }
@@ -57,15 +52,12 @@ pub(crate) struct MinecraftSession {
     xuid: Option<String>,
 }
 impl MinecraftSession {
-    #[allow(dead_code, reason = "Task 4 detects backwards wall clock")]
     pub(crate) fn issued_at(&self) -> u64 {
         self.issued_at
     }
-    #[allow(dead_code, reason = "Task 4 binds cached session to account identity")]
     pub(crate) fn profile_uuid(&self) -> Uuid {
         self.profile_uuid
     }
-    #[allow(dead_code, reason = "Task 4 builds authenticated launch identity")]
     pub(crate) fn xuid(&self) -> Option<&str> {
         self.xuid.as_deref()
     }
@@ -90,23 +82,21 @@ impl MinecraftSession {
 pub(crate) struct MinecraftProfile {
     uuid: Uuid,
     username: String,
+    #[cfg(test)]
     xuid: Option<String>,
     skin_hash: Option<String>,
 }
 impl MinecraftProfile {
-    #[allow(dead_code, reason = "Task 4 commits verified profile metadata")]
     pub(crate) fn uuid(&self) -> Uuid {
         self.uuid
     }
-    #[allow(dead_code, reason = "Task 4 commits verified profile metadata")]
     pub(crate) fn username(&self) -> &str {
         &self.username
     }
-    #[allow(dead_code, reason = "Task 4 commits verified profile metadata")]
+    #[cfg(test)]
     pub(crate) fn xuid(&self) -> Option<&str> {
         self.xuid.as_deref()
     }
-    #[allow(dead_code, reason = "Task 4 commits safe skin metadata")]
     pub(crate) fn skin_hash(&self) -> Option<&str> {
         self.skin_hash.as_deref()
     }
@@ -120,10 +110,6 @@ pub(crate) struct VerifiedLogin {
     verified_at: u64,
 }
 impl VerifiedLogin {
-    #[allow(
-        dead_code,
-        reason = "Task 4 transfers the verified result into durable records"
-    )]
     pub(crate) fn into_parts(self) -> (MinecraftProfile, SecretString, MinecraftSession, u64) {
         (
             self.profile,
@@ -133,19 +119,18 @@ impl VerifiedLogin {
         )
     }
 
-    #[allow(dead_code, reason = "Task 4 commits verified profile metadata")]
     pub(crate) fn profile(&self) -> &MinecraftProfile {
         &self.profile
     }
-    #[allow(dead_code, reason = "Task 4 commits the protected refresh token")]
+    #[cfg(test)]
     pub(crate) fn refresh_token(&self) -> &SecretString {
         &self.refresh_token
     }
-    #[allow(dead_code, reason = "Task 3/4 persist the protected Minecraft session")]
+    #[cfg(test)]
     pub(crate) fn session(&self) -> &MinecraftSession {
         &self.session
     }
-    #[allow(dead_code, reason = "Task 4 records historical verification time")]
+    #[cfg(test)]
     pub(crate) fn verified_at(&self) -> u64 {
         self.verified_at
     }
@@ -159,7 +144,6 @@ pub struct MsaClient {
     clock: Arc<dyn AuthClock>,
 }
 impl MsaClient {
-    #[allow(dead_code, reason = "Task 4 constructs the production AccountService")]
     pub(crate) fn production() -> Result<Self, AuthError> {
         Ok(Self::new(AuthHttp::production()?, Arc::new(SystemClock)))
     }
@@ -172,7 +156,6 @@ impl MsaClient {
         Self::new(http, clock)
     }
 
-    #[allow(dead_code, reason = "Task 4 owns login commit and terminal events")]
     pub(crate) fn sign_in(
         &self,
         events: UnboundedSender<LoginEvent>,
@@ -278,10 +261,6 @@ impl MsaClient {
         self.complete_minecraft(tokens, cancel).await
     }
 
-    #[allow(
-        dead_code,
-        reason = "Task 4 persists refresh rotation before downstream verification"
-    )]
     pub(crate) fn refresh_microsoft(
         &self,
         refresh: SecretString,
@@ -426,6 +405,9 @@ impl MsaClient {
         {
             return Err(AuthError::NoEntitlement);
         }
+        if self.clock.unix_seconds() < issued_at || self.clock.unix_seconds() >= expires_at {
+            return Err(AuthError::SessionExpired);
+        }
         let response = self
             .http
             .send(
@@ -463,10 +445,14 @@ impl MsaClient {
                     .then(|| hash.to_ascii_lowercase())
             })
         });
+        if self.clock.unix_seconds() < issued_at || self.clock.unix_seconds() >= expires_at {
+            return Err(AuthError::SessionExpired);
+        }
         Ok(VerifiedLogin {
             profile: MinecraftProfile {
                 uuid,
                 username: profile.name,
+                #[cfg(test)]
                 xuid: xsts.xuid.clone().or(xbox.xuid.clone()),
                 skin_hash,
             },
@@ -638,4 +624,42 @@ struct ProfileResponse {
     name: String,
     #[serde(default)]
     skins: serde_json::Value,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) mod testing {
+    use super::*;
+    pub(in crate::accounts) fn verified(
+        name: &str,
+        uuid: Uuid,
+        refresh: &str,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> Result<VerifiedLogin, AuthError> {
+        let session = MinecraftSession {
+            access_token: SecretString::new("MC_SECRET_SENTINEL".into()),
+            issued_at,
+            expires_at,
+            profile_uuid: uuid,
+            xuid: None,
+        };
+        if !session.valid_persisted()
+            || !(3..=16).contains(&name.len())
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(AuthError::CredentialCorrupt);
+        }
+        Ok(VerifiedLogin {
+            profile: MinecraftProfile {
+                uuid,
+                username: name.to_owned(),
+                #[cfg(test)]
+                xuid: None,
+                skin_hash: None,
+            },
+            refresh_token: SecretString::new(refresh.to_owned()),
+            session,
+            verified_at: issued_at,
+        })
+    }
 }

@@ -18,7 +18,7 @@ impl UserType {
 
 /// The identity a game is launched with. Fields and the Microsoft
 /// constructor are crate-private, so outside this crate one comes only from
-/// the account store; offline ones exist only with the `dev-offline` feature
+/// AccountService (or the temporary legacy store seam); offline ones exist only with the `dev-offline` feature
 /// (and test stand-ins, `test_account`, only with `test-support`).
 #[derive(Clone)]
 pub struct LaunchAccount {
@@ -31,12 +31,8 @@ pub struct LaunchAccount {
 
 impl LaunchAccount {
     /// A signed-in Microsoft account. Crate-private: outside the crate a
-    /// launch identity only comes from the account store, so a release build
+    /// launch identity only comes from AccountService's grant, so a release build
     /// cannot fabricate one with an arbitrary token.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "plan 3 builds MSA accounts from AccountStore")
-    )]
     pub(crate) fn msa(name: &str, uuid: Uuid, access_token: &str, xuid: Option<String>) -> Self {
         LaunchAccount {
             name: name.to_string(),

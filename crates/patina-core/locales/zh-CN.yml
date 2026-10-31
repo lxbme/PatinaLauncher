@@ -16,6 +16,7 @@ errors:
     offline_conflict: "已存在同名离线账号。"
     busy: "另一个账号操作正在进行，请稍后重试。"
     session_expired: "游戏会话已过期，请重新启动游戏。"
+    launch: "无法启动游戏，请检查实例后重试。"
     network: "%{stage}时无法连接，请重试。"
     http: "服务拒绝了%{stage}（HTTP %{status}）。"
     invalid_response: "%{stage}时服务返回了无效响应。"
