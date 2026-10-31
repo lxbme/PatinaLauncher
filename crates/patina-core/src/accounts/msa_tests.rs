@@ -852,6 +852,83 @@ async fn oauth_errors_short_expiry_and_optional_skin() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn profile_skin_metadata_preserves_official_http_and_https_hashes() {
+    let _time = TimeGuard::new();
+    for scheme in ["http", "https"] {
+        let url = format!(
+            "{scheme}://textures.minecraft.net/texture/ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+        );
+        let mut body = profile();
+        body["skins"] = json!([{
+            "id": "fedcba98-7654-3210-fedc-ba9876543210",
+            "state": "ACTIVE",
+            "url": url,
+            "variant": "CLASSIC"
+        }]);
+        let mut script = chain();
+        script[6].1 = ok(body);
+        let (result, requests, _) = run(script).await;
+        let login = result.unwrap();
+        assert_eq!(
+            login.profile().skin_hash(),
+            Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+            "official {scheme} skin metadata lost or not canonicalized"
+        );
+        assert_eq!(login.profile().username(), "Player_123");
+        assert_eq!(requests.len(), 7);
+        assert!(!format!("{login:?}").contains(&url));
+        assert!(!format!("{login:?}").contains("SECRET"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn profile_skin_metadata_ignores_untrusted_urls_without_failing_login() {
+    let _time = TimeGuard::new();
+    let mut urls = vec![
+        "ftp://textures.minecraft.net/texture/abc".to_owned(),
+        "file://textures.minecraft.net/texture/abc".to_owned(),
+        "//textures.minecraft.net/texture/abc".to_owned(),
+        "data:text/plain,abc".to_owned(),
+    ];
+    for scheme in ["http", "https"] {
+        for suffix in [
+            "foreign.invalid/texture/abc",
+            "textures.minecraft.net.foreign.invalid/texture/abc",
+            "user@textures.minecraft.net/texture/abc",
+            "textures.minecraft.net@foreign.invalid/texture/abc",
+            "textures.minecraft.net:80/texture/abc",
+            "textures.minecraft.net:443/texture/abc",
+            "textures.minecraft.net/other/abc",
+            "textures.minecraft.net/texture/abc/extra",
+            "textures.minecraft.net/texture/abc?query=x",
+            "textures.minecraft.net/texture/abc#fragment",
+            "textures.minecraft.net/texture/",
+            "textures.minecraft.net/texture/NOTHEX",
+        ] {
+            urls.push(format!("{scheme}://{suffix}"));
+        }
+    }
+    for url in urls {
+        let mut body = profile();
+        body["skins"] = json!([{
+            "id": "fedcba98-7654-3210-fedc-ba9876543210",
+            "state": "ACTIVE",
+            "url": url,
+            "variant": "CLASSIC"
+        }]);
+        let mut script = chain();
+        script[6].1 = ok(body);
+        let (result, requests, _) = run(script).await;
+        let login = result.unwrap();
+        assert_eq!(login.profile().skin_hash(), None, "accepted {url}");
+        assert_eq!(login.profile().username(), "Player_123");
+        assert_eq!(requests.len(), 7);
+        assert!(!format!("{login:?}").contains(&url));
+        assert!(!format!("{login:?}").contains("SECRET"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn every_stage_bounds_bodies_and_sanitizes_http_failures() {
     let _time = TimeGuard::new();
     for (stage, auth_stage) in STAGES.into_iter().enumerate() {

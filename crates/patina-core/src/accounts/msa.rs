@@ -435,10 +435,12 @@ impl MsaClient {
                 if skin.get("state")?.as_str()? != "ACTIVE" {
                     return None;
                 }
-                let hash = skin
-                    .get("url")?
-                    .as_str()?
-                    .strip_prefix("https://textures.minecraft.net/texture/")?;
+                let url = skin.get("url")?.as_str()?;
+                // Official profiles may use HTTP metadata; retain only the hash.
+                // The skin downloader constructs its own fixed HTTPS request.
+                let hash = url
+                    .strip_prefix("https://textures.minecraft.net/texture/")
+                    .or_else(|| url.strip_prefix("http://textures.minecraft.net/texture/"))?;
                 (!hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
                     .then(|| hash.to_ascii_lowercase())
             })
