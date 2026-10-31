@@ -1,11 +1,16 @@
 //! The main window's root (layout A): title bar, then rail | page, then the
 //! status bar.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
+use futures::future::Either;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{ActiveTheme, IconName, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Subscription, TestSupportExt, Window, actions, div,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Render, Styled, Subscription, TestSupportExt, WeakEntity, Window, actions, div,
 };
 
 use super::placeholder;
@@ -52,6 +57,11 @@ impl RootView {
             this.status_bar.update(cx, |s, cx| s.refresh_now(cx));
         });
         let _launch_events = cx.subscribe_in(&model, window, Self::on_launch_event);
+        let page = instances.downgrade();
+        let closing = Rc::new(Cell::new(false));
+        window.on_window_should_close(cx, move |window, cx| {
+            close_after_saving(&page, &closing, window, cx)
+        });
         Self {
             title_bar: cx.new(|cx| TitleBarView::new(shell.clone(), window, cx)),
             rail: cx.new(|cx| Rail::new(shell.clone(), cx)),
@@ -146,6 +156,42 @@ impl RootView {
                 .into_any_element(),
         }
     }
+}
+
+/// How long closing the window waits for the settings form's save: the
+/// runtime's shutdown budget.
+const CLOSE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Whether the window may close now. With a settings form open, what was
+/// typed into it is saved first (waiting at most [`CLOSE_BUDGET`]), then
+/// the window closes by itself.
+fn close_after_saving(
+    page: &WeakEntity<InstancesPage>,
+    closing: &Rc<Cell<bool>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    if closing.get() {
+        return true;
+    }
+    let form = page
+        .upgrade()
+        .and_then(|page| page.read(cx).detail().read(cx).settings_view().cloned());
+    let Some(form) = form else {
+        return true;
+    };
+    closing.set(true);
+    let saved = form.update(cx, |form, cx| form.flush(window, cx));
+    window
+        .spawn(cx, async move |cx| {
+            let budget = cx.background_executor().timer(CLOSE_BUDGET);
+            if let Either::Right(_) = futures::future::select(Box::pin(saved), budget).await {
+                tracing::warn!("closing before the settings were saved");
+            }
+            cx.update(|window, _| window.remove_window()).ok();
+        })
+        .detach();
+    false
 }
 
 impl Render for RootView {

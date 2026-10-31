@@ -13,6 +13,8 @@ pub enum Phase {
     FetchMetadata,
     DownloadRuntime,
     DownloadAssetIndex,
+    /// Verifying the game's files (client jar, assets) and downloading only
+    /// the missing or damaged ones; on an installed game, mostly checking.
     DownloadGameFiles,
     DownloadInstaller,
     DownloadLibraries,
@@ -29,7 +31,7 @@ impl Phase {
             Phase::FetchMetadata => t!("progress.phase.fetch_metadata"),
             Phase::DownloadRuntime => t!("progress.phase.download_runtime"),
             Phase::DownloadAssetIndex => t!("progress.phase.download_asset_index"),
-            Phase::DownloadGameFiles => t!("progress.phase.download_game_files"),
+            Phase::DownloadGameFiles => t!("progress.phase.check_game_files"),
             Phase::DownloadInstaller => t!("progress.phase.download_installer"),
             Phase::DownloadLibraries => t!("progress.phase.download_libraries"),
             Phase::RunProcessor => t!("progress.phase.run_processor"),
@@ -181,8 +183,12 @@ mod tests {
         let _g = locale_lock();
         set_language(Language::ZhCn);
         assert_eq!(Phase::FetchMetadata.display_name(), "正在获取版本信息");
-        assert_eq!(Phase::DownloadGameFiles.display_name(), "正在下载游戏文件");
+        assert_eq!(Phase::DownloadGameFiles.display_name(), "正在检查游戏文件");
         set_language(Language::En);
+        assert_eq!(
+            Phase::DownloadGameFiles.display_name(),
+            "Checking game files"
+        );
         assert_eq!(Phase::FetchMetadata.display_name(), "Fetching version info");
         assert_eq!(Phase::Launching.display_name(), "Launching game");
         set_language(Language::ZhCn);

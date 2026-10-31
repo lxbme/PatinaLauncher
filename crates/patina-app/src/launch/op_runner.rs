@@ -138,6 +138,7 @@ pub fn busy_message(what: &BusyKind, name_of: impl Fn(&str) -> String) -> String
         BusyKind::Instance(id) => t!("busy.instance", name = name_of(id)).to_string(),
         BusyKind::Version(id) => t!("busy.version", id = id).to_string(),
         BusyKind::Processors(mc) => t!("busy.processors", mc = mc).to_string(),
+        BusyKind::Running(id) => t!("busy.running", name = name_of(id)).to_string(),
     }
 }
 

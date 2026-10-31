@@ -39,7 +39,8 @@ const _: () = assert!(!patina_core::DEV_OFFLINE);
 pub const APP_ID: &str = "patina";
 
 /// Sets up the app-wide state the windows rely on: the settings, the CJK
-/// font, the zoom keys, the shell's keys and the accounts-changed signal. Call once, after
+/// font, the zoom keys, the shell's, instances page's and log's keys and
+/// the accounts-changed signal. Call once, after
 /// `gpui_kit::init` and before [`open_main_window`].
 pub fn init(settings: SettingsStore, cx: &mut App) {
     cx.set_global(settings);
@@ -47,6 +48,7 @@ pub fn init(settings: SettingsStore, cx: &mut App) {
     scale::init(cx);
     shell::init(cx);
     instances::init(cx);
+    launch::log_view::init(cx);
     core_bridge::AccountsChanged::init(cx);
     cx.on_app_quit(|cx| {
         SettingsStore::flush(cx);
@@ -62,12 +64,14 @@ pub(crate) fn style_window(ui_scale: f32, window: &mut Window, cx: &mut App) {
     scale::apply_scale(ui_scale, cx);
 }
 
-/// Opens the main window (1280×800, at least 960×600). Call after [`init`],
-/// with the [`core_bridge::Core`] global set.
-pub fn open_main_window(cx: &mut App) -> gpui_kit::Result<(AnyWindowHandle, Entity<RootView>)> {
+/// The main window's options at `ui_scale`: 1280×800, at least the
+/// scale's [`scale::min_window_size`] (960×600 at 100 %).
+pub fn main_window_options(ui_scale: f32, cx: &App) -> WindowOptions {
     // Window geometry is in logical pixels by the platform's definition; the
-    // content inside is rem-based and follows the UI scale.
-    let options = WindowOptions {
+    // content inside is rem-based and follows the UI scale, so the minimum
+    // grows with it.
+    let min = scale::min_window_size(ui_scale);
+    WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some(t!("app.title").to_string().into()),
             ..Default::default()
@@ -75,15 +79,24 @@ pub fn open_main_window(cx: &mut App) -> gpui_kit::Result<(AnyWindowHandle, Enti
         app_id: Some(APP_ID.into()),
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(1280.), px(800.)),
+            size(px(1280.), px(800.)).max(&min),
             cx,
         ))),
-        window_min_size: Some(size(px(960.), px(600.))),
+        window_min_size: Some(min),
         ..Default::default()
-    };
-    gpui_kit::open_window(options, cx, |window, cx| {
-        let ui_scale = SettingsStore::get(cx).ui_scale;
+    }
+}
+
+/// Opens the main window (see [`main_window_options`]) at the saved UI
+/// scale, lowered to the largest step that fits the display (the saved
+/// setting is kept). Call after [`init`], with the
+/// [`core_bridge::Core`] global set.
+pub fn open_main_window(cx: &mut App) -> gpui_kit::Result<(AnyWindowHandle, Entity<RootView>)> {
+    let ui_scale = scale::startup_scale(SettingsStore::get(cx).ui_scale, cx);
+    let options = main_window_options(ui_scale, cx);
+    gpui_kit::open_window(options, cx, move |window, cx| {
         style_window(ui_scale, window, cx);
+        scale::follow_window(window, cx);
         cx.new(|cx| RootView::new(window, cx))
     })
 }

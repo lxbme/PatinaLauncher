@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::instance::Instance;
+use crate::locks::{Busy, BusyKind};
 
 pub const RUNNING_FILE: &str = "patina-running.json";
 /// Game output log, relative to the instance directory.
@@ -42,6 +43,21 @@ pub fn running_game(inst: &Instance) -> Option<RunningInfo> {
     verified_record(inst).map(|rec| RunningInfo::from(&rec))
 }
 
+/// Refuses (as [`BusyKind::Running`]) while the game of instance `id` in
+/// `dir` runs, so an operation never changes or deletes the files of a
+/// running game, even one no lock guards (left running by a launcher that
+/// quit). Read-only, like [`running_game`].
+pub(crate) fn refuse_while_running(dir: &Path, id: &str) -> Result<(), Busy> {
+    let running = read_record_at(&dir.join(RUNNING_FILE))
+        .is_some_and(|rec| rec.instance_id == id && verify(&rec));
+    if running {
+        return Err(Busy {
+            what: BusyKind::Running(id.to_string()),
+        });
+    }
+    Ok(())
+}
+
 /// The stored record when it names `inst` and [`verify`] accepts it.
 pub(crate) fn verified_record(inst: &Instance) -> Option<RunningRecord> {
     read_record(inst).filter(|rec| rec.instance_id == inst.id && verify(rec))
@@ -70,8 +86,11 @@ pub fn write_record(inst: &Instance, rec: &RunningRecord) -> io::Result<()> {
 
 /// The stored record; `None` when missing or unparseable.
 pub fn read_record(inst: &Instance) -> Option<RunningRecord> {
-    let path = record_path(inst);
-    let bytes = match std::fs::read(&path) {
+    read_record_at(&record_path(inst))
+}
+
+fn read_record_at(path: &Path) -> Option<RunningRecord> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             if e.kind() != io::ErrorKind::NotFound {
@@ -135,6 +154,58 @@ pub fn verify(rec: &RunningRecord) -> bool {
     };
     let marker = format!("{}={}", super::args::INSTANCE_MARKER_PROP, rec.instance_id);
     info.start_time == rec.start_time && info.cmdline.contains(&marker)
+}
+
+/// A stand-in game for tests: a shell carrying instance `id`'s marker, with
+/// its running record in the instance directory, as a game left running by
+/// a launcher that quit (it holds no lock). Dropping it kills the process it
+/// spawned, and only while that pid still is that process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct FakeGame {
+    child: std::process::Child,
+    token: Option<u64>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl FakeGame {
+    pub(crate) fn start(dir: &Path, id: &str) -> FakeGame {
+        use crate::platform::{proc_info, spawn_detached};
+        let marker = format!("{}={id}", super::args::INSTANCE_MARKER_PROP);
+        let child = spawn_detached(
+            &super::LaunchCommand {
+                program: "sh".into(),
+                args: vec!["-c".into(), "sleep 60 & wait".into(), "x".into(), marker],
+                cwd: std::env::temp_dir(),
+            },
+            &dir.join(CURRENT_LOG),
+        )
+        .unwrap();
+        let pid = child.id();
+        let token = proc_info(pid).map(|i| i.start_time);
+        let game = FakeGame { child, token };
+        let rec = RunningRecord {
+            pid,
+            start_time: token.expect("the fake game runs"),
+            instance_id: id.to_string(),
+            started_at: 0,
+            log: CURRENT_LOG.into(),
+        };
+        let data = serde_json::to_vec_pretty(&rec).unwrap();
+        crate::fsutil::write_atomic(&dir.join(RUNNING_FILE), &data).unwrap();
+        game
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for FakeGame {
+    fn drop(&mut self) {
+        use crate::platform::{kill_pid, proc_info};
+        let pid = self.child.id();
+        if self.token.is_some() && proc_info(pid).map(|i| i.start_time) == self.token {
+            let _ = kill_pid(pid);
+        }
+        let _ = self.child.wait();
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

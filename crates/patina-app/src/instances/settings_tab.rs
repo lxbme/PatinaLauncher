@@ -32,7 +32,7 @@ use gpui_kit::component::{ActiveTheme, Disableable, Sizable, WindowExt, h_flex, 
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     App, AppContext, Context, Entity, Focusable, FontWeight, Global, InteractiveElement,
-    IntoElement, ParentElement, PathPromptOptions, Rems, Render, SharedString,
+    IntoElement, ParentElement, PathPromptOptions, Rems, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, div, rems,
 };
 use patina_core::config::JavaSettings;
@@ -50,7 +50,7 @@ use super::model::{Entry, InstancesChanged, InstancesModel};
 use super::{icon_for, instance_icon, overview};
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
-use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY};
+use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY, scroll_y};
 
 /// Widest the form grows.
 const CONTENT_W: Rems = Rems(40.);
@@ -215,6 +215,8 @@ pub struct SettingsForm {
     /// The model or the Java list changed since `render` last followed up.
     stale: bool,
     errors: Errors,
+    /// The form's scroll.
+    scroll: ScrollHandle,
     /// The config the inputs were last set from.
     seen: Option<InstanceConfig>,
     /// The Java the instance's Minecraft version needs, once read.
@@ -314,6 +316,7 @@ impl SettingsForm {
             required_done: false,
             stale: false,
             errors: Errors::default(),
+            scroll: ScrollHandle::new(),
             seen: None,
             required: None,
             required_mc: None,
@@ -371,14 +374,7 @@ impl SettingsForm {
 
     /// Why renaming and deleting are disabled now, or `None`.
     fn busy_reason(&self, cx: &App) -> Option<String> {
-        let model = self.model.read(cx);
-        if model.is_op_running(&self.id) {
-            Some(t!("versions.busy_operation").to_string())
-        } else if model.is_busy(&self.id) {
-            Some(t!("versions.busy_running").to_string())
-        } else {
-            None
-        }
+        self.model.read(cx).busy_reason(&self.id)
     }
 
     // --- following the saved config ----------------------------------------
@@ -1643,11 +1639,9 @@ impl Render for SettingsForm {
         };
         let busy = self.busy_reason(cx);
         let neoforge = matches!(instance.config.loader(), Some((LoaderKind::Neoforge, _)));
-        div()
+        let content = div()
             .id("settings-tab")
             .test_support()
-            .size_full()
-            .overflow_y_scroll()
             .text_size(TEXT_PRIMARY)
             .child(
                 v_flex()
@@ -1659,7 +1653,7 @@ impl Render for SettingsForm {
                     .child(self.render_window(&instance.config, cx))
                     .when(neoforge, |d| d.child(self.render_neoforge(cx)))
                     .child(self.render_danger(busy.as_ref(), cx)),
-            )
-            .into_any_element()
+            );
+        scroll_y(content, &self.scroll).into_any_element()
     }
 }

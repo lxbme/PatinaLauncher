@@ -2,10 +2,12 @@
 //! downloads, real loader installs, real Minecraft), driven through the same
 //! headless window API as `tests/ui.rs`. Nothing here is faked.
 //!
-//! Every test is `#[ignore]`d: they need the network, a real Java, minutes
-//! of time, and `PATINA_DATA_DIR` set to a disposable data dir that has
+//! The suite builds only with the `e2e` feature (which brings
+//! `dev-offline` and `test-support`), and every test is `#[ignore]`d on top:
+//! they need the network, a real Java, minutes of time, and
+//! `PATINA_DATA_DIR` set to a disposable data dir that has
 //!
-//! - an offline account (so build with `dev-offline`),
+//! - an offline account (`e2e` builds with `dev-offline`),
 //! - the instance `forge-1201` with its game files (the launch tests start
 //!   it; a real Minecraft window opens),
 //! - the `patina-dev` binary built next to this test (`cargo build -p
@@ -14,7 +16,7 @@
 //! Run them one at a time, in name order:
 //!
 //! ```text
-//! PATINA_DATA_DIR=… cargo test -p patina-app --features test-support,dev-offline \
+//! PATINA_DATA_DIR=… cargo test -p patina-app --features e2e \
 //!     --test e2e_real -- --ignored --test-threads=1 --nocapture <name>
 //! ```
 //!

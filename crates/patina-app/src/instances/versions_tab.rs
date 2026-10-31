@@ -216,7 +216,7 @@ impl VersionsTab {
 
     /// Why the changes are disabled, or `None` when they are not.
     fn busy_reason(&self, cx: &App) -> Option<String> {
-        busy_reason(self.model.read(cx), &self.id)
+        self.model.read(cx).busy_reason(&self.id)
     }
 
     fn tag(id: &'static str, text: String, primary: bool) -> gpui_kit::AnyElement {
@@ -554,18 +554,6 @@ enum Changed {
     },
 }
 
-/// Why instance `id` takes no change now: an operation is in flight, or
-/// its game runs.
-fn busy_reason(model: &InstancesModel, id: &str) -> Option<String> {
-    if model.is_op_running(id) {
-        Some(t!("versions.busy_operation").to_string())
-    } else if model.is_busy(id) {
-        Some(t!("versions.busy_running").to_string())
-    } else {
-        None
-    }
-}
-
 /// Shows `text` as a warning once the model is not being updated.
 fn warn_later(texts: Vec<String>, cx: &mut Context<InstancesModel>) {
     cx.spawn(async move |_, cx| {
@@ -610,8 +598,9 @@ fn start(
     );
     if !started {
         let name = model.display_name(id).unwrap_or_else(|| id.to_string());
-        let reason =
-            busy_reason(model, id).unwrap_or_else(|| t!("versions.busy_operation").to_string());
+        let reason = model
+            .busy_reason(id)
+            .unwrap_or_else(|| t!("versions.busy_operation").to_string());
         warn_later(
             vec![t!("versions.refused", name = name, reason = reason).to_string()],
             cx,

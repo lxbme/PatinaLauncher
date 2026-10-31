@@ -25,8 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext, Context, ElementId, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Rems, Render, Styled, Subscription, Window,
-    actions, div, rems,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Rems, Render, Styled, Subscription,
+    Window, actions, div, rems,
 };
 use patina_core::instance::InstanceConfig;
 use rust_i18n::t;
@@ -40,7 +40,7 @@ pub use add_dialog::{
     AddInstanceForm, FormChanged, NewInstance, create_instance, default_name,
     open as open_add_instance_dialog,
 };
-pub use detail::{DetailTab, DetailView};
+pub use detail::{DetailTab, DetailView, NextTab, PrevTab};
 pub use icon::{
     BUILTIN_ICONS, IconChoice, IconSource, asset_bytes, forget_cached_image, icon_for,
     instance_icon, save_icon, tint_for,
@@ -78,8 +78,15 @@ pub(crate) const HEADER_ICON: Rems = Rems(4.);
 pub(crate) const HEADER_TITLE: Rems = Rems(1.375);
 
 /// Binds the instances page's keys: Up / Down move the selection while the
-/// instance list has the keyboard.
+/// instance list has the keyboard; Ctrl+Tab / Ctrl+Shift+Tab and Ctrl+Page
+/// Down / Up switch the detail's tabs anywhere on the page.
 pub fn init(cx: &mut gpui_kit::App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-tab", NextTab, Some(INSTANCES_CONTEXT)),
+        KeyBinding::new("ctrl-pagedown", NextTab, Some(INSTANCES_CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, Some(INSTANCES_CONTEXT)),
+        KeyBinding::new("ctrl-pageup", PrevTab, Some(INSTANCES_CONTEXT)),
+    ]);
     list::init(cx);
     icon_picker::init(cx);
     version_picker::init(cx);
@@ -119,7 +126,7 @@ impl InstancesPage {
         );
         Self {
             list: cx.new(|cx| InstanceList::new(model.clone(), focus.clone(), cx)),
-            detail: cx.new(|cx| DetailView::new(model.clone(), cx)),
+            detail: cx.new(|cx| DetailView::new(model.clone(), focus.clone(), cx)),
             model,
             focus,
             _observe,
@@ -137,6 +144,17 @@ impl InstancesPage {
 
     pub fn detail(&self) -> &Entity<DetailView> {
         &self.detail
+    }
+
+    /// Switches the detail's tab, when a healthy instance shows one.
+    fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.model.read(cx).selected_entry(),
+            Some(Entry::Healthy(_))
+        ) {
+            self.detail
+                .update(cx, |d, cx| d.step_tab(delta, window, cx));
+        }
     }
 
     /// Opens the add-instance dialog.
@@ -169,6 +187,8 @@ impl Render for InstancesPage {
             .key_context(INSTANCES_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::add_instance))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.step_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.step_tab(-1, window, cx)))
             .size_full()
             // Full-height columns.
             .items_stretch()

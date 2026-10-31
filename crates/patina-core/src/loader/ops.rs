@@ -1,5 +1,9 @@
 //! Instance-level loader operations: install, change version, change kind,
 //! remove, and changing the Minecraft version of an instance with a loader.
+//!
+//! Every operation takes the instance lock and refuses with
+//! [`BusyKind::Running`](crate::locks::BusyKind::Running) while the
+//! instance's game runs, so a running game's version is never changed.
 
 use std::fmt;
 
@@ -12,6 +16,7 @@ use super::forge::{
 use super::list::{InstallerProblem, LoaderError, LoaderVersion, VersionPick, list_versions};
 use super::{InstalledProfile, LoaderKind};
 use crate::instance::{Component, ComponentUid, Instance, InstanceStore};
+use crate::launch::running::refuse_while_running;
 use crate::meta::VersionJson;
 use crate::prepare::{Launcher, PrepareError};
 use crate::progress::{Phase, ProgressSink, Unit, report};
@@ -67,6 +72,7 @@ pub async fn install_loader(
 ) -> Result<OpOutcome, LoaderError> {
     let _lock = store.lock(id)?;
     let inst = store.load(id)?;
+    refuse_while_running(&inst.dir, &inst.id)?;
     let previous = inst.config.loader().map(|(k, c)| (k, c.version.clone()));
     if let Some((existing, existing_version)) = &previous
         && *existing != kind
@@ -119,6 +125,7 @@ pub async fn reinstall_loader(
 ) -> Result<OpOutcome, LoaderError> {
     let _lock = store.lock(id)?;
     let inst = store.load(id)?;
+    refuse_while_running(&inst.dir, &inst.id)?;
     let (kind, current) = inst.config.loader().ok_or(LoaderError::NoLoader)?;
     let pick = VersionPick::Exact(current.version.clone());
     tracing::info!(instance = %id, loader = ?kind, version = %current.version, "reinstalling loader");
@@ -147,6 +154,7 @@ pub async fn reinstall_loader(
 pub fn remove_loader(store: &InstanceStore, id: &str) -> Result<OpOutcome, LoaderError> {
     let _lock = store.lock(id)?;
     let inst = store.load(id)?;
+    refuse_while_running(&inst.dir, &inst.id)?;
     let mut config = inst.config;
     config.set_loader(None)?;
     Ok(OpOutcome {
@@ -180,6 +188,7 @@ pub async fn set_mc_version(
 ) -> Result<OpOutcome, LoaderError> {
     let _lock = store.lock(id)?;
     let inst = store.load(id)?;
+    refuse_while_running(&inst.dir, &inst.id)?;
     check_mc(mc)?;
     if inst.config.mc_version() == mc {
         return Ok(OpOutcome {
@@ -953,6 +962,35 @@ mod tests {
         env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
             .await
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ops_refuse_while_the_game_runs() {
+        use crate::launch::running::FakeGame;
+        use crate::locks::BusyKind;
+        let env = Env::new().await;
+        let id = env.store.create("running-op", "1.20.1").unwrap().id;
+        env.install(&id, LoaderKind::Fabric, exact("0.16.10"), false)
+            .await
+            .unwrap();
+        let before = env.load(&id);
+        let requests = env.requests().await;
+        let game = FakeGame::start(&before.dir, &id);
+        let running = |r: Result<OpOutcome, LoaderError>| matches!(&r, Err(LoaderError::Busy(b)) if b.what == BusyKind::Running(id.clone()));
+        assert!(running(
+            env.install(&id, LoaderKind::Fabric, exact("0.16.9"), false)
+                .await
+        ));
+        assert!(running(
+            reinstall_loader(&env.launcher, &env.store, &id, None).await
+        ));
+        assert!(running(env.set_mc(&id, "1.21.1", None).await));
+        assert!(running(remove_loader(&env.store, &id)));
+        assert_eq!(env.load(&id), before, "nothing changed");
+        assert_eq!(env.requests().await, requests, "nothing fetched");
+        drop(game);
+        remove_loader(&env.store, &id).unwrap();
     }
 
     #[tokio::test]

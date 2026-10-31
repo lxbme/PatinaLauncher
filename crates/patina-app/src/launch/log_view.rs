@@ -5,13 +5,19 @@
 //! Each instance has one `Entity<LogBuffer>` in the [`InstancesModel`]. The
 //! buffer notifies only its observers, i.e. the log view, once per batch:
 //! the instance list and the header are not re-rendered by log output.
+//!
+//! The list scrolls with the wheel, its scrollbar, and Page Up / Page Down /
+//! Home / End while it has the keyboard; however it got there, "Auto-scroll"
+//! follows whether the end of the log is in view.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::scroll::{ScrollableElement as _, ScrollbarHandle};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, VirtualListScrollHandle, h_flex, v_flex,
@@ -19,9 +25,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, ClipboardItem, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels,
-    Rems, Render, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task,
-    TestSupportExt, WeakEntity, Window, div, rems, size,
+    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, ParentElement, Pixels, Point, Rems, Render, ScrollStrategy,
+    SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt,
+    WeakEntity, Window, actions, div, point, rems, size,
 };
 use patina_core::launch::running::CURRENT_LOG;
 use patina_core::launch::{LogLevel, LogLine};
@@ -45,6 +52,71 @@ const BOTTOM_SLACK: Rems = Rems(0.5);
 
 /// Row sizes keyed by (row count, row height).
 type RowSizes = ((usize, Pixels), Rc<Vec<Size<Pixels>>>);
+
+/// Key context of the log list while it has the keyboard.
+const LOG_CONTEXT: &str = "LogView";
+
+actions!(
+    patina,
+    [
+        /// Scrolls the log up by a page.
+        LogPageUp,
+        /// Scrolls the log down by a page.
+        LogPageDown,
+        /// Scrolls to the log's first line.
+        LogTop,
+        /// Scrolls to the log's last line.
+        LogBottom
+    ]
+);
+
+/// Binds the log list's scrolling keys.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("pageup", LogPageUp, Some(LOG_CONTEXT)),
+        KeyBinding::new("pagedown", LogPageDown, Some(LOG_CONTEXT)),
+        KeyBinding::new("home", LogTop, Some(LOG_CONTEXT)),
+        KeyBinding::new("end", LogBottom, Some(LOG_CONTEXT)),
+    ]);
+}
+
+/// The log list's scroll handle as its scrollbar sees it: it records that
+/// the scrollbar moved the list (a drag or a click on the track), so the
+/// view can re-read whether the end is in view. The scrollbar re-renders
+/// the view after every move.
+#[derive(Clone)]
+struct ScrollbarMoves {
+    list: VirtualListScrollHandle,
+    moved: Rc<Cell<bool>>,
+}
+
+impl ScrollbarHandle for ScrollbarMoves {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.list.viewport_bounds()
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        ScrollbarHandle::offset(&self.list)
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        ScrollbarHandle::set_offset(&self.list, offset);
+        self.moved.set(true);
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        self.list.content_size()
+    }
+
+    fn start_drag(&self) {
+        self.list.start_drag();
+    }
+
+    fn end_drag(&self) {
+        self.list.end_drag();
+        self.moved.set(true);
+    }
+}
 
 /// The newest [`LOG_VIEW_MAX_LINES`] lines of one instance's output.
 #[derive(Debug, Default)]
@@ -199,6 +271,10 @@ pub struct LogView {
     visible: Option<Rc<Vec<usize>>>,
     autoscroll: bool,
     scroll: VirtualListScrollHandle,
+    /// [`Self::scroll`] for the scrollbar.
+    scrollbar: ScrollbarMoves,
+    /// The list's keyboard focus (a Tab stop; a click on the list takes it).
+    focus: FocusHandle,
     /// Row sizes, reused while the count and the rem size stay the same.
     sizes: Option<RowSizes>,
     _observe: [Subscription; 2],
@@ -212,6 +288,7 @@ impl LogView {
         });
         // The crash-log banner comes from the model.
         let observe_model = cx.observe(&model, |_, _, cx| cx.notify());
+        let scroll = VirtualListScrollHandle::new();
         Self {
             model,
             id,
@@ -219,7 +296,12 @@ impl LogView {
             filter: LevelFilter::All,
             visible: None,
             autoscroll: true,
-            scroll: VirtualListScrollHandle::new(),
+            scrollbar: ScrollbarMoves {
+                list: scroll.clone(),
+                moved: Rc::default(),
+            },
+            scroll,
+            focus: cx.focus_handle().tab_stop(true),
             sizes: None,
             _observe: [observe_buffer, observe_model],
         }
@@ -255,9 +337,18 @@ impl LogView {
     pub fn set_autoscroll(&mut self, on: bool, cx: &mut Context<Self>) {
         self.autoscroll = on;
         if on {
-            self.scroll.scroll_to_bottom();
+            self.scroll_to_end(cx);
         }
         cx.notify();
+    }
+
+    /// Scrolls to the last row on show. (The handle's own `scroll_to_bottom`
+    /// takes the row count of the last frame, so after new lines it would
+    /// stop one batch short.)
+    fn scroll_to_end(&self, cx: &App) {
+        if let Some(last) = self.visible_len(cx).checked_sub(1) {
+            self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
+        }
     }
 
     /// Copies the whole buffer, whatever the filter.
@@ -272,7 +363,7 @@ impl LogView {
             filter => Some(Rc::new(visible_rows(self.buffer.read(cx), filter))),
         };
         if self.autoscroll {
-            self.scroll.scroll_to_bottom();
+            self.scroll_to_end(cx);
         }
         cx.notify();
     }
@@ -289,19 +380,62 @@ impl LogView {
         Some(logs.unwrap_or_else(|| instance.dir.clone()))
     }
 
-    /// After the user scrolled with the wheel: autoscroll follows whether the list ends in
-    /// view.
-    // Limitation: the list draws no scrollbar and has no keyboard scrolling,
-    // so the wheel is the only way to scroll it; the Auto-scroll switch
-    // covers the rest.
+    /// After the user scrolled (wheel, scrollbar, keys): autoscroll follows
+    /// whether the list ends in view.
     fn follow_scroll(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let (offset, max) = (self.scroll.offset(), self.scroll.max_offset());
-        let slack = BOTTOM_SLACK.to_pixels(window.rem_size());
-        let at_bottom = -offset.y >= max.y - slack;
+        let at_bottom = self.at_bottom(window);
         if at_bottom != self.autoscroll {
             self.autoscroll = at_bottom;
             cx.notify();
         }
+    }
+
+    /// Whether the end of the list is in view.
+    fn at_bottom(&self, window: &Window) -> bool {
+        let (offset, max) = (self.scroll.offset(), self.scroll.max_offset());
+        let slack = BOTTOM_SLACK.to_pixels(window.rem_size());
+        -offset.y >= max.y - slack
+    }
+
+    /// Scrolls the list so `top` (pixels from the start, clamped) is at the
+    /// top of the view.
+    fn scroll_to(&mut self, top: Pixels, window: &Window, cx: &mut Context<Self>) {
+        let max = self.scroll.max_offset().y;
+        let top = top.clamp(Pixels::ZERO, max.max(Pixels::ZERO));
+        let x = self.scroll.offset().x;
+        self.scroll.set_offset(point(x, -top));
+        self.follow_scroll(window, cx);
+        cx.notify();
+    }
+
+    /// One page: the view's height less a row, so a line stays in sight.
+    fn page(&self, window: &Window) -> Pixels {
+        let row = ROW_H.to_pixels(window.rem_size());
+        (self.scroll.bounds().size.height - row).max(row)
+    }
+
+    fn page_up(&mut self, _: &LogPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        let top = -self.scroll.offset().y - self.page(window);
+        self.scroll_to(top, window, cx);
+    }
+
+    fn page_down(&mut self, _: &LogPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        let top = -self.scroll.offset().y + self.page(window);
+        self.scroll_to(top, window, cx);
+    }
+
+    fn scroll_top(&mut self, _: &LogTop, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_to(Pixels::ZERO, window, cx);
+    }
+
+    fn scroll_bottom(&mut self, _: &LogBottom, _: &mut Window, cx: &mut Context<Self>) {
+        // Follows new lines from here, as at the bottom by any other way.
+        self.set_autoscroll(true, cx);
+    }
+
+    /// The list's focus handle (tests and Tab order).
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -421,6 +555,11 @@ impl Render for LogView {
             }
         };
         let crash = self.model.read(cx).crash_log(&self.id).map(Path::to_owned);
+        // The scrollbar moved the list since the last frame.
+        if self.scrollbar.moved.take() {
+            self.autoscroll = self.at_bottom(window);
+        }
+        let ring = theme.ring;
         let this = cx.weak_entity();
         v_flex()
             .id("log-view")
@@ -454,9 +593,26 @@ impl Render for LogView {
             .child(
                 div()
                     .id("log-lines")
+                    // Before `track_focus`, so tests see the focus.
                     .test_support()
+                    .key_context(LOG_CONTEXT)
+                    .track_focus(&self.focus)
+                    .on_action(cx.listener(Self::page_up))
+                    .on_action(cx.listener(Self::page_down))
+                    .on_action(cx.listener(Self::scroll_top))
+                    .on_action(cx.listener(Self::scroll_bottom))
+                    .on_mouse_down(MouseButton::Left, {
+                        let focus = self.focus.clone();
+                        move |_, window, cx| focus.focus(window, cx)
+                    })
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    // A 1px hairline that shows only while the keyboard is
+                    // here.
+                    .border_1()
+                    .border_color(gpui_kit::transparent_black())
+                    .focus_visible(move |s| s.border_color(ring))
                     .font_family(mono)
                     .text_size(TEXT_SECONDARY)
                     // The list handles the wheel first; then this sees where
@@ -500,7 +656,8 @@ impl Render for LogView {
                         )
                         .track_scroll(&self.scroll)
                         .size_full(),
-                    ),
+                    )
+                    .vertical_scrollbar(&self.scrollbar),
             )
     }
 }

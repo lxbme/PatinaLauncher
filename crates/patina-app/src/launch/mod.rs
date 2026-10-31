@@ -15,8 +15,8 @@ pub mod session;
 pub mod stop_dialog;
 
 pub use log_view::{
-    LOG_VIEW_MAX_BYTES, LOG_VIEW_MAX_LINES, LevelFilter, LogBuffer, LogView, forward_logs,
-    visible_rows,
+    LOG_VIEW_MAX_BYTES, LOG_VIEW_MAX_LINES, LevelFilter, LogBottom, LogBuffer, LogPageDown,
+    LogPageUp, LogTop, LogView, forward_logs, visible_rows,
 };
 pub use op_runner::{OpError, OpFix, OpKind, OpState, RetryAction, busy_message};
 pub use progress::{ProgressTracker, ProgressView, view_of};

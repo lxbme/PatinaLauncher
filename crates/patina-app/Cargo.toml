@@ -15,6 +15,9 @@ dev-offline = ["patina-core/dev-offline"]
 # Test doubles (`core_bridge::testing`) for this crate's integration tests.
 # Never enabled by a release build.
 test-support = []
+# Builds the real end-to-end suite (`tests/e2e_real.rs`, network and a real
+# Minecraft), so a plain `cargo test -- --ignored` cannot run it by accident.
+e2e = ["dev-offline", "test-support"]
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
@@ -47,3 +50,8 @@ tempfile = "3.27.0"
 [[bin]]
 name = "patina"
 path = "src/main.rs"
+
+[[test]]
+name = "e2e_real"
+path = "tests/e2e_real.rs"
+required-features = ["e2e"]

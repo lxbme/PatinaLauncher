@@ -52,6 +52,10 @@ pub enum BusyKind {
     Version(String),
     /// Forge/NeoForge processors for this Minecraft version are running.
     Processors(String),
+    /// The game of this instance runs (one this process may hold no session
+    /// or lock for, such as a game left running by a launcher that quit), so
+    /// its files must not change.
+    Running(String),
 }
 
 /// A lock could not be taken because someone else holds it.
@@ -60,6 +64,7 @@ pub enum BusyKind {
     BusyKind::Instance(id) => rust_i18n::t!("errors.locks.instance_busy", id = id),
     BusyKind::Version(id) => rust_i18n::t!("errors.locks.version_busy", id = id),
     BusyKind::Processors(mc) => rust_i18n::t!("errors.locks.processors_busy", mc = mc),
+    BusyKind::Running(id) => rust_i18n::t!("errors.session.already_running", id = id),
 })]
 pub struct Busy {
     pub what: BusyKind,

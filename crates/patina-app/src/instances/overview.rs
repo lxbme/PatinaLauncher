@@ -6,8 +6,8 @@ use std::path::Path;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, Div, InteractiveElement, IntoElement, ParentElement, Rems, SharedString,
-    StatefulInteractiveElement, Styled, TestSupportExt, div, rems,
+    AnyElement, App, Div, InteractiveElement, IntoElement, ParentElement, Rems, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, TestSupportExt, div, rems,
 };
 use patina_core::content::mods::list_mod_files;
 use patina_core::fsutil::{is_safe_name, safe_join};
@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use super::{date, loader_full, now_secs, time_ago};
 use crate::disk_usage::{Walk, format_size};
-use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
+use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY, scroll_y};
 
 /// Readable measure of the overview's content; the dividers run full width.
 const CONTENT_MAX_W: Rems = Rems(44.);
@@ -50,19 +50,28 @@ impl OverviewStats {
         Self::compute_with(instance, versions, MAX_WALK_ENTRIES)
     }
 
-    fn compute_with(instance: &Instance, versions: &Path, budget: usize) -> Self {
+    /// The quick fields of `instance` again (mods, worlds, Java) with the
+    /// size of `previous`: no walk of the whole directory. Blocking.
+    pub fn recount(instance: &Instance, versions: &Path, previous: &OverviewStats) -> Self {
         let game = instance.game_dir();
-        let mods = list_mod_files(&game.join("mods")).map(|m| m.len());
-        let worlds = count_dirs(&game.join("saves"));
-        let mut walk = Walk::new(budget);
-        let size_complete = walk.add_tree(&instance.dir);
         Self {
-            mods: mods.ok(),
-            worlds: worlds.ok(),
-            size: walk.bytes(),
-            size_complete,
+            mods: list_mod_files(&game.join("mods")).map(|m| m.len()).ok(),
+            worlds: count_dirs(&game.join("saves")).ok(),
+            size: previous.size,
+            size_complete: previous.size_complete,
             java: required_java(versions, instance.config.mc_version()),
         }
+    }
+
+    fn compute_with(instance: &Instance, versions: &Path, budget: usize) -> Self {
+        let mut walk = Walk::new(budget);
+        let size_complete = walk.add_tree(&instance.dir);
+        let sized = Self {
+            size: walk.bytes(),
+            size_complete,
+            ..Self::default()
+        };
+        Self::recount(instance, versions, &sized)
     }
 }
 
@@ -143,7 +152,12 @@ fn grid(pairs: Vec<Div>) -> Div {
 }
 
 /// The tab's content for `instance`, with `stats` once they are read.
-pub fn render(instance: &Instance, stats: Option<&OverviewStats>, cx: &App) -> AnyElement {
+pub fn render(
+    instance: &Instance,
+    stats: Option<&OverviewStats>,
+    scroll: &ScrollHandle,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let config = &instance.config;
     let pending = || "—".to_string();
@@ -205,10 +219,8 @@ pub fn render(instance: &Instance, stats: Option<&OverviewStats>, cx: &App) -> A
         ),
     ];
     let dir = instance.dir.clone();
-    v_flex()
+    let content = v_flex()
         .id("overview")
-        .size_full()
-        .overflow_y_scroll()
         .child(
             div()
                 .w_full()
@@ -228,8 +240,8 @@ pub fn render(instance: &Instance, stats: Option<&OverviewStats>, cx: &App) -> A
                     .label(t!("instances.overview.open_folder").to_string())
                     .on_click(move |_, _, cx| cx.open_with_system(&dir)),
             ),
-        )
-        .into_any_element()
+        );
+    scroll_y(content, scroll).into_any_element()
 }
 
 #[cfg(test)]
@@ -272,6 +284,16 @@ mod tests {
 
         let cut = OverviewStats::compute_with(&inst, &versions, 3);
         assert!(!cut.size_complete);
+
+        // A recount keeps the size and counts again.
+        let before = OverviewStats::compute(&inst, &versions);
+        std::fs::write(game.join("mods/c.jar"), [0u8; 4096]).unwrap();
+        let recounted = OverviewStats::recount(&inst, &versions, &before);
+        assert_eq!(recounted.mods, Some(3));
+        assert_eq!(
+            (recounted.size, recounted.size_complete),
+            (before.size, true)
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 //! Java · 上次游玩", the operation or run status, 启动 / 强制关闭…), the
 //! tab strip with its teal underline, then the tab's content.
 
+use std::time::{Duration, Instant};
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{Tab as TabElement, Tabs};
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
@@ -9,9 +11,9 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Rems, Render, ScrollHandle, StatefulInteractiveElement, Styled, Subscription,
-    Task, TestSupportExt, Window, div, px, rems,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Rems, Render, ScrollHandle, StatefulInteractiveElement, Styled,
+    Subscription, Task, TestSupportExt, Window, actions, div, px, rems,
 };
 use patina_core::instance::Instance;
 use rust_i18n::t;
@@ -32,6 +34,16 @@ use crate::shell::placeholder;
 use crate::theme::ProductColors;
 
 const TABS_H: Rems = Rems(2.25);
+
+actions!(
+    patina,
+    [
+        /// Shows the detail's next tab, after the last the first.
+        NextTab,
+        /// Shows the detail's previous tab, before the first the last.
+        PrevTab
+    ]
+);
 
 /// A tab of the detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +99,13 @@ impl DetailTab {
         }
     }
 
+    /// The tab `delta` places after this one, wrapping around.
+    pub fn step(self, delta: isize) -> DetailTab {
+        let count = Self::ALL.len() as isize;
+        let ix = Self::ALL.iter().position(|t| *t == self).unwrap_or(0) as isize;
+        Self::ALL[(ix + delta).rem_euclid(count) as usize]
+    }
+
     fn icon(self) -> Icon {
         match self {
             DetailTab::Overview => Icon::new(IconName::LayoutDashboard),
@@ -112,11 +131,29 @@ struct StatsState {
     java: Option<u32>,
     /// The model generation they were started for.
     generation: u64,
+    /// The model's count of this app's operations on `id` they were
+    /// started for.
+    op_changes: u64,
+    /// When the last full walk of `id`'s directory started.
+    walked_at: Option<Instant>,
     /// A read is running for `id`.
     reading: bool,
     /// The list changed while reading; read again afterwards.
     again: bool,
+    /// ... and walk the directory then.
+    walk_again: bool,
     revision: Revision,
+}
+
+/// How long the overview's size stands before a refresh walks the
+/// directory again; a selection change or one of this app's operations on
+/// the instance walks it at once.
+const REWALK_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether a refresh at `now` walks the directory again, the last walk
+/// having started at `walked_at`.
+fn walk_due(walked_at: Option<Instant>, now: Instant) -> bool {
+    walked_at.is_none_or(|t| now.duration_since(t) >= REWALK_AFTER)
 }
 
 /// The detail of the selected healthy instance (an entity). Owns the tab
@@ -137,11 +174,24 @@ pub struct DetailView {
     /// The tab strip's scroll: English labels need more than the narrowest
     /// detail pane, so the strip scrolls rather than cutting tabs off.
     tabs_scroll: ScrollHandle,
+    /// The overview's scroll.
+    overview_scroll: ScrollHandle,
+    /// The instances page's focus, where the keyboard goes when the tab it
+    /// was in goes away.
+    page_focus: FocusHandle,
+    /// The tab content's region, to tell whether the keyboard is in it.
+    body_focus: FocusHandle,
     _observe: Subscription,
 }
 
 impl DetailView {
-    pub fn new(model: Entity<InstancesModel>, cx: &mut Context<Self>) -> Self {
+    /// The detail of `model`'s selection; `page_focus` is the instances
+    /// page's focus (see [`Self::set_tab_in`]).
+    pub fn new(
+        model: Entity<InstancesModel>,
+        page_focus: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let _observe = cx.observe(&model, |this, _, cx| this.sync_stats(cx));
         let mut this = Self {
             model,
@@ -152,6 +202,9 @@ impl DetailView {
             versions: None,
             settings: None,
             tabs_scroll: ScrollHandle::new(),
+            overview_scroll: ScrollHandle::new(),
+            page_focus,
+            body_focus: cx.focus_handle(),
             _observe,
         };
         this.sync_stats(cx);
@@ -179,11 +232,25 @@ impl DetailView {
     }
 
     /// Switches to `tab`, saving what was typed in the settings form first.
+    /// The keyboard moves to the instances page when it was in the tab
+    /// left behind or outside the page, so the tab keys keep working.
     pub fn set_tab_in(&mut self, tab: DetailTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(form) = self.settings.clone() {
             form.update(cx, |form, cx| drop(form.flush(window, cx)));
         }
+        if self.tab != tab
+            && (self.body_focus.contains_focused(window, cx)
+                || !self.page_focus.contains_focused(window, cx))
+        {
+            self.page_focus.focus(window, cx);
+        }
         self.set_tab(tab, cx);
+    }
+
+    /// Shows the tab `delta` places from the current one (wrapping), as a
+    /// click on it would ([`Self::set_tab_in`]).
+    pub fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_tab_in(self.tab.step(delta), window, cx);
     }
 
     pub fn set_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
@@ -281,13 +348,20 @@ impl DetailView {
             return;
         };
         let generation = model.generation();
+        let op_changes = model.op_changes(&instance.id);
         let same = self.stats.id.as_deref() == Some(instance.id.as_str());
-        if same && self.stats.generation == generation {
+        if same && self.stats.generation == generation && self.stats.op_changes == op_changes {
             cx.notify();
             return;
         }
+        // The counts are cheap and follow every refresh; the size needs a
+        // walk of the whole directory, so only when it may have changed.
+        let walk = !same
+            || op_changes != self.stats.op_changes
+            || walk_due(self.stats.walked_at, Instant::now());
         if same && self.stats.reading {
             self.stats.again = true;
+            self.stats.walk_again |= walk;
             return;
         }
         let instance = instance.clone();
@@ -295,23 +369,35 @@ impl DetailView {
             self.stats.id = Some(instance.id.clone());
             self.stats.stats = None;
             self.stats.java = None;
+            self.stats.walked_at = None;
         }
         self.stats.generation = generation;
-        self.read_stats(instance, cx);
+        self.stats.op_changes = op_changes;
+        let walk = walk || std::mem::take(&mut self.stats.walk_again);
+        self.read_stats(instance, walk, cx);
         cx.notify();
     }
 
-    fn read_stats(&mut self, instance: Instance, cx: &mut Context<Self>) {
+    /// Reads the stats of `instance`: everything with `walk`, else only the
+    /// counts (keeping the size, unless there is none yet).
+    fn read_stats(&mut self, instance: Instance, walk: bool, cx: &mut Context<Self>) {
         let request = self.stats.revision.start();
         self.stats.reading = true;
         self.stats.again = false;
+        let previous = if walk { None } else { self.stats.stats.clone() };
+        if previous.is_none() {
+            self.stats.walked_at = Some(Instant::now());
+        }
         let versions = Core::global(cx).data.versions();
         // The Java version is one small file: read it first, on its own.
         let quick = {
             let (versions, mc) = (versions.clone(), instance.config.mc_version().to_string());
             run_blocking(cx, move || overview::required_java(&versions, &mc))
         };
-        let job = run_blocking(cx, move || OverviewStats::compute(&instance, &versions));
+        let job = run_blocking(cx, move || match previous {
+            Some(previous) => OverviewStats::recount(&instance, &versions, &previous),
+            None => OverviewStats::compute(&instance, &versions),
+        });
         self.stats_task = cx.spawn(async move |this, cx| {
             if let Ok(java) = quick.await {
                 this.update(cx, |this, cx| {
@@ -735,7 +821,12 @@ impl DetailView {
                 .size_full()
                 .children(self.settings.clone())
                 .into_any_element(),
-            DetailTab::Overview => overview::render(instance, self.stats(&instance.id), cx),
+            DetailTab::Overview => overview::render(
+                instance,
+                self.stats(&instance.id),
+                &self.overview_scroll,
+                cx,
+            ),
             tab => placeholder::page(tab.icon(), tab.label()).into_any_element(),
         }
     }
@@ -764,10 +855,25 @@ impl Render for DetailView {
             .child(self.render_tabs(&instance, cx))
             .child(
                 div()
+                    .track_focus(&self.body_focus)
                     .flex_1()
                     .min_h_0()
                     .child(self.render_body(&instance, cx)),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_size_is_walked_again_after_a_minute() {
+        let start = Instant::now();
+        assert!(walk_due(None, start), "never walked");
+        assert!(!walk_due(Some(start), start));
+        assert!(!walk_due(Some(start), start + Duration::from_secs(59)));
+        assert!(walk_due(Some(start), start + REWALK_AFTER));
     }
 }

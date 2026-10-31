@@ -16,6 +16,7 @@ use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonGroup};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
@@ -615,8 +616,10 @@ impl Render for VersionPicker {
                         .track_focus(&self.focus)
                         .on_action(cx.listener(|this, _: &ChoosePrev, _, cx| this.step(-1, cx)))
                         .on_action(cx.listener(|this, _: &ChooseNext, _, cx| this.step(1, cx)))
+                        .relative()
                         .size_full()
-                        .child(self.render_list(window, cx)),
+                        .child(self.render_list(window, cx))
+                        .vertical_scrollbar(&self.scroll),
                 ),
             )
     }
@@ -1014,8 +1017,10 @@ impl Render for LoaderPicker {
                             .track_focus(&self.focus)
                             .on_action(cx.listener(|this, _: &ChoosePrev, _, cx| this.step(-1, cx)))
                             .on_action(cx.listener(|this, _: &ChooseNext, _, cx| this.step(1, cx)))
+                            .relative()
                             .size_full()
-                            .child(self.render_list(window, cx)),
+                            .child(self.render_list(window, cx))
+                            .vertical_scrollbar(&self.scroll),
                     ),
                 )
             })

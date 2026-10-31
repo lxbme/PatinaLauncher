@@ -129,6 +129,18 @@ mod tests {
     }
 
     #[test]
+    fn dialog_bodies_are_full_sentences() {
+        for (file, stop) in [("en.yml", '.'), ("zh-CN.yml", '。')] {
+            let open: Vec<_> = entries(file)
+                .into_iter()
+                .filter(|(k, text)| k.ends_with("_body") && !text.ends_with(stop))
+                .map(|(k, _)| k)
+                .collect();
+            assert!(open.is_empty(), "{file}: no final {stop:?} in {open:?}");
+        }
+    }
+
+    #[test]
     fn language_switch_reaches_core() {
         use patina_core::progress::Phase;
         let _locale = locale_lock();

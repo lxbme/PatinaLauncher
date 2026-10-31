@@ -124,6 +124,9 @@ pub struct InstancesModel {
     /// session. Entities of their own, so a log batch notifies only the log
     /// view, never the model's other observers.
     logs: HashMap<String, Entity<LogBuffer>>,
+    /// How many of this app's operations (other than launches) changed each
+    /// instance: the overview walks the disk again after one.
+    op_changes: HashMap<String, u64>,
     /// The crash log saved after the last run of an instance, if it crashed.
     crash_logs: HashMap<String, PathBuf>,
     /// Broken entries being deleted, so a second request is ignored.
@@ -164,6 +167,7 @@ impl InstancesModel {
             ops: HashMap::new(),
             next_op: 0,
             logs: HashMap::new(),
+            op_changes: HashMap::new(),
             crash_logs: HashMap::new(),
             deleting: HashSet::new(),
             revision: Revision::default(),
@@ -329,6 +333,24 @@ impl InstancesModel {
         self.ops.get(id).map(|e| &e.state)
     }
 
+    /// How many of this app's operations other than launches have finished
+    /// on instance `id` (a counter to compare, not a total of all time).
+    pub fn op_changes(&self, id: &str) -> u64 {
+        self.op_changes.get(id).copied().unwrap_or(0)
+    }
+
+    /// Why instance `id` takes no change now (its versions, name or
+    /// deletion), or `None`: an operation is in flight, or its game runs.
+    pub fn busy_reason(&self, id: &str) -> Option<String> {
+        if self.is_op_running(id) {
+            Some(rust_i18n::t!("versions.busy_operation").to_string())
+        } else if self.is_busy(id) {
+            Some(rust_i18n::t!("versions.busy_running").to_string())
+        } else {
+            None
+        }
+    }
+
     /// Whether an operation of instance `id` is running.
     pub fn is_op_running(&self, id: &str) -> bool {
         self.op(id).is_some_and(OpState::is_running)
@@ -484,7 +506,12 @@ impl InstancesModel {
             match result {
                 Ok(value) => {
                     on_done(self, value, cx);
-                    cx.emit(InstancesChanged);
+                    // A launch changes no instance on disk worth a new
+                    // count or size: no status-bar disk scan per launch.
+                    if kind != OpKind::Launch {
+                        *self.op_changes.entry(id.to_string()).or_default() += 1;
+                        cx.emit(InstancesChanged);
+                    }
                 }
                 Err(error) => {
                     let message = error.message(self);
@@ -636,6 +663,7 @@ impl InstancesModel {
         let running = &self.running;
         let kept = |id: &String| running.contains_key(id) || find_entry(&outcome, id).is_some();
         self.logs.retain(|id, _| kept(id));
+        self.op_changes.retain(|id, _| kept(id));
         self.crash_logs.retain(|id, _| kept(id));
         // A crash notice has nothing to hang on to either; a game that runs
         // stays (it ends by itself).

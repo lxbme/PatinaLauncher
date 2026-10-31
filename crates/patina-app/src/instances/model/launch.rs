@@ -9,7 +9,6 @@ use patina_core::instance::Instance;
 use patina_core::launch::{
     GameSession, LaunchAccount, PendingLaunch, Reattach, SessionExit, SessionWarning,
 };
-use patina_core::loader::ops::reinstall_loader;
 use rust_i18n::t;
 
 use super::{Entry, InstancesModel, LaunchFlow, OnFail, Track};
@@ -589,11 +588,11 @@ impl InstancesModel {
         }
     }
 
-    /// Reinstalls `id`'s loader, then launches it again once the list shows
-    /// the reinstalled instance.
+    /// Reinstalls `id`'s loader (through `Core.version_ops`, as the versions
+    /// tab's repair does), then launches it again once the list shows the
+    /// reinstalled instance.
     pub fn reinstall_and_launch(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
-        let core = Core::global(cx);
-        let (launcher, store) = (core.launcher(), core.store.clone());
+        let ops = Core::global(cx).version_ops.clone();
         let key = id.to_string();
         let retry: RetryAction = {
             let key = key.clone();
@@ -608,7 +607,7 @@ impl InstancesModel {
                 let key = key.clone();
                 move |progress| {
                     async move {
-                        reinstall_loader(&launcher, &store, &key, progress)
+                        ops.reinstall_loader(key, progress)
                             .await
                             .map_err(OpError::Loader)
                     }

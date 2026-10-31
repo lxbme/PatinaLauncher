@@ -601,6 +601,9 @@ impl InstanceStore {
         Ok(())
     }
 
+    /// Deletes instance `id` and its directory. Refuses while another
+    /// operation holds the instance, and while its game runs
+    /// ([`BusyKind::Running`](crate::locks::BusyKind::Running)).
     pub fn delete(&self, id: &str) -> Result<(), InstanceError> {
         Self::check_id(id)?;
         let _lock = self.lock(id)?;
@@ -608,6 +611,7 @@ impl InstanceStore {
         if !dir.join(CONFIG_FILE).is_file() {
             return Err(InstanceError::NotFound(id.to_string()));
         }
+        crate::launch::running::refuse_while_running(&dir, id)?;
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -969,6 +973,26 @@ mod tests {
         let r = store.rename(&a.id, "新名字").unwrap();
         assert_eq!(r.id, "Old");
         assert_eq!(store.load("Old").unwrap().config.name, "新名字");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_refuses_while_the_game_runs() {
+        use crate::launch::running::FakeGame;
+        use crate::locks::BusyKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(tmp.path().to_path_buf());
+        let a = store.create("Running", "1.21.1").unwrap();
+        let game = FakeGame::start(&a.dir, &a.id);
+        match store.delete(&a.id) {
+            Err(InstanceError::Busy(b)) => assert_eq!(b.what, BusyKind::Running(a.id.clone())),
+            other => panic!("expected Busy(Running), got {other:?}"),
+        }
+        assert!(a.dir.is_dir(), "nothing deleted");
+        drop(game);
+        // The game is gone: its stale record no longer holds the instance.
+        store.delete(&a.id).unwrap();
+        assert!(!a.dir.exists());
     }
 
     #[test]

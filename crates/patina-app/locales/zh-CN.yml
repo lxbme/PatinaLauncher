@@ -161,6 +161,7 @@ busy:
   instance: '"%{name}"正在执行其他操作'
   version: "版本 %{id} 正被其他操作使用"
   processors: "Minecraft %{mc} 的另一个安装正在进行"
+  running: '"%{name}"正在运行，先关闭游戏'
 ops:
   amount_mb: "%{done}/%{total} MB"
   amount_kb: "%{done}/%{total} KB"
@@ -238,7 +239,7 @@ instance_settings:
   danger: "危险操作"
   delete: "删除实例…"
   delete_title: '删除"%{name}"？'
-  delete_body: "实例目录及其中的存档会被永久删除"
+  delete_body: "实例目录及其中的存档会被永久删除。"
   delete_confirm: "删除"
   delete_cancel: "取消"
   delete_failed: '无法删除"%{name}"：%{error}'

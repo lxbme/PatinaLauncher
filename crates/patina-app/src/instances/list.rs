@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, VirtualListScrollHandle, h_flex, v_flex, v_virtual_list,
 };
@@ -27,10 +28,11 @@ use super::{
 use crate::fonts::Strong;
 use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY};
 
-/// Column width at UI scale 1.0 (392 px). Measured in the headless test
+/// Column width at UI scale 1.0 (400 px). Measured in the headless test
 /// (`english_filter_chips_fit`): the six English chips with their padding
-/// and gaps take 390 px including the gutters; Chinese takes less.
-pub const LIST_W: Rems = Rems(24.5);
+/// and gaps take 390 px including the gutters, so 10 px stay free for font
+/// differences; Chinese takes less.
+pub const LIST_W: Rems = Rems(25.);
 /// Row height (two lines), 48 px.
 const ROW_H: Rems = Rems(3.);
 /// Row icon, 32 px: half the 64 px built-in PNGs at scale 1.0.
@@ -544,6 +546,7 @@ impl Render for InstanceList {
                     .track_focus(&self.focus)
                     .on_action(cx.listener(Self::select_prev))
                     .on_action(cx.listener(Self::select_next))
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .pt_1()
@@ -567,7 +570,8 @@ impl Render for InstanceList {
                         .track_scroll(&self.scroll)
                         .flex_1()
                         .min_h_0(),
-                    ),
+                    )
+                    .vertical_scrollbar(&self.scroll),
             )
     }
 }

@@ -161,6 +161,7 @@ busy:
   instance: "“%{name}” is busy with another operation"
   version: "Version %{id} is in use by another operation"
   processors: "Another installation for Minecraft %{mc} is running"
+  running: "“%{name}” is running; stop the game first"
 ops:
   amount_mb: "%{done}/%{total} MB"
   amount_kb: "%{done}/%{total} KB"
@@ -238,7 +239,7 @@ instance_settings:
   danger: "Danger zone"
   delete: "Delete instance…"
   delete_title: "Delete “%{name}”?"
-  delete_body: "The instance folder and the worlds in it will be deleted permanently"
+  delete_body: "The instance folder and the worlds in it will be deleted permanently."
   delete_confirm: "Delete"
   delete_cancel: "Cancel"
   delete_failed: "Couldn’t delete “%{name}”: %{error}"

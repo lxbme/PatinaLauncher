@@ -138,7 +138,7 @@ progress:
     fetch_metadata: "Fetching version info"
     download_runtime: "Downloading Java runtime"
     download_asset_index: "Downloading asset index"
-    download_game_files: "Downloading game files"
+    check_game_files: "Checking game files"
     download_installer: "Downloading installer"
     download_libraries: "Downloading libraries"
     run_processor: "Running install steps"

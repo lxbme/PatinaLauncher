@@ -49,6 +49,18 @@ impl Booted {
 /// process-global; every test starts in English.
 static LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+thread_local! {
+    /// Whether this test thread holds a booted app (and so [`LANGUAGE`]): a
+    /// second boot would wait for its own lock forever.
+    static BOOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Drop for Booted {
+    fn drop(&mut self) {
+        BOOTED.with(|b| b.set(false));
+    }
+}
+
 /// Boots the app as `main` does, with its data dir and settings in `dir`
 /// and an offline core, and opens the main window.
 fn boot(cx: &mut TestAppContext, dir: &Path, start: AppSettings) -> Booted {
@@ -79,6 +91,11 @@ fn boot_core(
     start: AppSettings,
     make_core: impl FnOnce(tokio::runtime::Handle, DataDirs) -> Core,
 ) -> Booted {
+    assert!(
+        !BOOTED.with(|b| b.replace(true)),
+        "boot() called twice in one test: the first app still holds the language \
+         lock; boot once per test (Booted::language switches the language)"
+    );
     let language = LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
     patina_app::i18n::set_language(Language::En);
     let rt = patina_app::runtime::start();
@@ -133,6 +150,14 @@ fn app_boots_headless(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+#[should_panic(expected = "boot() called twice in one test")]
+fn booting_twice_in_one_test_panics_instead_of_hanging(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let _app = boot(cx, tmp.path(), AppSettings::default());
+    let _again = boot(cx, tmp.path(), AppSettings::default());
+}
+
+#[gpui_kit::test]
 fn zoom_keys_scale_the_ui_and_persist(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let mut start = AppSettings::default();
@@ -170,6 +195,103 @@ fn zoom_keys_scale_the_ui_and_persist(cx: &mut TestAppContext) {
     // Quitting (which runs the app's quit handlers) writes the change.
     cx.quit();
     assert_eq!(settings::load(tmp.path()).ui_scale, 0.9);
+}
+
+/// The window's size as the platform has it.
+fn window_size(app: &Booted, cx: &mut TestAppContext) -> gpui_kit::Size<Pixels> {
+    cx.update_window(app.handle, |_, window, _| window.bounds().size)
+        .unwrap()
+}
+
+/// Whether element `id` lies wholly inside the window (and is drawn).
+fn inside_window(app: &Booted, cx: &mut TestAppContext, id: &'static str) -> bool {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let size = window.viewport_size();
+        let e = window.find(id);
+        let b = e.bounds();
+        e.visible()
+            && b.left() >= px(0.)
+            && b.top() >= px(0.)
+            && b.right() <= size.width
+            && b.bottom() <= size.height
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_title_bar_fits_the_smallest_window(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+    cx.run_until_parked();
+    for id in [
+        "search",
+        "title-downloads",
+        "title-account",
+        "title-settings",
+    ] {
+        assert!(inside_window(&app, cx, id), "{id} is cut off at 960×600");
+    }
+}
+
+#[gpui_kit::test]
+fn a_scale_too_large_for_the_display_is_not_offered(cx: &mut TestAppContext) {
+    // The test display is 1920×1080: 200 % would need 1920×1200.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut start = AppSettings::default();
+    start.ui_scale = 2.0;
+    let app = boot(cx, tmp.path(), start);
+    let handle = app.handle;
+    let scale = |cx: &mut TestAppContext| cx.update(|cx| SettingsStore::get(cx).ui_scale);
+    let press = |cx: &mut TestAppContext, key: &str| {
+        cx.update_window(handle, |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+
+    // Opened at the largest step that fits, with that step's minimum.
+    assert_eq!(font_size(cx), px(16.) * 1.75);
+    assert_eq!(cx.update(|cx| patina_app::scale::applied_scale(cx)), 1.75);
+    let options = cx.update(|cx| patina_app::main_window_options(1.75, cx));
+    assert_eq!(
+        options.window_min_size,
+        Some(gpui_kit::size(px(1680.), px(1050.)))
+    );
+    let size = window_size(&app, cx);
+    assert!(
+        size.width >= px(1680.) && size.height >= px(1050.),
+        "{size:?}"
+    );
+
+    // Zooming in stops there and leaves the saved setting alone.
+    press(cx, "ctrl-=");
+    assert_eq!(font_size(cx), px(16.) * 1.75);
+    assert_eq!(scale(cx), 2.0, "the saved setting is not rewritten");
+
+    // A real change is saved.
+    press(cx, "ctrl--");
+    assert_eq!(font_size(cx), px(16.) * 1.5);
+    assert_eq!(scale(cx), 1.5);
+}
+
+#[gpui_kit::test]
+fn zooming_in_grows_the_window_to_the_new_minimum(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let handle = app.handle;
+    cx.simulate_window_resize(handle, gpui_kit::size(px(960.), px(600.)));
+    for _ in 0..10 {
+        cx.update_window(handle, |_, window, cx| window.press("ctrl-=", cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+    assert_eq!(cx.update(|cx| SettingsStore::get(cx).ui_scale), 1.75);
+    let size = window_size(&app, cx);
+    assert!(
+        size.width >= px(1680.) && size.height >= px(1050.),
+        "{size:?}"
+    );
 }
 
 /// Opens the already-running notice as the second instance does.
@@ -917,11 +1039,13 @@ fn english_filter_chips_fit(cx: &mut TestAppContext) {
         let row = window.find("instance-filters").bounds();
         let first = window.find(Filter::CHIPS[0].chip_id()).bounds();
         let last = window.find(Filter::CHIPS[5].chip_id()).bounds();
-        // The gutter on both sides, so nothing needs scrolling.
+        // The gutter on both sides, so nothing needs scrolling, and half a
+        // rem to spare for a font that sets the labels a little wider.
         let gutter = first.left() - row.left();
         assert!(gutter > px(0.));
+        let spare = px(8.);
         assert!(
-            last.right() + gutter <= row.right(),
+            last.right() + gutter + spare <= row.right(),
             "last chip ends at {:?}, row at {:?}",
             last.right(),
             row.right()
@@ -1468,6 +1592,14 @@ fn busy_message_uses_display_name(cx: &mut TestAppContext) {
     };
     assert_eq!(message, "“My Pack” is busy with another operation");
     assert!(!message.contains(&id), "{message}");
+    // A game left running (no lock held) reads the same way.
+    let running = OpError::Loader(LoaderError::Busy(Busy {
+        what: BusyKind::Running(id.clone()),
+    }));
+    assert_eq!(
+        model.read_with(cx, |m, _| running.message(m)),
+        "“My Pack” is running; stop the game first"
+    );
     assert_eq!(done.get(), 0);
     // Dismissing clears it, and a new operation may start.
     model.update(cx, |m, cx| m.dismiss_op(&id, cx));
@@ -1918,6 +2050,31 @@ fn create_closes_dialog_and_selects_new_instance(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_add_dialog_fits_the_smallest_window(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+    cx.run_until_parked();
+    for id in [
+        "add-instance-title",
+        "add-instance-name",
+        "version-search",
+        "version-list",
+        "loader-none",
+        "loader-neoforge",
+        "add-instance-cancel",
+        "add-instance-create",
+    ] {
+        assert!(inside_window(&app, cx, id), "{id} is cut off at 960×600");
+    }
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let model = instances_model(&app, cx);
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
+    assert!(store.load("1.21.1").is_ok());
+}
+
+#[gpui_kit::test]
 fn failed_install_leaves_vanilla_instance_with_retry(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
@@ -2330,6 +2487,86 @@ fn the_log_tab_shows_follows_and_copies(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_log_scrolls_by_keyboard_and_scrollbar(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    InstanceStore::new(DataDirs::new(tmp.path()).instances())
+        .create("Logs", "1.21.1")
+        .unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    click(&app, cx, "tab-log");
+    let view = log_view(&app, cx);
+    let buffer = model.update(cx, |m, cx| m.log_buffer("Logs", cx));
+    buffer.update(cx, |b, cx| {
+        for n in 0..500 {
+            b.push(LogLevel::Info, format!("line {n}"));
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let autoscroll = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.autoscroll());
+    assert!(autoscroll(cx));
+
+    // A click on the lines gives them the keyboard.
+    click(&app, cx, "log-lines");
+    assert_eq!(
+        element(&app, cx, "log-lines").unwrap().focused(),
+        Some(true)
+    );
+
+    press(&app, cx, "pageup");
+    assert!(!autoscroll(cx), "a page up leaves the end");
+    press(&app, cx, "pagedown");
+    assert!(autoscroll(cx), "a page down returns to it");
+    press(&app, cx, "home");
+    assert!(!autoscroll(cx));
+    assert!(shows(&app, cx, "log-lines"));
+    press(&app, cx, "end");
+    assert!(autoscroll(cx));
+
+    // Dragging the scrollbar's thumb from the bottom to the top. The bar
+    // shows once the list scrolls.
+    cx.update_window(app.handle, |_, window, cx| {
+        window.scroll(
+            "log-lines",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(40.))),
+            cx,
+        )
+    })
+    .unwrap();
+    press(&app, cx, "end");
+    assert!(autoscroll(cx));
+    let lines = element(&app, cx, "log-lines").unwrap().bounds();
+    // The middle of the thumb's 6px width, 4px in from the edge.
+    let x = lines.right() - px(8.);
+    cx.update_window(app.handle, |_, window, cx| {
+        window.drag(
+            gpui_kit::point(x, lines.bottom() - px(16.)),
+            gpui_kit::point(x, lines.top()),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(!autoscroll(cx), "dragged away from the end");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.drag(
+            gpui_kit::point(x, lines.top() + px(16.)),
+            gpui_kit::point(x, lines.bottom() + px(50.)),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.handle, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(autoscroll(cx), "dragged back to the end");
+}
+
+#[gpui_kit::test]
 fn a_deleted_instance_forgets_its_log(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
@@ -2632,6 +2869,32 @@ fn second_launch_is_busy_with_display_name(cx: &mut TestAppContext) {
         Some(RunState::Running { .. })
     ));
     drop(held);
+}
+
+#[gpui_kit::test]
+fn a_launch_does_not_announce_changed_instances(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    with_account(tmp.path());
+    let app = boot_games(cx, tmp.path(), FakeGames::running("sleep 30 & wait"));
+    let games = StopGames::new(app._rt.handle());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let changed = Rc::new(std::cell::Cell::new(0));
+    let _count = {
+        let changed = changed.clone();
+        cx.update(|cx| {
+            cx.subscribe(&model, move |_, _: &InstancesChanged, _| {
+                changed.set(changed.get() + 1)
+            })
+        })
+    };
+
+    click(&app, cx, "launch");
+    games.add(wait_running(&model, cx, &a));
+    settle_game(cx, |cx| op_of(&model, cx, &a).is_none());
+    assert_eq!(changed.get(), 0, "no status-bar disk scan per launch");
 }
 
 #[gpui_kit::test]
@@ -3018,6 +3281,40 @@ fn loader_needing_reinstall_offers_reinstall(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui_kit::test]
+fn the_reinstall_fix_goes_through_version_ops(cx: &mut TestAppContext) {
+    use patina_core::prepare::PrepareError;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    set_loader(&store, &a, ComponentUid::Fabric);
+    with_account(tmp.path());
+    let games = FakeGames::failing(|| {
+        SessionError::Prepare(PrepareError::LoaderNeedsReinstall {
+            kind: LoaderKind::Fabric,
+            version: "1.0".into(),
+        })
+    });
+    let ops = Arc::new(FakeVersionOps::new(store.clone()));
+    let app = {
+        let (games, ops) = (games.clone(), ops.clone());
+        boot_core(cx, tmp.path(), AppSettings::default(), move |rt, data| {
+            testing::core_with_launch_and_ops(rt, data, Arc::new(FakeCatalog::new()), games, ops)
+        })
+    };
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| failed_message(&model, cx, &a).is_some());
+    assert_eq!(games.prepares(), 1);
+    click(&app, cx, "instance-op-fix");
+    // The fake reinstall succeeds; the launch then runs again.
+    settle_game(cx, |_| games.prepares() == 2);
+    assert_eq!(ops.calls(), vec![OpCall::Reinstall { id: a.clone() }]);
+}
+
 // --- versions tab ---------------------------------------------------------
 
 use patina_app::core_bridge::testing::{FakeVersionOps, OpCall};
@@ -3095,6 +3392,38 @@ fn repair_calls_reinstall(cx: &mut TestAppContext) {
     wait_calls(&ops, cx, 1);
     assert_eq!(ops.calls(), [OpCall::Reinstall { id: "Pack".into() }]);
     settle(cx, |cx| op_of(&model, cx, "Pack").is_none());
+}
+
+#[gpui_kit::test]
+fn the_overview_walks_the_disk_only_when_the_size_may_have_changed(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, ops) = versions_app(cx, tmp.path(), "1.21.1", "0.16.5");
+    let detail = cx.update(|cx| app.root.read(cx).instances().read(cx).detail().clone());
+    let stats = |cx: &mut TestAppContext| detail.read_with(cx, |d, _| d.stats("Pack").cloned());
+    settle(cx, |cx| stats(cx).is_some());
+    let first = stats(cx).unwrap();
+    assert_eq!(first.mods, Some(0));
+
+    // Another program adds a mod and a large file: a refresh counts the mod
+    // but does not walk the whole directory again.
+    let game = InstanceStore::new(DataDirs::new(tmp.path()).instances())
+        .load("Pack")
+        .unwrap()
+        .game_dir();
+    std::fs::create_dir_all(game.join("mods")).unwrap();
+    std::fs::write(game.join("mods/a.jar"), [0u8; 10]).unwrap();
+    std::fs::write(game.join("big.bin"), vec![0u8; 1 << 20]).unwrap();
+    refresh(&model, cx);
+    settle(cx, |cx| stats(cx).is_some_and(|s| s.mods == Some(1)));
+    assert_eq!(stats(cx).unwrap().size, first.size, "no walk");
+
+    // One of this app's operations on it walks it at once.
+    click(&app, cx, "versions-row-loader");
+    click(&app, cx, "versions-repair");
+    wait_calls(&ops, cx, 1);
+    settle(cx, |cx| {
+        stats(cx).is_some_and(|s| s.size >= first.size + (1 << 20))
+    });
 }
 
 #[gpui_kit::test]
@@ -4126,6 +4455,109 @@ fn typed_edits_are_saved_on_selection_and_tab_change(cx: &mut TestAppContext) {
     click(&app, cx, "tab-settings");
     assert!(sshows(&app, cx, "settings-args-error"));
     assert_eq!(saved_java(&store, "Alpha").unwrap().extra_jvm_args, "-Dx=1");
+}
+
+#[gpui_kit::test]
+fn ctrl_tab_and_ctrl_page_keys_switch_the_detail_tabs(cx: &mut TestAppContext) {
+    use patina_app::instances::DetailTab;
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    let detail = cx.update(|cx| app.root.read(cx).instances().read(cx).detail().clone());
+    let tab = |cx: &mut TestAppContext| detail.read_with(cx, |d, _| d.tab());
+
+    // From inside the settings form: the typed edit is saved on the way.
+    replace_text(&app, cx, "settings-max-mem", "2048");
+    press(&app, cx, "ctrl-tab");
+    assert_eq!(tab(cx), DetailTab::Log);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().max_mem_mib == Some(2048)
+    });
+    // The keyboard left the form with its tab and the keys keep working.
+    press(&app, cx, "ctrl-tab");
+    assert_eq!(tab(cx), DetailTab::Overview, "wraps after the last tab");
+    press(&app, cx, "ctrl-pagedown");
+    assert_eq!(tab(cx), DetailTab::Versions);
+    press(&app, cx, "ctrl-shift-tab");
+    assert_eq!(tab(cx), DetailTab::Overview);
+    press(&app, cx, "ctrl-pageup");
+    assert_eq!(tab(cx), DetailTab::Log, "wraps before the first tab");
+    assert!(shows(&app, cx, "tab-log"));
+
+    // From the instance list too.
+    click(&app, cx, row_id("Alpha"));
+    press(&app, cx, "ctrl-tab");
+    assert_eq!(tab(cx), DetailTab::Overview);
+    press(&app, cx, "down");
+    press(&app, cx, "ctrl-tab");
+    assert_eq!(tab(cx), DetailTab::Versions);
+}
+
+/// Drags the vertical scrollbar of region `id` (shown once the region
+/// scrolls) from near its top to past its bottom.
+fn drag_scrollbar_down(app: &Booted, cx: &mut TestAppContext, id: &'static str) {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll(
+            id,
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-20.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let region = element(app, cx, id).unwrap().bounds();
+    // The middle of the thumb's 6px width, 4px in from the edge.
+    let x = region.right() - px(7.);
+    cx.update_window(app.handle, |_, window, cx| {
+        window.drag(
+            gpui_kit::point(x, region.top() + px(30.)),
+            gpui_kit::point(x, region.bottom() + px(400.)),
+            cx,
+        )
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn long_regions_scroll_by_their_scrollbar(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..40).map(|n| format!("I{n:02}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (app, _model, _store) = settings_app(cx, tmp.path(), &names, vec![]);
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+    cx.run_until_parked();
+
+    // The settings form.
+    assert!(
+        !shows(&app, cx, "settings-delete"),
+        "this test needs an overflow"
+    );
+    drag_scrollbar_down(&app, cx, "settings-tab");
+    assert!(shows(&app, cx, "settings-delete"));
+
+    // The instance list.
+    assert!(
+        !shows(&app, cx, row_id("I39")),
+        "this test needs an overflow"
+    );
+    drag_scrollbar_down(&app, cx, "instance-rows-region");
+    assert!(shows(&app, cx, row_id("I39")));
+}
+
+#[gpui_kit::test]
+fn typed_edits_are_saved_before_the_window_closes(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(cx, tmp.path(), &["Alpha"], vec![]);
+    override_on(&app, cx, &store, "Alpha");
+    replace_text(&app, cx, "settings-max-mem", "2048");
+    assert_ne!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(2048));
+
+    let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
+    assert!(!window.simulate_close(), "waits for the save");
+    settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+    assert_eq!(saved_java(&store, "Alpha").unwrap().max_mem_mib, Some(2048));
 }
 
 #[gpui_kit::test]

@@ -61,6 +61,22 @@ pub fn core_with_launch(
     Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
 }
 
+/// [`core`] with fake games (`launch`) and recorded loader changes (`ops`).
+pub fn core_with_launch_and_ops(
+    rt: Handle,
+    data: DataDirs,
+    catalog: Arc<dyn Catalog>,
+    launch: Arc<dyn LaunchBackend>,
+    ops: Arc<dyn VersionOps>,
+) -> Core {
+    let fakes = Fakes {
+        catalog: Some(catalog),
+        launch_backend: Some(launch),
+        version_ops: Some(ops),
+    };
+    Core::start(rt, data, fakes, Startup::Offline).expect("the test core starts")
+}
+
 /// Canned version lists. With no manifest set, asking for it fails; a loader
 /// with no versions for a Minecraft version answers `NoVersions`.
 pub struct FakeCatalog {
