@@ -34,7 +34,10 @@ impl AccountService {
     pub(super) async fn load(&self) -> Result<AccountStore, AuthError> {
         let data = self.inner.data.clone();
         match blocking(move || AccountStore::load_durable(&data)).await {
-            Ok(store) => Ok(store),
+            Ok(mut store) => {
+                store.recompute_current();
+                Ok(store)
+            }
             Err(error) => {
                 let mut published = self.inner.snapshot.write().expect("account snapshot");
                 if published.as_ref() != Some(&Err(error.clone())) {
@@ -74,6 +77,7 @@ impl AccountService {
                 account.verification = None;
             }
         }
+        store.recompute_current();
         let data = self.inner.data.clone();
         #[cfg(test)]
         let fail = self

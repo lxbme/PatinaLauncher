@@ -1,8 +1,8 @@
 //! Persistent account store (`<data>/accounts.toml`).
 //!
-//! Release builds only expose Microsoft accounts. Offline accounts exist only
-//! behind the `dev-offline` feature; without it they are kept aside and
-//! written back verbatim on save so a dev build's data is never lost.
+//! Production offline identities are visible in all builds and gated by historical
+//! ownership. Legacy developer identities stay hidden without `dev-offline`,
+//! but their metadata and stored selection survive round trips.
 
 use crate::launch::LaunchAccount;
 use crate::paths::DataDirs;
@@ -18,6 +18,7 @@ mod http;
 pub mod login;
 mod metadata;
 mod msa;
+mod policy;
 mod secret;
 mod service;
 pub use service::{
@@ -43,6 +44,8 @@ mod http_tests;
 #[cfg(test)]
 mod msa_tests;
 #[cfg(test)]
+mod policy_tests;
+#[cfg(test)]
 mod service_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +69,16 @@ pub struct Account {
     verification: Option<Verification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skin_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offline_origin: Option<OfflineOrigin>,
+}
+
+/// Offline identity provenance. An absent legacy marker means development, never entitlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OfflineOrigin {
+    Development,
+    Entitled,
 }
 
 /// Historical proof, produced only by an entitlement- and profile-verified commit.
@@ -83,6 +96,10 @@ impl Verification {
     }
 }
 impl Account {
+    pub fn offline_origin(&self) -> Option<OfflineOrigin> {
+        (self.kind == AccountKind::Offline)
+            .then_some(self.offline_origin.unwrap_or(OfflineOrigin::Development))
+    }
     pub fn verification(&self) -> Option<&Verification> {
         self.verification.as_ref()
     }
@@ -128,7 +145,9 @@ pub struct AccountStore {
 }
 
 fn visible_in_this_build(a: &Account) -> bool {
-    cfg!(feature = "dev-offline") || a.kind != AccountKind::Offline
+    cfg!(feature = "dev-offline")
+        || a.kind != AccountKind::Offline
+        || a.offline_origin() == Some(OfflineOrigin::Entitled)
 }
 
 impl AccountStore {
@@ -244,7 +263,9 @@ impl AccountStore {
         self.accounts.remove(pos);
         if self.current.as_deref() == Some(id) {
             self.current = self.accounts.first().map(|a| a.id.clone());
-            self.current_changed = true;
+            if !self.stored_current_is_hidden() {
+                self.current_changed = true;
+            }
         }
         Ok(())
     }
@@ -280,6 +301,7 @@ impl AccountStore {
                     token_ref: None,
                     verification: None,
                     skin_hash: None,
+                    offline_origin: Some(OfflineOrigin::Development),
                 });
                 self.accounts.len() - 1
             }
@@ -311,6 +333,7 @@ impl AccountStore {
                     token_ref,
                     verification: None,
                     skin_hash: None,
+                    offline_origin: None,
                 });
                 self.accounts.len() - 1
             }

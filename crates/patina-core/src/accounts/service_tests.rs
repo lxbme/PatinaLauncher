@@ -20,25 +20,25 @@ use wiremock::{
     matchers::{method, path},
 };
 
-const NOW: u64 = 1_800_000_000;
-const ID: &str = "0123456789abcdef0123456789abcdef";
+pub(super) const NOW: u64 = 1_800_000_000;
+pub(super) const ID: &str = "0123456789abcdef0123456789abcdef";
 #[derive(Default)]
-struct Clock(AtomicU64);
+pub(super) struct Clock(pub(super) AtomicU64);
 impl AuthClock for Clock {
     fn unix_seconds(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
 }
-struct Fixture {
+pub(super) struct Fixture {
     _temp: tempfile::TempDir,
-    data: DataDirs,
-    server: MockServer,
-    keyring: Arc<MemoryCredentials>,
-    clock: Arc<Clock>,
-    service: AccountService,
+    pub(super) data: DataDirs,
+    pub(super) server: MockServer,
+    pub(super) keyring: Arc<MemoryCredentials>,
+    pub(super) clock: Arc<Clock>,
+    pub(super) service: AccountService,
 }
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let data = DataDirs::new(temp.path());
         let server = MockServer::start().await;
@@ -80,7 +80,7 @@ impl Fixture {
             clock,
         )
     }
-    fn restarted(&self) -> AccountService {
+    pub(super) fn restarted(&self) -> AccountService {
         Self::service(
             &self.data,
             &self.server,
@@ -95,7 +95,7 @@ impl Fixture {
             .mount(&self.server)
             .await;
     }
-    async fn chain(&self, name: &str) {
+    pub(super) async fn chain(&self, name: &str) {
         self.response(0,200,json!({"device_code":"DEVICE_SECRET_SENTINEL", "user_code":"ABCD-EFGH", "verification_uri":"https://microsoft.com/link", "expires_in":120, "interval":1})).await;
         self.response(1,200,json!({"access_token":"MS_SECRET_SENTINEL", "refresh_token":"ROTATED_SENTINEL", "expires_in":3600})).await;
         for (stage, token) in [(2, "XBL_SECRET_SENTINEL"), (3, "XSTS_SECRET_SENTINEL")] {
@@ -123,7 +123,7 @@ impl Fixture {
         .await
         .unwrap()
     }
-    async fn login(&self) -> Vec<LoginEvent> {
+    pub(super) async fn login(&self) -> Vec<LoginEvent> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_cancel, token) = watch::channel(false);
         self.service.start(tx, token).await;
@@ -133,7 +133,7 @@ impl Fixture {
         }
         events
     }
-    async fn resolve(&self) -> Result<super::LaunchGrant, AuthError> {
+    pub(super) async fn resolve(&self) -> Result<super::LaunchGrant, AuthError> {
         let (_cancel, token) = watch::channel(false);
         self.service.resolve_launch(ID, token).await
     }

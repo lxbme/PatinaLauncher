@@ -18,8 +18,8 @@ impl UserType {
 
 /// The identity a game is launched with. Fields and the Microsoft
 /// constructor are crate-private, so outside this crate one comes only from
-/// AccountService (or the temporary legacy store seam); offline ones exist only with the `dev-offline` feature
-/// (and test stand-ins, `test_account`, only with `test-support`).
+/// AccountService (or temporary legacy seams). Production offline grants require
+/// historical ownership; developer and test bypasses remain feature-gated.
 #[derive(Clone)]
 pub struct LaunchAccount {
     pub(crate) name: String,
@@ -30,6 +30,17 @@ pub struct LaunchAccount {
 }
 
 impl LaunchAccount {
+    /// Only the account service may authorize a stored production offline identity.
+    pub(crate) fn offline(name: &str, uuid: Uuid) -> Self {
+        Self {
+            name: name.to_owned(),
+            uuid,
+            access_token: "0".to_owned(),
+            user_type: UserType::Legacy,
+            xuid: None,
+        }
+    }
+
     /// A signed-in Microsoft account. Crate-private: outside the crate a
     /// launch identity only comes from AccountService's grant, so a release build
     /// cannot fabricate one with an arbitrary token.

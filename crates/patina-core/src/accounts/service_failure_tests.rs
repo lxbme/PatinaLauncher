@@ -389,10 +389,11 @@ async fn refresh_does_not_change_unrelated_current_and_watch_revision_counts_bur
         other.id
     );
     assert_eq!(*changes.borrow(), before + 3);
-    assert_eq!(
-        f.service.add_offline("NoBypass").await.unwrap_err(),
-        AuthError::OfflineNotAllowed
-    );
+    let offline = f.service.add_offline("Entitled").await.unwrap();
+    let snapshot = f.service.snapshot().await.unwrap();
+    assert!(snapshot.is_launchable(&offline.id));
+    assert_eq!(snapshot.current().unwrap().id, other.id);
+    assert_eq!(*changes.borrow(), before + 4);
 }
 
 #[tokio::test]

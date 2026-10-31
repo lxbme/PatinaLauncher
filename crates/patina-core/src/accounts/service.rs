@@ -1,12 +1,13 @@
 //! Single mutation owner. Critical operations run in owned Tokio tasks: dropping a
 //! waiter cannot interrupt an acknowledged refresh rotation or a metadata commit.
 use super::{
-    Account, AccountKind, AccountStore, Verification,
+    Account, AccountKind, AccountStore, OfflineOrigin, Verification,
     credentials::{CredentialRecord, CredentialStore},
     error::AuthError,
     http::cancelled,
     login::{CancelToken, DeviceCodeLogin, LoginError, LoginEvent, StorageKind},
     msa::{AuthClock, MinecraftSession, MsaClient, SystemClock, VerifiedLogin},
+    policy::{is_launchable, offline_allowed},
 };
 use crate::{
     launch::{
@@ -46,21 +47,12 @@ impl AccountSnapshot {
         self.revision
     }
     pub fn is_offline_allowed(&self) -> bool {
-        self.accounts.iter().any(|a| {
-            a.kind == AccountKind::Msa
-                && a.verification
-                    .as_ref()
-                    .is_some_and(|v| v.profile_uuid == a.uuid)
-        })
+        offline_allowed(&self.accounts)
     }
     pub fn is_launchable(&self, id: &str) -> bool {
-        self.accounts.iter().any(|a| {
-            a.id == id
-                && match a.kind {
-                    AccountKind::Msa => a.token_ref.is_some(),
-                    AccountKind::Offline => cfg!(feature = "dev-offline"),
-                }
-        })
+        self.accounts
+            .iter()
+            .any(|a| a.id == id && is_launchable(a, &self.accounts))
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +67,7 @@ pub struct LaunchGrant {
     account: LaunchAccount,
     id: String,
     reference: Option<String>,
+    offline_origin: Option<OfflineOrigin>,
     issued_at: u64,
     expires_at: u64,
 }
@@ -289,6 +282,14 @@ impl AccountService {
             let store = service.load().await?;
             let mut store = service.recover(&mut operation, store).await?;
             check_cancel(&cancel)?;
+            let account = find(&store, &id)?;
+            if !is_launchable(account, &store.accounts) {
+                return Err(if account.kind == AccountKind::Offline {
+                    AuthError::OfflineNotAllowed
+                } else {
+                    AuthError::ReauthenticationRequired
+                });
+            }
             store.set_current(&id).map_err(AuthError::Account)?;
             let store = service.save(&mut operation, store).await?;
             service.publish(&store, true);
@@ -297,11 +298,20 @@ impl AccountService {
         .await
         .map_err(|_| AuthError::StorageUnavailable)?
     }
-    pub async fn add_offline(&self, _name: &str) -> Result<Account, AuthError> {
-        Err(AuthError::OfflineNotAllowed)
+    pub async fn add_offline(&self, name: &str) -> Result<Account, AuthError> {
+        self.add_offline_with_origin(name, OfflineOrigin::Entitled)
+            .await
     }
     #[cfg(feature = "dev-offline")]
     pub async fn add_dev_offline(&self, name: &str) -> Result<Account, AuthError> {
+        self.add_offline_with_origin(name, OfflineOrigin::Development)
+            .await
+    }
+    async fn add_offline_with_origin(
+        &self,
+        name: &str,
+        origin: OfflineOrigin,
+    ) -> Result<Account, AuthError> {
         let service = self.clone();
         let name = name.to_owned();
         let (tx, cancel) = watch::channel(false);
@@ -311,10 +321,7 @@ impl AccountService {
             let store = service.load().await?;
             let mut store = service.recover(&mut operation, store).await?;
             check_cancel(&cancel)?;
-            let account = store
-                .add_offline(&name)
-                .map_err(AuthError::Account)?
-                .clone();
+            let account = store.insert_offline(&name, origin)?;
             let store = service.save(&mut operation, store).await?;
             service.publish(&store, true);
             Ok(account)
@@ -378,7 +385,7 @@ impl AccountService {
         self.publish(&store, false);
         let account = find(&store, id)?.clone();
         if account.kind == AccountKind::Offline {
-            return offline_grant(&account);
+            return offline_grant(&account, &store.accounts);
         }
         let reference = account
             .token_ref
@@ -459,6 +466,7 @@ impl AccountService {
                         .expect("loaded identity")
                         .verification = None;
                     // Publish fail-closed policy even if durable revocation fails.
+                    store.recompute_current();
                     self.publish(&store, true);
                     store = self.save(&mut operation, store).await?;
                     self.publish(&store, false);
@@ -512,13 +520,14 @@ impl AccountService {
         if account.uuid != grant.account.uuid()
             || account.username != grant.account.name()
             || account.token_ref != grant.reference
+            || account.offline_origin() != grant.offline_origin
             || (account.kind == AccountKind::Msa)
                 != (grant.account.user_type() == crate::launch::account::UserType::Msa)
         {
             return Err(AuthError::IdentityMismatch);
         }
         if account.kind == AccountKind::Offline {
-            offline_grant(account)?;
+            offline_grant(account, &store.accounts)?;
             return Ok(());
         }
         let now = self.inner.clock.unix_seconds();
@@ -609,26 +618,23 @@ fn grant(account: &Account, session: &MinecraftSession) -> LaunchGrant {
         ),
         id: account.id.clone(),
         reference: account.token_ref.clone(),
+        offline_origin: None,
         issued_at: session.issued_at(),
         expires_at: session.expires_at(),
     }
 }
-fn offline_grant(account: &Account) -> Result<LaunchGrant, AuthError> {
-    #[cfg(feature = "dev-offline")]
-    {
-        Ok(LaunchGrant {
-            account: crate::launch::account::dev_offline_account(&account.username),
-            id: account.id.clone(),
-            reference: None,
-            issued_at: 0,
-            expires_at: u64::MAX,
-        })
+fn offline_grant(account: &Account, accounts: &[Account]) -> Result<LaunchGrant, AuthError> {
+    if !is_launchable(account, accounts) {
+        return Err(AuthError::OfflineNotAllowed);
     }
-    #[cfg(not(feature = "dev-offline"))]
-    {
-        let _ = account;
-        Err(AuthError::OfflineNotAllowed)
-    }
+    Ok(LaunchGrant {
+        account: LaunchAccount::offline(&account.username, account.uuid),
+        id: account.id.clone(),
+        reference: account.token_ref.clone(),
+        offline_origin: account.offline_origin(),
+        issued_at: 0,
+        expires_at: u64::MAX,
+    })
 }
 impl DeviceCodeLogin for AccountService {
     fn start(
