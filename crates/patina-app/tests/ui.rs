@@ -931,6 +931,52 @@ fn english_filter_chips_fit(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+#[gpui_kit::test]
+fn every_tab_is_reachable_in_the_smallest_window(cx: &mut TestAppContext) {
+    use patina_app::instances::DetailTab;
+    let tmp = tempfile::tempdir().unwrap();
+    InstanceStore::new(DataDirs::new(tmp.path()).instances())
+        .create("Alpha", "1.21.1")
+        .unwrap();
+    let mut start = AppSettings::default();
+    start.language = Language::En;
+    let app = boot(cx, tmp.path(), start);
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let detail = cx.update(|cx| app.root.read(cx).instances().read(cx).detail().clone());
+    let scroll_tabs = |cx: &mut TestAppContext, dx: f32| {
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            // The wheel over a tab in the middle, which stays in view.
+            window.scroll(
+                "tab-mods",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(dx), px(0.))),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+
+    // English labels need more than the narrowest detail pane: the strip
+    // scrolls instead of cutting the last tabs off.
+    assert!(shows(&app, cx, "tab-overview"));
+    assert!(!shows(&app, cx, "tab-log"), "this test needs an overflow");
+    scroll_tabs(cx, -1000.);
+    assert!(shows(&app, cx, "tab-log"));
+    click(&app, cx, "tab-log");
+    assert_eq!(detail.read_with(cx, |d, _| d.tab()), DetailTab::Log);
+
+    // Choosing a tab out of view brings it into view.
+    scroll_tabs(cx, 1000.);
+    assert!(!shows(&app, cx, "tab-log"));
+    detail.update(cx, |d, cx| d.set_tab(DetailTab::Settings, cx));
+    detail.update(cx, |d, cx| d.set_tab(DetailTab::Log, cx));
+    cx.run_until_parked();
+    assert!(shows(&app, cx, "tab-log"));
+}
+
 /// Waits for the save task and returns its result.
 fn finish_save(
     task: gpui_kit::Task<Result<(), gpui_kit::SharedString>>,

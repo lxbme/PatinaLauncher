@@ -10,8 +10,8 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, h_f
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Rems, Render, StatefulInteractiveElement, Styled, Subscription, Task,
-    TestSupportExt, Window, div, px, rems,
+    ParentElement, Rems, Render, ScrollHandle, StatefulInteractiveElement, Styled, Subscription,
+    Task, TestSupportExt, Window, div, px, rems,
 };
 use patina_core::instance::Instance;
 use rust_i18n::t;
@@ -134,6 +134,9 @@ pub struct DetailView {
     /// The settings tab of the selected instance, made when it is first
     /// shown.
     settings: Option<Entity<SettingsForm>>,
+    /// The tab strip's scroll: English labels need more than the narrowest
+    /// detail pane, so the strip scrolls rather than cutting tabs off.
+    tabs_scroll: ScrollHandle,
     _observe: Subscription,
 }
 
@@ -148,6 +151,7 @@ impl DetailView {
             log: None,
             versions: None,
             settings: None,
+            tabs_scroll: ScrollHandle::new(),
             _observe,
         };
         this.sync_stats(cx);
@@ -185,6 +189,10 @@ impl DetailView {
     pub fn set_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            // A tab chosen out of view (scrolled away) comes into view.
+            if let Some(ix) = DetailTab::ALL.iter().position(|t| *t == tab) {
+                self.tabs_scroll.scroll_to_item(ix);
+            }
             cx.notify();
         }
     }
@@ -636,6 +644,8 @@ impl DetailView {
             .h(TABS_H)
             .px(GUTTER)
             .gap_5()
+            .overflow_x_scroll()
+            .track_scroll(&self.tabs_scroll)
             .border_b_1()
             .border_color(border)
             .children(DetailTab::ALL.into_iter().enumerate().map(|(i, tab)| {
@@ -650,6 +660,7 @@ impl DetailView {
                     .selected(selected)
                     .set_position(i + 1, count)
                     .accessibility_label(tab.label())
+                    .flex_none()
                     .h_full()
                     .px_0p5()
                     .gap_1()
