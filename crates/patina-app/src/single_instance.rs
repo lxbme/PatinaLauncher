@@ -6,17 +6,11 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
 
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Theme, h_flex, v_flex};
-use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Styled, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, actions, div, size,
-};
+use gpui_kit::{AnyWindowHandle, App, Entity};
 use patina_core::paths::DataDirs;
 use rust_i18n::t;
 
-use crate::fonts::Strong;
+use crate::notice::{self, Notice};
 
 pub const LOCK_FILE: &str = ".patina-app.lock";
 
@@ -86,97 +80,19 @@ fn acquire_in(dir: &Path) -> Result<SingleInstance, AlreadyRunning> {
     }
 }
 
-actions!(single_instance, [Dismiss]);
-
-/// Key context of the [`AlreadyRunningNotice`] window.
-const NOTICE_CONTEXT: &str = "AlreadyRunningNotice";
-
-/// The second instance's window: the first instance is running, and a
-/// button that closes it. It takes focus when it opens, so Enter and Escape
-/// close it too. Closing the last window quits the process
-/// (`quit_with_last_window`).
-pub struct AlreadyRunningNotice {
-    focus: FocusHandle,
-}
-
-impl AlreadyRunningNotice {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus = cx.focus_handle();
-        window.focus(&focus, cx);
-        Self { focus }
-    }
-}
-
-impl Render for AlreadyRunningNotice {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        v_flex()
-            .key_context(NOTICE_CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(|_: &Dismiss, window, _| window.remove_window())
-            .size_full()
-            .p_5()
-            .gap_2()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(
-                div()
-                    .text_base()
-                    .strong(FontWeight::SEMIBOLD, cx)
-                    .child(t!("single_instance.title")),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(t!("single_instance.body")),
-            )
-            .child(div().flex_1())
-            .child(
-                h_flex().justify_end().child(
-                    Button::new("close")
-                        .primary()
-                        .label(t!("single_instance.close"))
-                        .on_click(|_, window, _| window.remove_window()),
-                ),
-            )
-    }
-}
-
-/// Opens the [`AlreadyRunningNotice`] window at `ui_scale` and binds its
-/// keys. Call after `gpui_kit::init`, once per process.
+/// Opens the "already running" notice at `ui_scale` (see
+/// [`notice::open`]). Call after `gpui_kit::init`, once per process.
 pub fn open_notice(
     ui_scale: f32,
     cx: &mut App,
-) -> gpui_kit::Result<(AnyWindowHandle, Entity<AlreadyRunningNotice>)> {
-    cx.bind_keys([
-        KeyBinding::new("enter", Dismiss, Some(NOTICE_CONTEXT)),
-        KeyBinding::new("escape", Dismiss, Some(NOTICE_CONTEXT)),
-    ]);
-    // The window is sized in the theme's base font so it follows the scale;
-    // before `theme::apply` that is the default theme's, which `apply`
-    // keeps.
-    let rem = Theme::global(cx).font_size * crate::scale::snap_scale(ui_scale);
-    let options = WindowOptions {
-        titlebar: Some(TitlebarOptions {
-            title: Some(t!("app.title").to_string().into()),
-            ..Default::default()
-        }),
-        app_id: Some(crate::APP_ID.into()),
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(rem * 24., rem * 9.),
-            cx,
-        ))),
-        is_resizable: false,
-        is_minimizable: false,
-        ..Default::default()
-    };
-    gpui_kit::open_window(options, cx, move |window, cx| {
-        crate::style_window(ui_scale, window, cx);
-        cx.new(|cx| AlreadyRunningNotice::new(window, cx))
-    })
+) -> gpui_kit::Result<(AnyWindowHandle, Entity<Notice>)> {
+    let title = t!("single_instance.title").to_string().into();
+    let body = t!("single_instance.body").to_string().into();
+    notice::open(title, body, NOTICE_SIZE, ui_scale, cx)
 }
+
+/// Width and height of the notice, in rem.
+const NOTICE_SIZE: (f32, f32) = (24., 9.);
 
 #[cfg(test)]
 mod tests {

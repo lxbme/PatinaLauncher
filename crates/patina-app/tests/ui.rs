@@ -130,3 +130,23 @@ fn already_running_notice_closes_on_enter(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(window_count(cx), 0);
 }
+
+#[gpui_kit::test]
+fn startup_failure_notice_says_why_and_closes(cx: &mut TestAppContext) {
+    use patina_app::core_bridge::InitError;
+    cx.update(gpui_kit::init);
+    let error = InitError::HttpClient("no TLS backend".into());
+    let handle = cx.update(|cx| {
+        patina_app::fonts::init(cx);
+        patina_app::notice::open_startup_failure(&error, 1.0, cx)
+            .expect("open the notice")
+            .0
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("close", cx);
+    })
+    .unwrap();
+    assert_eq!(window_count(cx), 0);
+    assert!(error.to_string().contains("no TLS backend"));
+}

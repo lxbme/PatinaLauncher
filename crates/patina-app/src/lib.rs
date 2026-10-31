@@ -4,9 +4,11 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod assets;
+pub mod core_bridge;
 pub mod fonts;
 pub mod i18n;
 pub mod logging;
+pub mod notice;
 pub mod platform;
 pub mod runtime;
 pub mod scale;

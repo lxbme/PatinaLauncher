@@ -135,12 +135,12 @@ mod tests {
 
         set_language(Language::En);
         assert_eq!(Phase::FetchMetadata.display_name(), "Fetching version info");
-        assert_eq!(rust_i18n::t!("single_instance.close"), "Close");
+        assert_eq!(rust_i18n::t!("notice.close"), "Close");
         assert_eq!(&*gpui_kit::component::locale(), "en");
 
         set_language(Language::ZhCn);
         assert_eq!(Phase::FetchMetadata.display_name(), "正在获取版本信息");
-        assert_eq!(rust_i18n::t!("single_instance.close"), "关闭");
+        assert_eq!(rust_i18n::t!("notice.close"), "关闭");
         assert_eq!(&*gpui_kit::component::locale(), "zh-CN");
     }
 

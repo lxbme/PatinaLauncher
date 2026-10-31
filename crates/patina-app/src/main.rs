@@ -3,9 +3,10 @@
 use std::time::Duration;
 
 use patina_app::assets::AppAssets;
+use patina_app::core_bridge::{Core, InitError};
 use patina_app::settings::{self, SettingsStore};
 use patina_app::single_instance::{self, AlreadyRunning};
-use patina_app::{i18n, logging, runtime};
+use patina_app::{i18n, logging, notice, runtime};
 use patina_core::paths::DataDirs;
 
 /// Temp files older than this are leftovers of a crashed run.
@@ -42,11 +43,24 @@ fn main() {
         },
     );
 
+    // Loads the config and the accounts on the runtime; never waits for them.
+    let core = match Core::init(rt.handle().clone(), data.clone()) {
+        Ok(core) => core,
+        Err(e) => {
+            tracing::error!(error = %e, "core services failed to start");
+            show_startup_failure(&e, settings.ui_scale);
+            rt.shutdown_timeout(RUNTIME_SHUTDOWN);
+            drop(guard);
+            std::process::exit(1);
+        }
+    };
+
     let store = SettingsStore::new(data.root(), settings);
     gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_global(core);
             patina_app::init(store, cx);
             patina_app::open_main_window(cx).expect("failed to open the main window");
             patina_app::quit_with_last_window(cx);
@@ -57,6 +71,22 @@ fn main() {
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
     // Last: the next Patina may start once this one is done with the data dir.
     drop(guard);
+}
+
+/// Says that Patina could not start, and why, then returns once the notice
+/// is closed.
+fn show_startup_failure(error: &InitError, ui_scale: f32) {
+    let error = error.clone();
+    gpui_kit::application()
+        .with_assets(AppAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            patina_app::fonts::init(cx);
+            notice::open_startup_failure(&error, ui_scale, cx)
+                .expect("failed to open the notice window");
+            patina_app::quit_with_last_window(cx);
+            cx.activate(true);
+        });
 }
 
 /// The second-instance path: say that Patina is already running, then quit.

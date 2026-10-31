@@ -4,4 +4,14 @@ app:
 single_instance:
   title: "Patina is already running"
   body: "Only one copy of Patina can run at a time."
+
+core_bridge:
+  panicked: "An internal error stopped this task."
+  not_loaded: "Not loaded: reading the file was interrupted."
+  http_client: "Patina can't set up network access: %{error}"
+
+startup_failed:
+  title: "Patina can't start"
+
+notice:
   close: "Close"

@@ -1,0 +1,27 @@
+//! The bridge between the UI and patina-core.
+//!
+//! [`Core`] is a gpui global holding the core's services and a handle to the
+//! app's tokio runtime. Views never call the core on the gpui main thread:
+//!
+//! - async core work goes through [`run`], blocking core calls (the stores,
+//!   scans, `reattach`, ...) through [`run_blocking`]; both return a gpui
+//!   [`Task`](gpui_kit::Task) with the result (or [`BridgeError`]), and
+//!   dropping that task cancels the work if it has not started (or, for
+//!   async work, at its next await);
+//! - the config and the accounts are reached through [`Core::read_config`],
+//!   [`Core::update_config`] and [`Core::with_accounts`];
+//! - a stream of progress reaches a view through [`forward_progress`], at most
+//!   about 30 times a second;
+//! - every result is checked against the request that is current when it
+//!   arrives ([`Revision`], or the id of the instance it is for) and dropped
+//!   if it is stale.
+
+mod service;
+mod task;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
+pub use service::{Catalog, Core, InitError, LoadError, LoadedAccounts, LoadedConfig};
+pub use task::{
+    BridgeError, PROGRESS_MIN_GAP, Revision, RevisionId, forward_progress, run, run_blocking,
+};

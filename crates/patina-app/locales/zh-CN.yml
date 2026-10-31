@@ -4,4 +4,14 @@ app:
 single_instance:
   title: "Patina 已经在运行"
   body: "同一时间只能运行一个 Patina。"
+
+core_bridge:
+  panicked: "内部错误中断了此任务。"
+  not_loaded: "未加载：读取文件时被中断。"
+  http_client: "Patina 无法初始化网络访问：%{error}"
+
+startup_failed:
+  title: "Patina 无法启动"
+
+notice:
   close: "关闭"

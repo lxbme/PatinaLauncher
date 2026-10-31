@@ -5371,7 +5371,9 @@ dependencies = [
 name = "patina-app"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui-kit",
+ "patina-app",
  "patina-core",
  "rust-i18n",
  "serde",

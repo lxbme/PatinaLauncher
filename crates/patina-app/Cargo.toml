@@ -12,8 +12,12 @@ workspace = true
 # so a release build never carries them; `cargo app` (see .cargo/config.toml)
 # enables it.
 dev-offline = ["patina-core/dev-offline"]
+# Test doubles (`core_bridge::testing`) for this crate's integration tests.
+# Never enabled by a release build.
+test-support = []
 
 [dependencies]
+futures = "0.3.34"
 gpui-kit.workspace = true
 patina-core = { version = "0.1.0", path = "../patina-core" }
 rust-i18n = "4"
@@ -26,6 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 # Same source and version as the normal dependency; adds headless windows.
 gpui-kit = { workspace = true, features = ["test-support"] }
+# This crate with its test doubles, for the integration tests in `tests/`.
+patina-app = { path = ".", features = ["test-support"] }
 serde-saphyr = "2.0.0"
 serde_json = "1.0.154"
 tempfile = "3.27.0"
