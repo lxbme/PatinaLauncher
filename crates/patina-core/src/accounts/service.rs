@@ -26,6 +26,7 @@ use std::{
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc::UnboundedSender, watch};
 use uuid::Uuid;
 
+mod skin;
 mod transactions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +118,7 @@ impl Drop for Operation {
 struct Inner {
     data: DataDirs,
     client: MsaClient,
+    skin: super::skin::SkinClient,
     credentials: Arc<CredentialStore>,
     clock: Arc<dyn AuthClock>,
     operation: Arc<Mutex<OperationState>>,
@@ -192,6 +194,7 @@ impl AccountService {
             inner: Arc::new(Inner {
                 data,
                 client,
+                skin: super::skin::SkinClient::production(),
                 credentials: Arc::new(credentials),
                 clock,
                 operation: Arc::new(Mutex::new(OperationState::default())),

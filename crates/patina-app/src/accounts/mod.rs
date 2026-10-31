@@ -10,6 +10,7 @@
 //! which saves and then signals. Signing in only walks the dialog for now:
 //! the real flow and storing its account arrive with plan 3.
 
+mod avatar;
 #[cfg(feature = "dev-offline")]
 mod fake_login;
 mod login_dialog;
@@ -85,9 +86,17 @@ pub fn switch_to(id: String, window: &mut Window, cx: &mut App) -> Task<()> {
     })
 }
 
-/// The account's avatar: the first letter of its name on a tile whose tint
-/// follows its uuid (the skin's head arrives with plan 3).
+/// Read-only retained skin head, or the unchanged UUID-tinted letter tile.
 pub fn avatar(account: &Account, size: Rems, cx: &App) -> AnyElement {
+    use gpui_kit::{IntoElement, ObjectFit, Styled, StyledImage, img, rems};
+    if let Some(image) = avatar::cached_image(account, cx) {
+        return img(image)
+            .flex_none()
+            .size(size)
+            .rounded(rems(size.0 * 0.22))
+            .object_fit(ObjectFit::Cover)
+            .into_any_element();
+    }
     let ch = (account.username.chars().next())
         .and_then(|c| c.to_uppercase().next())
         .unwrap_or('?');

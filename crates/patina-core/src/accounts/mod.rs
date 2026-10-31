@@ -21,6 +21,9 @@ mod msa;
 mod policy;
 mod secret;
 mod service;
+mod skin;
+#[cfg(test)]
+mod skin_tests;
 pub use service::{
     AccountService, AccountSnapshot, AuthenticatedLaunchError, LaunchGrant, RemovalOutcome,
 };

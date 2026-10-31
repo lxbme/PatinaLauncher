@@ -98,6 +98,8 @@ impl AccountService {
         // All surviving references are now durably cleared; absent references
         // were durably removed/replaced. Errors above retain every marker.
         operation.state.revoked.clear();
+        // Decoration cleanup follows metadata commit and cannot undo it.
+        let _ = self.cleanup_heads(&store).await;
         Ok(store)
     }
     pub(super) async fn read_record(
@@ -129,6 +131,9 @@ impl AccountService {
         .await
     }
     pub(super) async fn cleanup(&self, store: &AccountStore) -> Result<bool, AuthError> {
+        // Run independently before native credential cleanup: its failure must
+        // never preserve a removed account's head. Recovery retries both.
+        let heads_clean = self.cleanup_heads(store).await.is_ok();
         let active = store.references();
         let credentials = self.inner.credentials.clone();
         blocking(move || {
@@ -140,7 +145,7 @@ impl AccountService {
                 }
             }
             credentials.write_journal(&remaining)?;
-            Ok(remaining.is_empty())
+            Ok(remaining.is_empty() && heads_clean)
         })
         .await
     }

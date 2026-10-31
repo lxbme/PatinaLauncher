@@ -1,6 +1,7 @@
 //! Platform abstraction. All OS-specific logic lives here; other modules
 //! must go through `crate::platform::*`.
 
+pub(crate) mod account_heads;
 pub(crate) mod credentials;
 #[cfg(all(test, target_os = "linux"))]
 mod credentials_tests;

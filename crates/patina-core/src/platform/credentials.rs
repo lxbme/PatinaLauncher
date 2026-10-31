@@ -179,6 +179,10 @@ mod linux {
             fail,
         )
     }
+    // Shared path traversal only; cache storage has its own policy/operations.
+    pub(crate) fn open_account_data_dir(data: &DataDirs) -> Result<OwnedFd, CredentialError> {
+        PrivateCredentialDir::open_root(data)
+    }
     impl PrivateCredentialDir {
         fn open_root(data: &DataDirs) -> Result<OwnedFd, CredentialError> {
             let path = data.root();
