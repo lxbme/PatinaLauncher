@@ -13,13 +13,24 @@ use patina_core::paths::DataDirs;
 use tokio::runtime::Handle;
 
 use super::service::Startup;
-use super::{Catalog, Core};
+use super::{Catalog, Core, LaunchBackend};
 
 /// A [`Core`] over `data` that lists versions from `catalog`. It loads the
 /// config and the accounts as the real one does and follows a configured
 /// download source, but never speed-tests.
 pub fn core(rt: Handle, data: DataDirs, catalog: Arc<dyn Catalog>) -> Core {
-    Core::start(rt, data, Some(catalog), Startup::Offline).expect("the test core starts")
+    Core::start(rt, data, Some(catalog), None, Startup::Offline).expect("the test core starts")
+}
+
+/// [`core`] that prepares launches through `launch` (fake games).
+pub fn core_with_launch(
+    rt: Handle,
+    data: DataDirs,
+    catalog: Arc<dyn Catalog>,
+    launch: Arc<dyn LaunchBackend>,
+) -> Core {
+    Core::start(rt, data, Some(catalog), Some(launch), Startup::Offline)
+        .expect("the test core starts")
 }
 
 /// Canned version lists. With no manifest set, asking for it fails; a loader

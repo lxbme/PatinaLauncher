@@ -30,6 +30,7 @@ use patina_core::instance::InstanceConfig;
 use rust_i18n::t;
 
 use crate::fonts::Strong;
+use crate::launch::{LaunchEvent, prelaunch_dialog};
 use crate::layout::TEXT_PRIMARY;
 use crate::theme::ProductColors;
 
@@ -44,7 +45,9 @@ pub use icon::{
 };
 pub use icon_picker::{IconPicked, IconPicker, is_supported_upload, pick_id};
 pub use list::{Filter, InstanceList};
-pub use model::{Entry, InstancesChanged, InstancesModel, RunState};
+pub use model::{Entry, InstancesChanged, InstancesModel};
+// The run state lives with the launch flow; listed here for the views.
+pub use crate::launch::RunState;
 pub use overview::OverviewStats;
 pub use version_picker::{
     ChooseNext, ChoosePrev, KindFilter, LOADER_KINDS, LoaderChanged, LoaderPicker, VersionChosen,
@@ -92,6 +95,7 @@ pub struct InstancesPage {
     /// [`AddInstance`] here, whatever has the keyboard.
     focus: FocusHandle,
     _observe: Subscription,
+    _launch_events: Subscription,
 }
 
 impl InstancesPage {
@@ -99,12 +103,23 @@ impl InstancesPage {
         let model = cx.new(|cx| InstancesModel::new(window, cx));
         let focus = cx.focus_handle();
         let _observe = cx.observe(&model, |_, _, cx| cx.notify());
+        // A prepared launch with warnings asks before it starts.
+        let _launch_events = cx.subscribe_in(
+            &model,
+            window,
+            |_, model, event: &LaunchEvent, window, cx| {
+                if let LaunchEvent::ConfirmWarnings { id } = event {
+                    prelaunch_dialog::open(model.clone(), id.clone(), window, cx);
+                }
+            },
+        );
         Self {
             list: cx.new(|cx| InstanceList::new(model.clone(), focus.clone(), cx)),
             detail: cx.new(|cx| DetailView::new(model.clone(), cx)),
             model,
             focus,
             _observe,
+            _launch_events,
         }
     }
 

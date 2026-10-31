@@ -1,6 +1,6 @@
 //! The selected instance's detail: header (icon, name, "加载器 · 版本 ·
-//! Java · 上次游玩", 启动), the tab strip with its teal underline, then the
-//! tab's content.
+//! Java · 上次游玩", the operation or run status, 启动 / 强制关闭…), the
+//! tab strip with its teal underline, then the tab's content.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{Tab as TabElement, Tabs};
@@ -24,7 +24,7 @@ use super::{
 };
 use crate::core_bridge::{Core, Revision, run_blocking};
 use crate::fonts::Strong;
-use crate::launch::{LogView, OpState};
+use crate::launch::{LogView, OpState, RunState, stop_dialog};
 use crate::layout::{GUTTER, TEXT_PRIMARY, TEXT_SECONDARY};
 use crate::shell::placeholder;
 use crate::theme::ProductColors;
@@ -331,11 +331,54 @@ impl DetailView {
                             .child(played),
                     ),
             )
-            .when_some(self.model.read(cx).op(&instance.id).cloned(), |d, op| {
-                d.child(self.render_op(&instance.id, &op, cx))
+            .map(|d| {
+                let model = self.model.read(cx);
+                match (model.op(&instance.id), model.run_state(&instance.id)) {
+                    (Some(op), _) => d.child(self.render_op(&instance.id, op, cx)),
+                    (None, Some(RunState::Exited(exit))) => {
+                        d.child(self.render_crash(&instance.id, exit.saved_log.clone(), cx))
+                    }
+                    (None, Some(RunState::HeldElsewhere { .. })) => d.child(
+                        div()
+                            .id("instance-elsewhere")
+                            .test_support()
+                            .min_w_0()
+                            .text_size(TEXT_SECONDARY)
+                            .text_color(theme.muted_foreground)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(t!("launch.elsewhere").to_string()),
+                    ),
+                    _ => d,
+                }
             })
-            .child(
-                // Launching arrives with plan 4b task 10.
+            .map(|d| {
+                let model = self.model.read(cx);
+                if !model.is_running(&instance.id) {
+                    return d;
+                }
+                let stopping = model.is_stopping(&instance.id);
+                let (model, id) = (self.model.clone(), instance.id.clone());
+                d.child(
+                    Button::new("instance-stop")
+                        .danger()
+                        .outline()
+                        .icon(Icon::new(IconName::Square))
+                        .label(t!("launch.force_stop").to_string())
+                        .loading(stopping)
+                        .disabled(stopping)
+                        .h(rems(2.25))
+                        .on_click(move |_, window, cx| {
+                            stop_dialog::open(model.clone(), id.clone(), window, cx);
+                        }),
+                )
+            })
+            .child({
+                let model = self.model.read(cx);
+                let busy = model.is_busy(&instance.id);
+                let starting = matches!(model.run_state(&instance.id), Some(RunState::Starting));
+                let (model, id) = (self.model.clone(), instance.id.clone());
                 Button::new("launch")
                     .custom(launch)
                     // A custom variant's resting fill is drawn at 20 %
@@ -343,13 +386,65 @@ impl DetailView {
                     .bg(teal)
                     .icon(IconName::Play)
                     .label(t!("instances.launch").to_string())
-                    .disabled(true)
+                    .loading(starting)
+                    .disabled(busy)
                     .h(rems(2.25))
                     .px(rems(1.25))
                     .gap_1p5()
                     .text_size(rems(0.875))
-                    .strong(FontWeight::SEMIBOLD, cx),
+                    .strong(FontWeight::SEMIBOLD, cx)
+                    .on_click(move |_, _, cx| {
+                        model.update(cx, |m, cx| m.launch(&id, cx));
+                    })
+            })
+    }
+
+    /// "游戏异常退出，日志已保存" with "打开文件夹" (the saved log) and
+    /// dismiss.
+    fn render_crash(
+        &self,
+        id: &str,
+        saved_log: Option<std::path::PathBuf>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let message = match saved_log {
+            Some(_) => t!("launch.crashed_saved"),
+            None => t!("launch.crashed"),
+        }
+        .to_string();
+        let open = saved_log.map(|path| {
+            Button::new("instance-crash-open")
+                .small()
+                .icon(Icon::new(IconName::FolderOpen))
+                .label(t!("common.open_folder").to_string())
+                .on_click(move |_, _, cx| cx.reveal_path(&path))
+        });
+        let (model, key) = (self.model.clone(), id.to_string());
+        let dismiss = Button::new("instance-crash-dismiss")
+            .ghost()
+            .small()
+            .label(t!("ops.dismiss").to_string())
+            .on_click(move |_, _, cx| {
+                model.update(cx, |m, cx| m.dismiss_exit(&key, cx));
+            });
+        v_flex()
+            .id("instance-crash")
+            .test_support()
+            .min_w_0()
+            .w(rems(22.))
+            .gap(rems(0.375))
+            .text_size(TEXT_SECONDARY)
+            .child(
+                div()
+                    .id("instance-crash-text")
+                    .aria_label(message.clone())
+                    .test_support()
+                    .text_color(theme.danger)
+                    .line_clamp(2)
+                    .child(message),
             )
+            .child(h_flex().gap_1().children(open).child(dismiss))
     }
 
     /// The running operation's bar with "step · amount" below it, or the
@@ -386,7 +481,12 @@ impl DetailView {
                         .child(text.join(" · ")),
                 )
             }
-            OpState::Failed { message, retry, .. } => {
+            OpState::Failed {
+                message,
+                retry,
+                fix,
+                ..
+            } => {
                 let (model, key) = (self.model.clone(), id.to_string());
                 let dismiss = {
                     let (model, key) = (model.clone(), key.clone());
@@ -398,14 +498,25 @@ impl DetailView {
                             model.update(cx, |m, cx| m.dismiss_op(&key, cx));
                         })
                 };
-                let retry = retry.is_some().then(|| {
-                    Button::new("instance-op-retry")
-                        .small()
-                        .label(t!("ops.retry").to_string())
-                        .on_click(move |_, _, cx| {
-                            model.update(cx, |m, cx| m.retry_op(&key, cx));
-                        })
-                });
+                // A fix takes the place of retrying.
+                let action = match fix {
+                    Some(fix) => Some(
+                        Button::new("instance-op-fix")
+                            .small()
+                            .label(fix.label())
+                            .on_click(move |_, _, cx| {
+                                model.update(cx, |m, cx| m.apply_fix(&key, cx));
+                            }),
+                    ),
+                    None => retry.is_some().then(|| {
+                        Button::new("instance-op-retry")
+                            .small()
+                            .label(t!("ops.retry").to_string())
+                            .on_click(move |_, _, cx| {
+                                model.update(cx, |m, cx| m.retry_op(&key, cx));
+                            })
+                    }),
+                };
                 area.w(rems(22.))
                     .child(
                         div()
@@ -416,7 +527,7 @@ impl DetailView {
                             .line_clamp(2)
                             .child(message.clone()),
                     )
-                    .child(h_flex().gap_1().children(retry).child(dismiss))
+                    .child(h_flex().gap_1().children(action).child(dismiss))
             }
         }
     }
@@ -488,10 +599,33 @@ impl DetailView {
 
     fn render_body(&self, instance: &Instance, cx: &App) -> AnyElement {
         match self.tab {
-            DetailTab::Log => match &self.log {
-                Some(log) => log.clone().into_any_element(),
-                None => div().into_any_element(),
-            },
+            DetailTab::Log => {
+                let elsewhere = matches!(
+                    self.model.read(cx).run_state(&instance.id),
+                    Some(RunState::HeldElsewhere { .. })
+                );
+                // The other process shows this game's log; this one does
+                // not tail it (the folder button opens current.log).
+                let note = elsewhere.then(|| {
+                    let theme = cx.theme();
+                    div()
+                        .id("log-elsewhere")
+                        .test_support()
+                        .flex_none()
+                        .px(GUTTER)
+                        .py_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_size(TEXT_SECONDARY)
+                        .text_color(theme.muted_foreground)
+                        .child(t!("launch.elsewhere_log").to_string())
+                });
+                v_flex()
+                    .size_full()
+                    .children(note)
+                    .child(div().flex_1().min_h_0().children(self.log.clone()))
+                    .into_any_element()
+            }
             DetailTab::Overview => overview::render(instance, self.stats(&instance.id), cx),
             tab => placeholder::page(tab.icon(), tab.label()).into_any_element(),
         }

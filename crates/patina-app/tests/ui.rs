@@ -9,7 +9,7 @@ use gpui_kit::component::Theme;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, Pixels, TestAppContext, px};
 use patina_app::core_bridge::testing::{self, FakeCatalog};
-use patina_app::core_bridge::{AccountsChanged, Core, LoadError};
+use patina_app::core_bridge::{AccountsChanged, Core, LaunchBackend, LoadError};
 use patina_app::i18n::Language;
 use patina_app::instances::{
     Filter, IconChoice, IconPicked, IconPicker, IconSource, InstanceList, InstancesChanged,
@@ -62,10 +62,27 @@ fn boot_with(
     start: AppSettings,
     catalog: Arc<FakeCatalog>,
 ) -> Booted {
+    boot_core(cx, dir, start, |rt, data| testing::core(rt, data, catalog))
+}
+
+/// [`boot`] with launches prepared by `games` (fake games).
+fn boot_games(cx: &mut TestAppContext, dir: &Path, games: Arc<dyn LaunchBackend>) -> Booted {
+    boot_core(cx, dir, AppSettings::default(), |rt, data| {
+        testing::core_with_launch(rt, data, Arc::new(FakeCatalog::new()), games)
+    })
+}
+
+/// Boots as [`boot`] does, with the core from `make_core`.
+fn boot_core(
+    cx: &mut TestAppContext,
+    dir: &Path,
+    start: AppSettings,
+    make_core: impl FnOnce(tokio::runtime::Handle, DataDirs) -> Core,
+) -> Booted {
     let language = LANGUAGE.lock().unwrap_or_else(|e| e.into_inner());
     patina_app::i18n::set_language(Language::En);
     let rt = patina_app::runtime::start();
-    let core = testing::core(rt.handle().clone(), DataDirs::new(dir), catalog);
+    let core = make_core(rt.handle().clone(), DataDirs::new(dir));
     // Core work finishes on the runtime's threads, not the test's.
     cx.executor().allow_parking();
     cx.update(gpui_kit::init);
@@ -526,6 +543,12 @@ fn shows(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementI
     .unwrap()
 }
 
+/// A running state for list tests: only a state, nothing follows or signals
+/// it.
+fn elsewhere() -> RunState {
+    RunState::HeldElsewhere { pid: 0 }
+}
+
 /// Writes a config `instance.toml` that does not parse.
 fn break_config(dir: &Path) {
     std::fs::write(dir.join("instance.toml"), "garbage[[").unwrap();
@@ -638,9 +661,7 @@ fn filter_chips_filter_by_loader_and_running(cx: &mut TestAppContext) {
     expect(cx, Filter::Running, &[]);
 
     // Running instances show under 运行中 as soon as they run.
-    model.update(cx, |m, cx| {
-        m.set_run_state("Forg", Some(RunState::Running), cx)
-    });
+    model.update(cx, |m, cx| m.set_run_state("Forg", Some(elsewhere()), cx));
     cx.run_until_parked();
     assert_eq!(rows(cx), ["Forg"]);
     assert!(shows(&app, cx, row_id("Forg")));
@@ -871,8 +892,8 @@ fn arrow_keys_move_the_selection_through_the_list(cx: &mut TestAppContext) {
     let list = instance_list(&app, cx);
     list.update(cx, |l, cx| l.set_filter(Filter::Running, cx));
     model.update(cx, |m, cx| {
-        m.set_run_state("I05", Some(RunState::Running), cx);
-        m.set_run_state("I07", Some(RunState::Running), cx);
+        m.set_run_state("I05", Some(elsewhere()), cx);
+        m.set_run_state("I07", Some(elsewhere()), cx);
     });
     cx.run_until_parked();
     press(cx, "down");
@@ -2284,5 +2305,658 @@ fn a_deleted_instance_forgets_its_log(cx: &mut TestAppContext) {
         assert!(m.crash_log("Kept").is_some());
         assert!(!m.has_log("Gone"));
         assert!(m.has_log("Kept"));
+    });
+}
+
+// ---- Launch ----
+
+use patina_app::launch::prelaunch_dialog::warning_id;
+use patina_core::accounts::AccountError;
+use patina_core::instance::Instance;
+use patina_core::launch::{
+    GameSession, KillHandle, LaunchAccount, LaunchCommand, PendingLaunch, SessionError,
+    running_game, test_account,
+};
+use patina_core::prepare::PrepareWarning;
+
+/// A fake game of instance `id`: `sh -c <script>` with the instance marker
+/// the core's identity checks look for. Scripts that run on keep the shell
+/// as the group leader (`… & wait`, never `exec`), so the core's stop and
+/// its checks see the game as it would a real one.
+fn fake_game(id: &str, script: &str) -> LaunchCommand {
+    LaunchCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            script.into(),
+            "fake-game".into(),
+            format!("-Dpatina.instance={id}"),
+        ],
+        cwd: std::env::temp_dir(),
+    }
+}
+
+/// Launches fake games running `script`, with `warnings` found while
+/// "preparing", for any account the store has; or fails every prepare with
+/// `fail`. Counts the prepares.
+struct FakeGames {
+    script: String,
+    warnings: Vec<PrepareWarning>,
+    fail: Option<fn() -> SessionError>,
+    prepares: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeGames {
+    fn running(script: &str) -> Arc<dyn LaunchBackend> {
+        Self::warning(script, Vec::new())
+    }
+
+    fn warning(script: &str, warnings: Vec<PrepareWarning>) -> Arc<dyn LaunchBackend> {
+        Arc::new(Self::with(script, warnings, None))
+    }
+
+    fn failing(fail: fn() -> SessionError) -> Arc<FakeGames> {
+        Arc::new(Self::with("exit 0", Vec::new(), Some(fail)))
+    }
+
+    fn with(
+        script: &str,
+        warnings: Vec<PrepareWarning>,
+        fail: Option<fn() -> SessionError>,
+    ) -> Self {
+        FakeGames {
+            script: script.into(),
+            warnings,
+            fail,
+            prepares: Default::default(),
+        }
+    }
+
+    fn prepares(&self) -> usize {
+        self.prepares.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl LaunchBackend for FakeGames {
+    fn launch_account(&self, _: &AccountStore, _: &str) -> Result<LaunchAccount, AccountError> {
+        Ok(test_account("Steve"))
+    }
+
+    fn prepare(
+        &self,
+        inst: Instance,
+        _: LaunchAccount,
+        _: ProgressSink,
+    ) -> futures::future::BoxFuture<'static, Result<PendingLaunch, SessionError>> {
+        self.prepares
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(fail) = self.fail {
+            return futures::future::ready(Err(fail())).boxed();
+        }
+        let (cmd, warnings) = (fake_game(&inst.id, &self.script), self.warnings.clone());
+        async move { GameSession::prepare_launch_with_command(&inst, cmd, warnings) }.boxed()
+    }
+}
+
+/// Stops the fake games this test started when it ends, also when it
+/// fails. Declare it after the app so it runs first. Each handle is a
+/// game's own: it signals only that game, and only while its pid still
+/// carries the game's identity.
+struct StopGames {
+    rt: tokio::runtime::Handle,
+    games: std::cell::RefCell<Vec<KillHandle>>,
+}
+
+impl StopGames {
+    fn new(rt: &tokio::runtime::Handle) -> Self {
+        Self {
+            rt: rt.clone(),
+            games: Default::default(),
+        }
+    }
+
+    fn add(&self, game: KillHandle) {
+        self.games.borrow_mut().push(game);
+    }
+}
+
+impl Drop for StopGames {
+    fn drop(&mut self) {
+        for game in self.games.take() {
+            self.rt.block_on(game.kill()).ok();
+        }
+    }
+}
+
+/// Runs gpui until `done` holds, for at most 20 s (games take real time).
+/// gpui's clock moves along with the real one, so its timers (the log
+/// forwarding's batching, the poll of a game held elsewhere) fire.
+fn settle_game(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    for _ in 0..2000 {
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the game did not get there within 20 s");
+}
+
+fn run_state(
+    model: &Entity<InstancesModel>,
+    cx: &mut TestAppContext,
+    id: &str,
+) -> Option<RunState> {
+    model.read_with(cx, |m, _| m.run_state(id).cloned())
+}
+
+/// The stop handle of `id`'s game once this app runs it.
+fn wait_running(model: &Entity<InstancesModel>, cx: &mut TestAppContext, id: &str) -> KillHandle {
+    settle_game(cx, |cx| {
+        matches!(run_state(model, cx, id), Some(RunState::Running { .. }))
+    });
+    match run_state(model, cx, id) {
+        Some(RunState::Running { killer, .. }) => killer,
+        state => panic!("not running: {state:?}"),
+    }
+}
+
+/// The label of element `id` inside the open dialog.
+fn dialog_label(
+    app: &Booted,
+    cx: &mut TestAppContext,
+    id: impl Into<gpui_kit::ElementId>,
+) -> String {
+    let id = id.into();
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let found = window.within("dialog").find(id);
+        found.label().map(str::to_owned).unwrap_or_default()
+    })
+    .unwrap()
+}
+
+fn dialog_click(app: &Booted, cx: &mut TestAppContext, id: &'static str) {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn failed_message(
+    model: &Entity<InstancesModel>,
+    cx: &mut TestAppContext,
+    id: &str,
+) -> Option<String> {
+    match op_of(model, cx, id) {
+        Some(OpState::Failed { message, .. }) => Some(message),
+        _ => None,
+    }
+}
+
+/// An account in the store, so launching gets past the account check.
+fn with_account(dir: &Path) {
+    std::fs::write(dir.join("accounts.toml"), ACCOUNT).unwrap();
+}
+
+#[gpui_kit::test]
+fn second_launch_is_busy_with_display_name(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    store.rename(&a, "My Pack").unwrap();
+    let b = store.create("Beta", "1.21.1").unwrap().id;
+    store.rename(&b, "Other Pack").unwrap();
+    with_account(tmp.path());
+    let app = boot_games(cx, tmp.path(), FakeGames::running("sleep 30 & wait"));
+    let games = StopGames::new(app._rt.handle());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    click(&app, cx, row_id(&a));
+    click(&app, cx, "launch");
+    games.add(wait_running(&model, cx, &a));
+    // Running: 启动 is greyed and the model refuses a second launch.
+    assert!(disabled(&app, cx, "launch"));
+    assert!(shows(&app, cx, "instance-stop"));
+    assert!(model.read_with(cx, |m, _| m.is_busy(&a)));
+    assert!(!model.update(cx, |m, cx| m.launch(&a, cx)));
+    assert!(op_of(&model, cx, &a).is_none());
+
+    // Another operation holds Beta (here: its lock, held by this test),
+    // and no game runs: the launch fails, naming Beta by its display name,
+    // and may be retried.
+    let lock = store.lock(&b).unwrap();
+    click(&app, cx, row_id(&b));
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| failed_message(&model, cx, &b).is_some());
+    let message = failed_message(&model, cx, &b).unwrap();
+    assert_eq!(message, "“Other Pack” is busy with another operation");
+    assert!(!message.contains(&b), "{message}");
+    // Looking for a game finds none; the failure stays, with retry.
+    settle_game(cx, |cx| model.read_with(cx, |m, _| !m.is_following(&b)));
+    assert!(run_state(&model, cx, &b).is_none());
+    assert!(failed_message(&model, cx, &b).is_some());
+    assert!(shows(&app, cx, "instance-op-retry"));
+    drop(lock);
+
+    // Someone else launched Beta's game (here: a session this test holds).
+    // The launch finds the instance busy, then the game: the header shows
+    // it running elsewhere, with no failure and no retry.
+    let beta = store.load(&b).unwrap();
+    let held = app._rt.block_on(async {
+        let pending = GameSession::prepare_launch_with_command(
+            &beta,
+            fake_game(&b, "sleep 30 & wait"),
+            vec![],
+        )
+        .unwrap();
+        pending.launch(None).await.unwrap()
+    });
+    games.add(held.killer());
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| {
+        matches!(
+            run_state(&model, cx, &b),
+            Some(RunState::HeldElsewhere { pid }) if pid == held.pid()
+        )
+    });
+    assert!(op_of(&model, cx, &b).is_none(), "the failed launch is gone");
+    assert!(!shows(&app, cx, "instance-op-retry"));
+    assert!(shows(&app, cx, "instance-elsewhere"));
+    assert!(shows(&app, cx, "instance-stop"));
+    assert!(disabled(&app, cx, "launch"));
+    // Alpha's game was not disturbed.
+    assert!(matches!(
+        run_state(&model, cx, &a),
+        Some(RunState::Running { .. })
+    ));
+    drop(held);
+}
+
+#[gpui_kit::test]
+fn warnings_dialog_cancel_releases_locks(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = DataDirs::new(tmp.path());
+    let store = InstanceStore::new(data.instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    with_account(tmp.path());
+    let warning = PrepareWarning::LowMemory {
+        requested_mib: 4096,
+        available_mib: 1024,
+    };
+    let games_backend = FakeGames::warning("sleep 30 & wait", vec![warning.clone()]);
+    let app = boot_games(cx, tmp.path(), games_backend);
+    let games = StopGames::new(app._rt.handle());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| shows(&app, cx, "dialog"));
+    assert_eq!(dialog_label(&app, cx, "prelaunch-title"), "Play “Alpha”?");
+    assert_eq!(dialog_label(&app, cx, warning_id(0)), warning.to_string());
+    assert!(matches!(
+        run_state(&model, cx, &a),
+        Some(RunState::Starting)
+    ));
+    assert!(
+        store.lock(&a).is_err(),
+        "the prepared launch holds the instance"
+    );
+
+    // 取消: nothing starts and the locks are free again.
+    dialog_click(&app, cx, "cancel");
+    assert!(!shows(&app, cx, "dialog"));
+    assert!(run_state(&model, cx, &a).is_none());
+    assert!(!disabled(&app, cx, "launch"));
+    drop(store.lock(&a).expect("the instance lock is released"));
+    drop(
+        data.lock_version_exclusive("1.21.1")
+            .expect("the version lock is released"),
+    );
+    let inst = store.load(&a).unwrap();
+    assert!(running_game(&inst).is_none());
+    assert!(
+        !inst.dir.join("patina-logs/current.log").exists(),
+        "never spawned"
+    );
+
+    // 继续启动 starts it.
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| shows(&app, cx, "dialog"));
+    dialog_click(&app, cx, "ok");
+    games.add(wait_running(&model, cx, &a));
+    assert!(!shows(&app, cx, "dialog"));
+    assert!(running_game(&inst).is_some());
+}
+
+#[gpui_kit::test]
+fn crash_shows_saved_log(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    with_account(tmp.path());
+    let app = boot_games(cx, tmp.path(), FakeGames::running("echo boom; exit 3"));
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| {
+        matches!(run_state(&model, cx, &a), Some(RunState::Exited(_)))
+    });
+    let Some(RunState::Exited(exit)) = run_state(&model, cx, &a) else {
+        unreachable!()
+    };
+    assert!(exit.crashed);
+    assert_eq!(exit.code, Some(3));
+    let saved = exit.saved_log.clone().expect("the log is saved");
+    assert!(std::fs::read_to_string(&saved).unwrap().contains("boom"));
+    assert_eq!(
+        model.read_with(cx, |m, _| m.crash_log(&a).map(Path::to_owned)),
+        Some(saved)
+    );
+    // The header says so, with the folder one click away.
+    let text = element(&app, cx, "instance-crash-text").expect("the crash notice");
+    assert_eq!(
+        text.label(),
+        Some("The game quit unexpectedly. Its log was saved.")
+    );
+    assert!(shows(&app, cx, "instance-crash"));
+    assert!(shows(&app, cx, "instance-crash-open"));
+    assert!(!disabled(&app, cx, "launch"), "it can be launched again");
+    // So does the log tab, which got the run's output.
+    click(&app, cx, "tab-log");
+    assert!(shows(&app, cx, "log-crash-banner"));
+    let buffer = model.update(cx, |m, cx| m.log_buffer(&a, cx));
+    settle_game(cx, |cx| {
+        buffer.read_with(cx, |b, _| b.text().contains("boom"))
+    });
+    // Dismissing clears the header, not the log tab.
+    click(&app, cx, "instance-crash-dismiss");
+    assert!(!shows(&app, cx, "instance-crash"));
+    assert!(run_state(&model, cx, &a).is_none());
+    assert!(shows(&app, cx, "log-crash-banner"));
+}
+
+#[gpui_kit::test]
+fn force_stop_requires_confirmation_and_is_not_a_crash(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    with_account(tmp.path());
+    let app = boot_games(cx, tmp.path(), FakeGames::running("sleep 30 & wait"));
+    let games = StopGames::new(app._rt.handle());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let inst = store.load(&a).unwrap();
+
+    click(&app, cx, "launch");
+    games.add(wait_running(&model, cx, &a));
+
+    // Asks first; 取消 leaves the game running.
+    click(&app, cx, "instance-stop");
+    assert!(shows(&app, cx, "dialog"));
+    assert_eq!(dialog_label(&app, cx, "stop-title"), "Force stop “Alpha”?");
+    dialog_click(&app, cx, "cancel");
+    assert!(!shows(&app, cx, "dialog"));
+    std::thread::sleep(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(matches!(
+        run_state(&model, cx, &a),
+        Some(RunState::Running { .. })
+    ));
+    assert!(running_game(&inst).is_some());
+
+    // 强制关闭 stops it; a stop the user asked for is no crash.
+    app.language(Language::ZhCn);
+    click(&app, cx, "instance-stop");
+    assert_eq!(dialog_label(&app, cx, "stop-title"), "强制关闭\"Alpha\"？");
+    dialog_click(&app, cx, "ok");
+    settle_game(cx, |cx| run_state(&model, cx, &a).is_none());
+    assert!(running_game(&inst).is_none());
+    assert!(model.read_with(cx, |m, _| m.crash_log(&a).is_none()));
+    assert!(!shows(&app, cx, "instance-crash"));
+    assert!(!shows(&app, cx, "instance-stop"));
+    let logs = std::fs::read_dir(inst.dir.join("patina-logs")).unwrap();
+    let crash_logs = logs
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("crash"))
+        .count();
+    assert_eq!(crash_logs, 0, "no crash log saved");
+}
+
+#[gpui_kit::test]
+fn reattach_on_startup_restores_running_state(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    let inst = store.load(&a).unwrap();
+    // An earlier launcher session started the game, then went away: its
+    // session is dropped, the game and its running record stay.
+    let earlier = patina_app::runtime::start();
+    let killer = earlier.block_on(async {
+        let pending = GameSession::prepare_launch_with_command(
+            &inst,
+            fake_game(&a, "sleep 30 & wait"),
+            vec![],
+        )
+        .unwrap();
+        let session = pending.launch(None).await.unwrap();
+        let killer = session.killer();
+        drop(session);
+        killer
+    });
+    // On the earlier runtime, which outlives the app (declared before it).
+    let games = StopGames::new(earlier.handle());
+    games.add(killer);
+    assert!(running_game(&inst).is_some());
+
+    // A new start of the app finds it after the first list load.
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    wait_running(&model, cx, &a);
+    assert!(matches!(
+        run_state(&model, cx, &a),
+        Some(RunState::Running {
+            reattached: true,
+            ..
+        })
+    ));
+    assert!(disabled(&app, cx, "launch"));
+
+    // And it can be stopped from here.
+    click(&app, cx, "instance-stop");
+    dialog_click(&app, cx, "ok");
+    settle_game(cx, |cx| run_state(&model, cx, &a).is_none());
+    assert!(running_game(&inst).is_none());
+    assert!(model.read_with(cx, |m, _| m.crash_log(&a).is_none()));
+    drop(app);
+    drop(games);
+}
+
+#[gpui_kit::test]
+async fn no_account_prompts_to_accounts_page(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = DataDirs::new(tmp.path());
+    let store = InstanceStore::new(data.instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    // The real launch backend: it is never reached without an account.
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    let shell = cx.update(|cx| app.root.read(cx).shell().clone());
+
+    click(&app, cx, "launch");
+    settle(cx, |cx| failed_message(&model, cx, &a).is_some());
+    assert_eq!(
+        failed_message(&model, cx, &a).as_deref(),
+        Some("No account to play with yet")
+    );
+    assert!(run_state(&model, cx, &a).is_none());
+    assert!(!shows(&app, cx, "instance-op-retry"));
+    let fix = element(&app, cx, "instance-op-fix").expect("a way to add one");
+    assert_eq!(fix.label(), Some("Add account"));
+    click(&app, cx, "instance-op-fix");
+    assert_eq!(shell.read_with(cx, |s, _| s.nav()), Nav::Accounts);
+    assert!(op_of(&model, cx, &a).is_none());
+
+    // A Microsoft account cannot play yet: the same way out.
+    std::fs::write(tmp.path().join("accounts.toml"), ACCOUNT).unwrap();
+    cx.update(|cx| {
+        Core::with_accounts(cx, move |accounts| {
+            *accounts = AccountStore::load(&data).map_err(|e| LoadError::Failed(Arc::new(e)));
+        })
+    })
+    .await
+    .unwrap();
+    shell.update(cx, |s, cx| s.navigate(Nav::Instances, cx));
+    settle(cx, |cx| shows(&app, cx, "launch"));
+    click(&app, cx, "launch");
+    settle(cx, |cx| failed_message(&model, cx, &a).is_some());
+    assert_eq!(
+        failed_message(&model, cx, &a).as_deref(),
+        Some("Microsoft sign-in isn’t available yet")
+    );
+    assert!(shows(&app, cx, "instance-op-fix"));
+    click(&app, cx, "instance-op-fix");
+    assert_eq!(shell.read_with(cx, |s, _| s.nav()), Nav::Accounts);
+}
+
+#[gpui_kit::test]
+fn external_game_is_found_on_refresh(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    let games = StopGames::new(app._rt.handle());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    assert!(run_state(&model, cx, &a).is_none());
+
+    // Another process starts the game after the app has loaded (here: a
+    // session this test holds).
+    let inst = store.load(&a).unwrap();
+    let held = app._rt.block_on(async {
+        let pending = GameSession::prepare_launch_with_command(
+            &inst,
+            fake_game(&a, "sleep 30 & wait"),
+            vec![],
+        )
+        .unwrap();
+        pending.launch(None).await.unwrap()
+    });
+    games.add(held.killer());
+    // The next refresh (the window becoming active) finds it.
+    refresh(&model, cx);
+    settle_game(cx, |cx| {
+        matches!(
+            run_state(&model, cx, &a),
+            Some(RunState::HeldElsewhere { pid }) if pid == held.pid()
+        )
+    });
+    assert!(shows(&app, cx, "instance-elsewhere"));
+    assert!(disabled(&app, cx, "launch"));
+    // Its log is the other process's; the log tab says so.
+    click(&app, cx, "tab-log");
+    assert!(shows(&app, cx, "log-elsewhere"));
+
+    // Once the other session lets go, this app takes the game over.
+    drop(held);
+    wait_running(&model, cx, &a);
+    assert!(matches!(
+        run_state(&model, cx, &a),
+        Some(RunState::Running {
+            reattached: true,
+            ..
+        })
+    ));
+    assert!(!shows(&app, cx, "instance-elsewhere"));
+    assert!(!shows(&app, cx, "log-elsewhere"));
+}
+
+#[gpui_kit::test]
+fn failed_prepare_returns_to_idle_with_retry(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    with_account(tmp.path());
+    let backend = FakeGames::failing(|| SessionError::Io {
+        path: "/nowhere".into(),
+        error: "disk on fire".into(),
+    });
+    let app = boot_games(cx, tmp.path(), backend.clone());
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| failed_message(&model, cx, &a).is_some());
+    assert!(
+        failed_message(&model, cx, &a)
+            .unwrap()
+            .contains("disk on fire")
+    );
+    assert!(run_state(&model, cx, &a).is_none(), "back to idle");
+    assert!(!disabled(&app, cx, "launch"));
+    assert!(!shows(&app, cx, "instance-op-fix"));
+    assert_eq!(backend.prepares(), 1);
+
+    // Retry launches again.
+    click(&app, cx, "instance-op-retry");
+    settle_game(cx, |cx| {
+        backend.prepares() == 2 && failed_message(&model, cx, &a).is_some()
+    });
+    assert!(run_state(&model, cx, &a).is_none());
+}
+
+#[gpui_kit::test]
+fn loader_needing_reinstall_offers_reinstall(cx: &mut TestAppContext) {
+    use patina_core::prepare::PrepareError;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let a = store.create("Alpha", "1.21.1").unwrap().id;
+    set_loader(&store, &a, ComponentUid::Fabric);
+    with_account(tmp.path());
+    let backend = FakeGames::failing(|| {
+        SessionError::Prepare(PrepareError::LoaderNeedsReinstall {
+            kind: LoaderKind::Fabric,
+            version: "1.0".into(),
+        })
+    });
+    let app = boot_games(cx, tmp.path(), backend);
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+
+    click(&app, cx, "launch");
+    settle_game(cx, |cx| failed_message(&model, cx, &a).is_some());
+    assert!(run_state(&model, cx, &a).is_none());
+    let fix = element(&app, cx, "instance-op-fix").expect("a reinstall button");
+    assert_eq!(fix.label(), Some("Reinstall"));
+    assert!(
+        !shows(&app, cx, "instance-op-retry"),
+        "retrying would fail again"
+    );
+    app.language(Language::ZhCn);
+    let fix = element(&app, cx, "instance-op-fix").unwrap();
+    assert_eq!(fix.label(), Some("重新安装"));
+
+    // It reinstalls the loader (the offline core fails that at once).
+    click(&app, cx, "instance-op-fix");
+    assert_eq!(
+        op_of(&model, cx, &a).map(|op| op.kind()),
+        Some(OpKind::Reinstall)
+    );
+    settle_game(cx, |cx| {
+        matches!(
+            op_of(&model, cx, &a),
+            Some(OpState::Failed {
+                kind: OpKind::Reinstall,
+                ..
+            })
+        )
     });
 }

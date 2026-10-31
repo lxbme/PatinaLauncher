@@ -17,6 +17,7 @@ use rust_i18n::t;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OwnedRwLockWriteGuard, RwLock};
 
+use super::launch::{CoreLaunchBackend, LaunchBackend};
 use super::task::{BridgeError, run, run_blocking};
 
 /// Why a file the core reads at startup is not in memory.
@@ -96,6 +97,8 @@ pub struct Core {
     pub store: InstanceStore,
     /// Version lists, injectable for UI tests.
     pub catalog: Arc<dyn Catalog>,
+    /// Prepares launches, injectable for UI tests (fake games).
+    pub launch_backend: Arc<dyn LaunchBackend>,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<Mutex<LoadedAccounts>>,
@@ -133,13 +136,14 @@ impl Core {
     /// and no stored pick, a speed test runs in the background, swaps the
     /// launcher and stores the pick. Network failures are only logged.
     pub fn init(rt: Handle, data: DataDirs) -> Result<Core, InitError> {
-        Core::start(rt, data, None, Startup::SpeedTest)
+        Core::start(rt, data, None, None, Startup::SpeedTest)
     }
 
     pub(super) fn start(
         rt: Handle,
         data: DataDirs,
         catalog: Option<Arc<dyn Catalog>>,
+        launch_backend: Option<Arc<dyn LaunchBackend>>,
         startup: Startup,
     ) -> Result<Core, InitError> {
         let client = {
@@ -164,16 +168,23 @@ impl Core {
             })
         });
         // What stays in memory if loading never finishes.
-        let config = LoadedConfig {
+        let config = Arc::new(RwLock::new(LoadedConfig {
             config: GlobalConfig::default(),
             load_error: Some(LoadError::NotLoaded),
-        };
+        }));
+        let launch_backend = launch_backend.unwrap_or_else(|| {
+            Arc::new(CoreLaunchBackend {
+                launcher: launcher.clone(),
+                config: config.clone(),
+            })
+        });
         let core = Core {
             rt,
             store: InstanceStore::new(data.instances()),
             data,
             catalog,
-            config: Arc::new(RwLock::new(config)),
+            launch_backend,
+            config,
             launcher,
             accounts: Arc::new(Mutex::new(Err(LoadError::NotLoaded))),
             startup,
@@ -377,7 +388,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     }
 }
 
-fn current(launcher: &StdRwLock<Arc<Launcher>>) -> Arc<Launcher> {
+pub(super) fn current(launcher: &StdRwLock<Arc<Launcher>>) -> Arc<Launcher> {
     launcher
         .read()
         .unwrap_or_else(PoisonError::into_inner)

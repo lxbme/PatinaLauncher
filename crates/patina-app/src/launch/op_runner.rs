@@ -3,8 +3,10 @@
 
 use std::rc::Rc;
 
+use patina_core::launch::SessionError;
 use patina_core::loader::LoaderError;
 use patina_core::locks::BusyKind;
+use patina_core::prepare::PrepareError;
 use rust_i18n::t;
 
 use super::progress::ProgressView;
@@ -18,6 +20,28 @@ pub enum OpKind {
     RemoveLoader,
     Reinstall,
     Launch,
+    /// Force-stopping a running game.
+    Stop,
+}
+
+/// A fix the failed header offers in place of retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpFix {
+    /// No usable account: go to the accounts page.
+    AddAccount,
+    /// The loader's files are gone: reinstall it, then launch again.
+    ReinstallLoader,
+}
+
+impl OpFix {
+    /// The fix button's label.
+    pub fn label(self) -> String {
+        match self {
+            OpFix::AddAccount => t!("launch.add_account"),
+            OpFix::ReinstallLoader => t!("launch.reinstall"),
+        }
+        .to_string()
+    }
 }
 
 /// Starts the same operation again (the failed header's retry button).
@@ -39,6 +63,8 @@ pub enum OpState {
         message: String,
         /// Re-runs the operation, when it can be.
         retry: Option<RetryAction>,
+        /// Offered instead of retry when it fixes the cause.
+        fix: Option<OpFix>,
     },
 }
 
@@ -66,11 +92,13 @@ impl std::fmt::Debug for OpState {
                 kind,
                 message,
                 retry,
+                fix,
             } => f
                 .debug_struct("Failed")
                 .field("kind", kind)
                 .field("message", message)
                 .field("retry", &retry.is_some())
+                .field("fix", fix)
                 .finish(),
         }
     }
@@ -80,6 +108,7 @@ impl std::fmt::Debug for OpState {
 #[derive(Debug)]
 pub enum OpError {
     Loader(LoaderError),
+    Session(SessionError),
     /// Already localized.
     Message(String),
 }
@@ -87,6 +116,12 @@ pub enum OpError {
 impl From<LoaderError> for OpError {
     fn from(e: LoaderError) -> Self {
         OpError::Loader(e)
+    }
+}
+
+impl From<SessionError> for OpError {
+    fn from(e: SessionError) -> Self {
+        OpError::Session(e)
     }
 }
 
@@ -110,12 +145,32 @@ impl OpError {
     /// The message to show for this error: busy locks in the app's words,
     /// everything else as the core words it.
     pub fn message(&self, model: &InstancesModel) -> String {
+        let name_of = |id: &str| model.display_name(id).unwrap_or_else(|| id.to_string());
         match self {
-            OpError::Loader(LoaderError::Busy(busy)) => busy_message(&busy.what, |id| {
-                model.display_name(id).unwrap_or_else(|| id.to_string())
-            }),
+            OpError::Loader(LoaderError::Busy(busy)) => busy_message(&busy.what, name_of),
+            OpError::Session(SessionError::Busy(busy)) => busy_message(&busy.what, name_of),
             OpError::Loader(e) => e.to_string(),
+            OpError::Session(e) => e.to_string(),
             OpError::Message(m) => m.clone(),
         }
+    }
+
+    /// The fix to offer for this error, if one applies.
+    pub fn fix(&self) -> Option<OpFix> {
+        match self {
+            OpError::Session(SessionError::Prepare(PrepareError::LoaderNeedsReinstall {
+                ..
+            })) => Some(OpFix::ReinstallLoader),
+            _ => None,
+        }
+    }
+
+    /// Whether the game may already run elsewhere (its instance is held or
+    /// it runs), so the run state is worth checking.
+    pub fn may_be_running(&self) -> bool {
+        matches!(
+            self,
+            OpError::Session(SessionError::Busy(_) | SessionError::AlreadyRunning(_))
+        )
     }
 }

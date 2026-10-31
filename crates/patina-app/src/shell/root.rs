@@ -12,6 +12,12 @@ use super::placeholder;
 use super::{Nav, Rail, ShellState, StatusBar, TitleBarView};
 use crate::fonts;
 use crate::instances::{InstancesChanged, InstancesPage};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
+use rust_i18n::t;
+
+use crate::launch::LaunchEvent;
+use crate::settings::{AfterLaunch, SettingsStore};
 
 actions!(patina, [FocusSearch]);
 
@@ -29,6 +35,7 @@ pub struct RootView {
     focus: FocusHandle,
     _observe: Subscription,
     _instances_changed: Subscription,
+    _launch_events: Subscription,
 }
 
 impl RootView {
@@ -44,6 +51,7 @@ impl RootView {
         let _instances_changed = cx.subscribe(&model, |this, _, _: &InstancesChanged, cx| {
             this.status_bar.update(cx, |s, cx| s.refresh_now(cx));
         });
+        let _launch_events = cx.subscribe_in(&model, window, Self::on_launch_event);
         Self {
             title_bar: cx.new(|cx| TitleBarView::new(shell.clone(), window, cx)),
             rail: cx.new(|cx| Rail::new(shell.clone(), cx)),
@@ -51,6 +59,7 @@ impl RootView {
             instances,
             _observe: cx.observe(&shell, |_, _, cx| cx.notify()),
             _instances_changed,
+            _launch_events,
             shell,
             focus,
         }
@@ -70,6 +79,44 @@ impl RootView {
 
     pub fn instances(&self) -> &Entity<InstancesPage> {
         &self.instances
+    }
+
+    /// The launch flow's requests for the shell and the window.
+    fn on_launch_event(
+        &mut self,
+        _: &Entity<crate::instances::InstancesModel>,
+        event: &LaunchEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            LaunchEvent::ShowAccounts => {
+                self.shell.update(cx, |s, cx| s.navigate(Nav::Accounts, cx));
+            }
+            LaunchEvent::Spawned {
+                warnings,
+                record_saved,
+                ..
+            } => {
+                for warning in warnings {
+                    window.push_notification(Notification::warning(warning.clone()), cx);
+                }
+                match SettingsStore::get(cx).after_launch {
+                    AfterLaunch::Keep => {}
+                    AfterLaunch::Minimize => window.minimize_window(),
+                    // The game keeps running: quitting drops its session,
+                    // which keeps the running record for the next start to
+                    // reattach.
+                    AfterLaunch::Close if *record_saved => cx.quit(),
+                    // Without the record nothing could find the game again.
+                    AfterLaunch::Close => {
+                        let text = t!("launch.close_skipped").to_string();
+                        window.push_notification(Notification::warning(text), cx);
+                    }
+                }
+            }
+            LaunchEvent::ConfirmWarnings { .. } => {}
+        }
     }
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {

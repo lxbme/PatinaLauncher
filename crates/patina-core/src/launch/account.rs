@@ -18,7 +18,8 @@ impl UserType {
 
 /// The identity a game is launched with. Fields and the Microsoft
 /// constructor are crate-private, so outside this crate one comes only from
-/// the account store; offline ones exist only with the `dev-offline` feature.
+/// the account store; offline ones exist only with the `dev-offline` feature
+/// (and test stand-ins, `test_account`, only with `test-support`).
 #[derive(Clone)]
 pub struct LaunchAccount {
     pub(crate) name: String,
@@ -82,6 +83,20 @@ pub fn offline_uuid(name: &str) -> Uuid {
 /// Development-only offline account; never available in default builds.
 #[cfg(feature = "dev-offline")]
 pub fn dev_offline_account(name: &str) -> LaunchAccount {
+    LaunchAccount {
+        name: name.to_string(),
+        uuid: offline_uuid(name),
+        access_token: "0".to_string(),
+        user_type: UserType::Legacy,
+        xuid: None,
+    }
+}
+
+/// A stand-in launch identity for other crates' tests (an offline-shaped
+/// player with a dummy token). Only with the `test-support` feature, which
+/// release builds never enable.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_account(name: &str) -> LaunchAccount {
     LaunchAccount {
         name: name.to_string(),
         uuid: offline_uuid(name),

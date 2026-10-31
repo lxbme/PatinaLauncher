@@ -84,7 +84,6 @@ instances:
     body: "Add an instance to choose a Minecraft version and loader."
   broken:
     label: "Broken config"
-    open_folder: "Open folder"
     delete: "Delete…"
     delete_title: "Delete “%{id}”?"
     delete_body: "This folder and everything in it will be deleted permanently."
@@ -138,4 +137,26 @@ log:
   open_folder: "Open log folder"
   omitted: "%{count} earlier lines omitted. See the log file for the full output."
   crash_saved: "Log saved to %{name}"
-  open_crash_folder: "Open folder"
+launch:
+  no_account: "No account to play with yet"
+  msa_unavailable: "Microsoft sign-in isn’t available yet"
+  add_account: "Add account"
+  reinstall: "Reinstall"
+  crashed_saved: "The game quit unexpectedly. Its log was saved."
+  crashed: "The game quit unexpectedly."
+  force_stop: "Force stop…"
+  stop_failed: "Couldn’t stop the game: %{error}"
+  close_skipped: "Couldn’t save the game’s running record, so Patina stays open: after quitting it couldn’t reattach to this game."
+  elsewhere: "Running in another Patina process"
+  elsewhere_log: "Another Patina process manages this game and shows its log. You can also read current.log in the log folder."
+  prelaunch:
+    title: "Play “%{name}”?"
+    confirm: "Play anyway"
+    cancel: "Cancel"
+  stop:
+    title: "Force stop “%{name}”?"
+    body: "The game will be forced to quit. World progress it hasn’t saved may be lost."
+    confirm: "Force stop"
+    cancel: "Cancel"
+common:
+  open_folder: "Open folder"

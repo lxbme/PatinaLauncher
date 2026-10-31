@@ -13,17 +13,21 @@
 //!   the accounts then calls [`AccountsChanged::bump`] so views re-read them;
 //! - a stream of progress reaches a view through [`forward_progress`], at most
 //!   about 30 times a second;
+//! - launches are prepared through `Core.launch_backend` ([`LaunchBackend`]),
+//!   which UI tests replace with fake games;
 //! - every result is checked against the request that is current when it
 //!   arrives ([`Revision`], or the id of the instance it is for) and dropped
 //!   if it is stale.
 
 mod accounts_changed;
+mod launch;
 mod service;
 mod task;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use accounts_changed::{AccountsChanged, AccountsEpoch};
+pub use launch::LaunchBackend;
 pub use service::{Catalog, Core, InitError, LoadError, LoadedAccounts, LoadedConfig};
 pub use task::{
     BridgeError, PROGRESS_MIN_GAP, Revision, RevisionId, forward_progress, run, run_blocking,

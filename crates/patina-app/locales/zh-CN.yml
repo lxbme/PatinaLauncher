@@ -84,7 +84,6 @@ instances:
     body: "添加一个实例，选择 Minecraft 版本和加载器。"
   broken:
     label: "配置损坏"
-    open_folder: "打开文件夹"
     delete: "删除…"
     delete_title: '删除"%{id}"？'
     delete_body: "将永久删除这个文件夹及其中的全部内容。"
@@ -138,4 +137,26 @@ log:
   open_folder: "打开日志文件夹"
   omitted: "较早的 %{count} 行已省略，完整内容见日志文件"
   crash_saved: "日志已保存到 %{name}"
-  open_crash_folder: "打开文件夹"
+launch:
+  no_account: "还没有可用的账号"
+  msa_unavailable: "微软登录暂未开放"
+  add_account: "去添加"
+  reinstall: "重新安装"
+  crashed_saved: "游戏异常退出，日志已保存。"
+  crashed: "游戏异常退出。"
+  force_stop: "强制关闭…"
+  stop_failed: "无法强制关闭：%{error}"
+  close_skipped: "无法保存游戏的运行记录，Patina 不会自动退出：退出后将无法再接入这个游戏。"
+  elsewhere: "在另一个 Patina 进程中运行"
+  elsewhere_log: "这个游戏由另一个 Patina 进程管理，日志显示在那里；也可以在日志文件夹中查看 current.log。"
+  prelaunch:
+    title: '启动"%{name}"？'
+    confirm: "继续启动"
+    cancel: "取消"
+  stop:
+    title: '强制关闭"%{name}"？'
+    body: "游戏会被强制终止，来不及保存的世界进度可能丢失。"
+    confirm: "强制关闭"
+    cancel: "取消"
+common:
+  open_folder: "打开文件夹"

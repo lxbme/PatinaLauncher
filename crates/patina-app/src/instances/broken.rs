@@ -154,7 +154,7 @@ impl RenderOnce for BrokenDetail {
                                     .outline()
                                     .small()
                                     .icon(Icon::new(IconName::FolderOpen))
-                                    .label(t!("instances.broken.open_folder").to_string())
+                                    .label(t!("common.open_folder").to_string())
                                     .on_click(move |_, _, cx| cx.open_with_system(&dir)),
                             )
                             .child(

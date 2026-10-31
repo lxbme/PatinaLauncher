@@ -1,5 +1,6 @@
 //! [`InstancesModel`]: the instance list as the instances page knows it, the
-//! selection, and which instances are running.
+//! selection, which instances are running, and the launch flow that gets
+//! them there.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,10 +11,13 @@ use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, SharedString, Subscription, Task, Window,
 };
 use patina_core::instance::{BrokenInstance, Instance, ListOutcome};
+use patina_core::launch::{PendingLaunch, running_game};
 use patina_core::progress::{ProgressSink, TaskProgress};
 
 use crate::core_bridge::{Core, Revision, forward_progress, run, run_blocking};
-use crate::launch::{LogBuffer, OpError, OpKind, OpState, ProgressTracker, RetryAction};
+use crate::launch::{
+    LaunchEvent, LogBuffer, OpError, OpFix, OpKind, OpState, ProgressTracker, RetryAction, RunState,
+};
 
 /// Identifies one operation when it finishes.
 struct OpMeta {
@@ -34,15 +38,29 @@ struct OpEntry {
     _job: Task<()>,
 }
 
-/// What a running instance is doing. Plan 4b task 10 (launch) adds the
-/// states between "prepared" and "exited"; until then nothing sets it
-/// outside tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RunState {
-    /// The game process is up.
-    Running,
+/// A launch in progress (the instance's state is [`RunState::Starting`]):
+/// the account lookup, then the prepare and spawn operations. Dropping it
+/// cancels what is left, including a prepared launch waiting for the
+/// warnings to be confirmed (which releases its locks).
+struct LaunchFlow {
+    token: u64,
+    /// Prepared, waiting for the pre-launch warnings to be answered.
+    pending: Option<PendingLaunch>,
+    _task: Task<()>,
 }
+
+/// Follows a game: its session's `wait`, or the poll of a game another
+/// process holds. Dropping it stops following (a session is then dropped,
+/// which keeps its running record: the game goes on).
+struct Track {
+    token: u64,
+    _task: Task<()>,
+}
+
+/// What happens after an operation fails or its instance is gone (`None`).
+type OnFail = Box<dyn FnOnce(&mut InstancesModel, Option<&OpError>, &mut Context<InstancesModel>)>;
+
+mod launch;
 
 /// One entry of the list: an instance that loads, or a directory whose
 /// config does not.
@@ -88,6 +106,17 @@ pub struct InstancesModel {
     generation: u64,
     selected: Option<String>,
     running: HashMap<String, RunState>,
+    /// Launches in progress, by instance id.
+    flows: HashMap<String, LaunchFlow>,
+    /// Games being followed, by instance id.
+    tracks: HashMap<String, Track>,
+    /// The log forwarding of each instance's latest session.
+    log_forwards: HashMap<String, Task<()>>,
+    /// Force stops in flight (until the game is gone or the stop failed).
+    stopping: HashMap<String, Task<()>>,
+    /// Whether the games of an earlier launcher session were looked for.
+    reattach_started: bool,
+    reattach_task: Task<()>,
     /// Operations by instance id; see [`InstancesModel::start_op`].
     ops: HashMap<String, OpEntry>,
     next_op: u64,
@@ -107,6 +136,7 @@ pub struct InstancesModel {
 }
 
 impl EventEmitter<InstancesChanged> for InstancesModel {}
+impl EventEmitter<LaunchEvent> for InstancesModel {}
 
 impl InstancesModel {
     /// Starts loading the list, and reloads it whenever `window` becomes
@@ -125,6 +155,12 @@ impl InstancesModel {
             generation: 0,
             selected: None,
             running: HashMap::new(),
+            flows: HashMap::new(),
+            tracks: HashMap::new(),
+            log_forwards: HashMap::new(),
+            stopping: HashMap::new(),
+            reattach_started: false,
+            reattach_task: Task::ready(()),
             ops: HashMap::new(),
             next_op: 0,
             logs: HashMap::new(),
@@ -197,23 +233,43 @@ impl InstancesModel {
         cx.notify();
     }
 
-    pub fn run_state(&self, id: &str) -> Option<RunState> {
-        self.running.get(id).copied()
+    /// What the game of instance `id` is doing; `None` when idle.
+    pub fn run_state(&self, id: &str) -> Option<&RunState> {
+        self.running.get(id)
     }
 
+    /// Whether a game of instance `id` runs (here or in another Patina
+    /// process).
     pub fn is_running(&self, id: &str) -> bool {
-        self.running.contains_key(id)
+        self.running.get(id).is_some_and(RunState::is_running)
     }
 
-    /// Records what instance `id` is doing (`None`: not running).
+    /// Whether instance `id` must not be launched or changed now: an
+    /// operation runs on it, or its game is starting or running. The
+    /// versions and settings tabs disable their changes on it.
+    pub fn is_busy(&self, id: &str) -> bool {
+        self.is_op_running(id) || self.running.get(id).is_some_and(RunState::is_busy)
+    }
+
+    /// Whether this app follows a game of `id`: its session, or a look
+    /// through its running record (in flight or polling).
+    pub fn is_following(&self, id: &str) -> bool {
+        self.tracks.contains_key(id)
+    }
+
+    /// Whether a force stop of `id`'s game is in flight.
+    pub fn is_stopping(&self, id: &str) -> bool {
+        self.stopping.contains_key(id)
+    }
+
+    /// Sets what instance `id` is doing (`None`: idle) without following a
+    /// game; for tests and previews. The launch flow sets it itself.
     pub fn set_run_state(&mut self, id: &str, state: Option<RunState>, cx: &mut Context<Self>) {
-        let changed = match state {
-            Some(state) => self.running.insert(id.to_string(), state) != Some(state),
-            None => self.running.remove(id).is_some(),
+        match state {
+            Some(state) => self.running.insert(id.to_string(), state),
+            None => self.running.remove(id),
         };
-        if changed {
-            cx.notify();
-        }
+        cx.notify();
     }
 
     /// The log buffer of instance `id`, created empty on first use. It keeps
@@ -307,6 +363,23 @@ impl InstancesModel {
         retry: Option<RetryAction>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.start_op_with(id, kind, f, on_done, retry, Box::new(|_, _, _| {}), cx)
+    }
+
+    /// [`InstancesModel::start_op`] that also runs `on_fail` when the work
+    /// fails (before the failure lands on the header) or its result is
+    /// dropped because the instance is gone (with `None`).
+    #[allow(clippy::too_many_arguments)]
+    fn start_op_with<T: Send + 'static>(
+        &mut self,
+        id: &str,
+        kind: OpKind,
+        f: impl FnOnce(ProgressSink) -> BoxFuture<'static, Result<T, OpError>>,
+        on_done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+        retry: Option<RetryAction>,
+        on_fail: OnFail,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.is_op_running(id) {
             return false;
         }
@@ -333,8 +406,10 @@ impl InstancesModel {
                     kind,
                     retry,
                 };
-                this.update(cx, |this, cx| this.finish_op(meta, result, on_done, cx))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    this.finish_op(meta, result, on_done, on_fail, cx)
+                })
+                .ok();
             }
         });
         self.ops.insert(
@@ -378,6 +453,7 @@ impl InstancesModel {
         meta: OpMeta,
         result: Result<T, OpError>,
         on_done: impl FnOnce(&mut Self, T, &mut Context<Self>),
+        on_fail: OnFail,
         cx: &mut Context<Self>,
     ) {
         let OpMeta {
@@ -399,6 +475,7 @@ impl InstancesModel {
                 id,
                 "dropping the result of an operation on a deleted instance"
             );
+            on_fail(self, None, cx);
         } else {
             match result {
                 Ok(value) => {
@@ -408,26 +485,41 @@ impl InstancesModel {
                 Err(error) => {
                     let message = error.message(self);
                     tracing::warn!(id, ?kind, %message, "instance operation failed");
-                    let (forward, job) = (Task::ready(()), Task::ready(()));
-                    self.ops.insert(
-                        id.to_string(),
-                        OpEntry {
-                            state: OpState::Failed {
-                                kind,
-                                message,
-                                retry,
-                            },
-                            token,
-                            tracker: ProgressTracker::default(),
-                            _forward: forward,
-                            _job: job,
-                        },
-                    );
+                    on_fail(self, Some(&error), cx);
+                    let fix = error.fix();
+                    self.insert_failed(id, token, kind, message, retry, fix);
                 }
             }
         }
         self.refresh(cx);
         cx.notify();
+    }
+
+    /// Puts a failed operation on `id`'s header.
+    fn insert_failed(
+        &mut self,
+        id: &str,
+        token: u64,
+        kind: OpKind,
+        message: String,
+        retry: Option<RetryAction>,
+        fix: Option<OpFix>,
+    ) {
+        self.ops.insert(
+            id.to_string(),
+            OpEntry {
+                state: OpState::Failed {
+                    kind,
+                    message,
+                    retry,
+                    fix,
+                },
+                token,
+                tracker: ProgressTracker::default(),
+                _forward: Task::ready(()),
+                _job: Task::ready(()),
+            },
+        );
     }
 
     /// Starts the failed operation of `id` again through its retry action.
@@ -459,7 +551,24 @@ impl InstancesModel {
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let id = self.revision.start();
         let store = Core::global(cx).store.clone();
-        let list = run_blocking(cx, move || store.list());
+        // Once the startup look is done, also look (lock-free) for games of
+        // idle instances, such as ones another Patina process started.
+        let probe = self.reattach_started;
+        let known: HashSet<String> = (self.running.keys())
+            .chain(self.tracks.keys())
+            .cloned()
+            .collect();
+        let list = run_blocking(cx, move || {
+            let outcome = store.list();
+            let running: Vec<String> = match &outcome {
+                Ok(outcome) if probe => (outcome.instances.iter())
+                    .filter(|i| !known.contains(&i.id) && running_game(i).is_some())
+                    .map(|i| i.id.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (outcome, running)
+        });
         self.refreshing = true;
         // Replacing the task drops the previous refresh.
         self.task = cx.spawn(async move |this, cx| {
@@ -468,8 +577,22 @@ impl InstancesModel {
                 if !this.revision.is_current(id) {
                     return;
                 }
+                let result =
+                    result.map(|(outcome, running)| outcome.map(|outcome| (outcome, running)));
                 match result {
-                    Ok(Ok(outcome)) => this.apply(outcome),
+                    Ok(Ok((outcome, running))) => {
+                        this.apply(outcome);
+                        if !std::mem::replace(&mut this.reattach_started, true) {
+                            this.reattach_on_startup(cx);
+                        }
+                        for id in running {
+                            let idle =
+                                !this.running.contains_key(&id) && !this.tracks.contains_key(&id);
+                            if idle {
+                                this.follow_game(&id, false, cx);
+                            }
+                        }
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "listing the instances failed");
                         this.error = Some(error.to_string().into());
@@ -510,6 +633,11 @@ impl InstancesModel {
         let kept = |id: &String| running.contains_key(id) || find_entry(&outcome, id).is_some();
         self.logs.retain(|id, _| kept(id));
         self.crash_logs.retain(|id, _| kept(id));
+        // A crash notice has nothing to hang on to either; a game that runs
+        // stays (it ends by itself).
+        self.running.retain(|id, state| {
+            !matches!(state, RunState::Exited(_)) || find_entry(&outcome, id).is_some()
+        });
         self.outcome = outcome;
         self.error = None;
         self.generation += 1;

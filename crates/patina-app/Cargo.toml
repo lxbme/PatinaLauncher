@@ -37,6 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
 # This crate with its test doubles, for the integration tests in `tests/`.
 patina-app = { path = ".", features = ["test-support"] }
+# Launch entry points that skip prepare (fake games) and a stand-in launch
+# account, for the launch tests only; release builds never get them.
+patina-core = { version = "0.1.0", path = "../patina-core", features = ["test-support"] }
 serde-saphyr = "2.0.0"
 serde_json = "1.0.154"
 tempfile = "3.27.0"

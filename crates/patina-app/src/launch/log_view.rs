@@ -434,7 +434,7 @@ impl Render for LogView {
                 let open = Button::new("log-crash-open")
                     .ghost()
                     .small()
-                    .label(t!("log.open_crash_folder").to_string())
+                    .label(t!("common.open_folder").to_string())
                     .on_click(move |_, _, cx| cx.reveal_path(&path));
                 d.child(self.banner(
                     "log-crash-banner",
