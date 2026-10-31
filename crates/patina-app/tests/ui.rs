@@ -465,6 +465,29 @@ fn slash_focuses_search_but_not_inside_input(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+#[gpui_kit::test]
+fn slash_reaches_the_search_after_changing_page(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    store.create("Alpha", "1.21.1").unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    list_settled(&instances_model(&app, cx), cx);
+    // The list has the keyboard; then another page is chosen.
+    click(&app, cx, row_id("Alpha"));
+    for rail in [
+        "rail-accounts",
+        "rail-settings",
+        "rail-downloads",
+        "rail-instances",
+    ] {
+        click(&app, cx, rail);
+        press(&app, cx, "/");
+        let search = element(&app, cx, "search").unwrap();
+        assert_eq!(search.focused(), Some(true), "`/` after {rail}");
+        press(&app, cx, "escape");
+    }
+}
+
 /// Bytes of the regular files under `dir`, not following symbolic links.
 fn regular_bytes(dir: &Path) -> u64 {
     let mut total = 0;

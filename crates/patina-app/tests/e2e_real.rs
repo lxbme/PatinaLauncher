@@ -1,6 +1,8 @@
 //! Real end-to-end acceptance: the app's views over the REAL core (real
 //! downloads, real loader installs, real Minecraft), driven through the same
-//! headless window API as `tests/ui.rs`. Nothing here is faked.
+//! headless window API as `tests/ui.rs`. Mod jars are generated fixtures;
+//! the settings-folder check intercepts the opener instead of opening a
+//! desktop file manager. These are not screenshot or click-only evidence.
 //!
 //! The suite builds only with the `e2e` feature (which brings
 //! `dev-offline` and `test-support`), and every test is `#[ignore]`d on top:
@@ -32,15 +34,21 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::test::{ElementSnapshot, TestWindowExt};
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext};
+use patina_app::content::{
+    ImageCache, ImageKey, LoadState, ModItem, ModsTab, mod_disabled_id, mod_row_id, mod_switch_id,
+};
 use patina_app::core_bridge::Core;
 use patina_app::i18n::Language;
 use patina_app::instances::{
-    InstancesModel, RunState, loader_segment_id, pick_id, row_id, version_row_id,
+    DetailTab, InstancesModel, RunState, loader_segment_id, pick_id, row_id, version_row_id,
 };
 use patina_app::launch::OpState;
-use patina_app::settings::{AppSettings, SettingsStore};
-use patina_app::shell::{AccountLabel, RootView};
+use patina_app::search::{ModGroup, SearchItem, SearchModel, SearchResults, search_row_id};
+use patina_app::settings::{AfterLaunch, AppSettings, SettingsStore};
+use patina_app::settings_page::scale_step_id;
+use patina_app::shell::{AccountLabel, Nav, RootView};
 use patina_core::instance::{ComponentUid, InstanceIcon, InstanceStore, WindowSize};
+use patina_core::jvm::GcPreset;
 use patina_core::loader::LoaderKind;
 use patina_core::paths::DataDirs;
 
@@ -1182,6 +1190,767 @@ fn e2e_07_settings(cx: &mut TestAppContext) {
     });
     assert!(app.store.load(FORGE).is_err());
     assert!(!app.data.instances().join(FORGE).exists());
+}
+
+// ---- 8. Mods tab: manually placed jars, enable/disable, folders ---------
+
+/// The instance the Mods and search checks fill with hand-made jars.
+const MODS_HOME: &str = NEOFORGE;
+/// The hand-made jars: (file, name, version) — one per metadata format,
+/// three with an icon, one with no metadata at all.
+const JARS: [(&str, &str, Option<&str>); 4] = [
+    ("e2e-fabric.jar", "E2E Fabric Mod", Some("1.2.3")),
+    ("e2e-neo.jar", "E2E Neo Mod", Some("2.0.0")),
+    ("e2e-legacy.jar", "E2E Legacy Mod", Some("0.9")),
+    ("e2e-plain.jar", "e2e-plain", None),
+];
+
+/// Writes the jar `file` with `entries` into `dir`.
+fn jar(dir: &Path, file: &str, entries: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    let mut w = zip::ZipWriter::new(std::fs::File::create(dir.join(file)).unwrap());
+    for (name, bytes) in entries {
+        w.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(bytes).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// Puts the [`JARS`] into `mods` by hand (as a player would, outside the
+/// downloads page), with the bundled icons as their logos.
+fn place_jars(mods: &Path) {
+    let icon = |name: &str| {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("assets/instance-icons/{name}.png")),
+        )
+        .unwrap()
+    };
+    std::fs::create_dir_all(mods).unwrap();
+    let fabric = br#"{"schemaVersion":1,"id":"e2e_fabric","version":"1.2.3","name":"E2E Fabric Mod","authors":["Patina"],"icon":"assets/e2e/icon.png"}"#;
+    jar(
+        mods,
+        JARS[0].0,
+        &[
+            ("fabric.mod.json", fabric),
+            ("assets/e2e/icon.png", &icon("axe")),
+        ],
+    );
+    let neo = br#"modLoader = "javafml"
+loaderVersion = "[1,)"
+license = "MIT"
+[[mods]]
+modId = "e2eneo"
+version = "2.0.0"
+displayName = "E2E Neo Mod"
+authors = "Patina"
+logoFile = "logo.png"
+"#;
+    jar(
+        mods,
+        JARS[1].0,
+        &[
+            ("META-INF/neoforge.mods.toml", neo),
+            ("logo.png", &icon("sword")),
+        ],
+    );
+    let legacy = br#"[{"modid":"e2elegacy","name":"E2E Legacy Mod","version":"0.9","authorList":["Patina"],"logoFile":"logo.png"}]"#;
+    jar(
+        mods,
+        JARS[2].0,
+        &[("mcmod.info", legacy), ("logo.png", &icon("pickaxe"))],
+    );
+    jar(mods, JARS[3].0, &[("readme.txt", b"no metadata here")]);
+}
+
+/// Removes the hand-made jars (enabled or not) when dropped.
+struct RemoveJars(PathBuf);
+impl Drop for RemoveJars {
+    fn drop(&mut self) {
+        for (file, _, _) in JARS {
+            std::fs::remove_file(self.0.join(file)).ok();
+            std::fs::remove_file(self.0.join(format!("{file}.disabled"))).ok();
+        }
+    }
+}
+
+fn mods_tab(app: &Booted, cx: &mut TestAppContext) -> Entity<ModsTab> {
+    cx.update(|cx| {
+        let detail = app.root.read(cx).instances().read(cx).detail().clone();
+        detail
+            .read(cx)
+            .mods_view()
+            .cloned()
+            .expect("the Mods tab was shown")
+    })
+}
+
+fn mods_settled(tab: &Entity<ModsTab>, cx: &mut TestAppContext) {
+    settle(cx, |cx| {
+        tab.read_with(cx, |t, cx| {
+            let list = t.list().read(cx);
+            !list.is_reloading() && *list.state() == LoadState::Loaded
+        })
+    });
+}
+
+fn mod_items(tab: &Entity<ModsTab>, cx: &mut TestAppContext) -> Vec<ModItem> {
+    tab.read_with(cx, |t, cx| t.list().read(cx).items().to_vec())
+}
+
+fn nav(app: &Booted, cx: &mut TestAppContext) -> Nav {
+    cx.update(|cx| app.root.read(cx).shell().read(cx).nav())
+}
+
+#[gpui_kit::test]
+#[ignore = "real data dir"]
+fn e2e_08_mods_tab_and_folders(cx: &mut TestAppContext) {
+    let app = boot(cx);
+    loaded(&app, cx);
+    let mods = app.data.instances().join(MODS_HOME).join("minecraft/mods");
+    let _remove = RemoveJars(mods.clone());
+    place_jars(&mods);
+
+    select(&app, cx, MODS_HOME);
+    click(&app, cx, "tab-mods");
+    let tab = mods_tab(&app, cx);
+    mods_settled(&tab, cx);
+
+    // Name, version and an icon of each, from its own metadata format.
+    let items = mod_items(&tab, cx);
+    for (file, name, version) in JARS {
+        let item = items
+            .iter()
+            .find(|i| i.file_name == file)
+            .unwrap_or_else(|| panic!("{file} listed"));
+        eprintln!(
+            "row {file}: name {:?} detail {:?} format {:?} icon {:?} enabled {}",
+            item.name(),
+            item.detail(),
+            item.info.as_ref().map(|i| i.format),
+            item.info.as_ref().map(|i| i.has_icon),
+            item.enabled
+        );
+        assert_eq!(item.name(), name);
+        assert_eq!(
+            item.info.as_ref().and_then(|i| i.version.as_deref()),
+            version
+        );
+        assert!(shows(&app, cx, mod_row_id(file)), "{file} drawn");
+        let has_icon = version.is_some();
+        assert_eq!(item.info.as_ref().is_some_and(|i| i.has_icon), has_icon);
+        if has_icon {
+            // The row on show reads its icon into the cache.
+            let modified = (item.modified_nanos > 0)
+                .then(|| std::time::UNIX_EPOCH + Duration::from_nanos(item.modified_nanos));
+            let key = ImageKey::new(MODS_HOME, file, item.size, modified);
+            settle(cx, |cx| {
+                cx.update(|cx| cx.global_mut::<ImageCache>().get(&key).is_some())
+            });
+        }
+    }
+
+    // Disable and enable again with the row's switch.
+    let file = JARS[0].0;
+    let off = format!("{file}.disabled");
+    click(&app, cx, mod_switch_id(file));
+    settle(cx, |cx| {
+        mod_items(&tab, cx).iter().any(|i| i.file_name == off)
+    });
+    assert!(mods.join(&off).is_file() && !mods.join(file).exists());
+    eprintln!(
+        "disabled: {:?} on disk, row says {:?}",
+        off,
+        label_of(&app, cx, mod_disabled_id(&off))
+    );
+    assert_eq!(
+        label_of(&app, cx, mod_disabled_id(&off)).as_deref(),
+        Some("Disabled")
+    );
+    click(&app, cx, mod_switch_id(&off));
+    settle(cx, |cx| {
+        mod_items(&tab, cx).iter().any(|i| i.file_name == file)
+    });
+    assert!(mods.join(file).is_file() && !mods.join(&off).exists());
+
+    // A jar added outside the app shows after 刷新.
+    jar(&mods, "e2e-late.jar", &[("readme.txt", b"late")]);
+    click(&app, cx, "content-refresh");
+    mods_settled(&tab, cx);
+    assert!(
+        mod_items(&tab, cx)
+            .iter()
+            .any(|i| i.file_name == "e2e-late.jar")
+    );
+    std::fs::remove_file(mods.join("e2e-late.jar")).unwrap();
+
+    // Every folder button is there and can be used (the headless platform
+    // cannot open a file manager: the real click is the user's).
+    for tab_id in [
+        "tab-mods",
+        "tab-resource-packs",
+        "tab-shaders",
+        "tab-worlds",
+    ] {
+        click(&app, cx, tab_id);
+        settle(cx, |cx| shows(&app, cx, "content-open-folder"));
+        assert!(!disabled(&app, cx, "content-open-folder"), "{tab_id}");
+        eprintln!(
+            "{tab_id}: open folder {:?}",
+            label_of(&app, cx, "content-open-folder")
+        );
+    }
+    click(&app, cx, "tab-overview");
+    settle(cx, |cx| shows(&app, cx, "open-instance-folder"));
+    assert!(!disabled(&app, cx, "open-instance-folder"));
+
+    // The data folder on the settings page opens through its opener.
+    click(&app, cx, "rail-settings");
+    let page = cx.update(|cx| app.root.read(cx).settings().clone());
+    settle(cx, |cx| page.read_with(cx, |p, _| p.config().is_some()));
+    let opened = std::rc::Rc::new(std::cell::RefCell::new(None));
+    page.update(cx, |p, _| {
+        let opened = opened.clone();
+        p.set_opener(move |dir, _| *opened.borrow_mut() = Some(dir.to_path_buf()));
+    });
+    preveal(&app, cx, "prefs-data-open");
+    click(&app, cx, "prefs-data-open");
+    settle(cx, |_| opened.borrow().is_some());
+    eprintln!("data folder opened: {:?}", opened.borrow());
+    assert_eq!(opened.borrow().as_deref(), Some(data_dir().as_path()));
+
+    // 在线获取 goes to the downloads page with this instance as target.
+    click(&app, cx, "rail-instances");
+    click(&app, cx, "tab-mods");
+    click(&app, cx, "mods-online");
+    assert_eq!(nav(&app, cx), Nav::Downloads);
+    let downloads = cx.update(|cx| app.root.read(cx).downloads().read(cx).model().clone());
+    let target = downloads.read_with(cx, |m, _| m.target().map(str::to_owned));
+    eprintln!("downloads target: {target:?}");
+    assert_eq!(target.as_deref(), Some(MODS_HOME));
+}
+
+// ---- 9. global search: the three groups jump --------------------------
+
+fn search_model(app: &Booted, cx: &mut TestAppContext) -> Entity<SearchModel> {
+    cx.update(|cx| {
+        let view = app.root.read(cx).title_bar().read(cx).search().clone();
+        view.read(cx).model().clone()
+    })
+}
+
+/// Opens the search with `/`, types `text` and waits for its results.
+fn search_for(app: &Booted, cx: &mut TestAppContext, text: &str) -> SearchResults {
+    press(app, cx, "/");
+    type_text(app, cx, text);
+    let model = search_model(app, cx);
+    wait_for(cx, Duration::from_secs(30), "search results", |cx| {
+        model.read_with(cx, |m, _| {
+            m.results()
+                .is_some_and(|r| r.query == text && !matches!(r.mods, ModGroup::Indexing))
+        })
+    });
+    model.read_with(cx, |m, _| m.results().cloned().unwrap())
+}
+
+#[gpui_kit::test]
+#[ignore = "real data dir"]
+fn e2e_09_global_search_jumps(cx: &mut TestAppContext) {
+    let app = boot(cx);
+    let m = loaded(&app, cx);
+    let mods = app.data.instances().join(MODS_HOME).join("minecraft/mods");
+    let _remove = RemoveJars(mods.clone());
+    place_jars(&mods);
+    let model = search_model(&app, cx);
+    wait_for(cx, Duration::from_secs(60), "index", |cx| {
+        model.read_with(cx, |m, _| m.is_indexed() && !m.is_refreshing())
+    });
+    // The jars were placed by hand: the index learns of them when asked.
+    let refreshes = model.read_with(cx, |m, _| m.refreshes());
+    model.update(cx, |m, cx| m.request_refresh(cx));
+    wait_for(cx, Duration::from_secs(60), "index refresh", |cx| {
+        // A throttled refresh can be scheduled but not yet in flight.
+        model.read_with(cx, |m, _| m.refreshes() > refreshes && !m.is_refreshing())
+    });
+    select(&app, cx, FORGE_1201);
+    click(&app, cx, "rail-accounts");
+
+    // Instances: "E2E" finds the test instances.
+    let found = search_for(&app, cx, "E2E");
+    let names: Vec<_> = found.instances.iter().map(|i| i.name.clone()).collect();
+    let hits: Vec<_> = found
+        .mod_hits()
+        .iter()
+        .map(|h| format!("{} — {}", h.hit.name, h.instance_name))
+        .collect();
+    eprintln!("\"E2E\": instances {names:?}; mods {hits:?}");
+    for group in [
+        "search-group-instances",
+        "search-group-mods",
+        "search-group-online",
+    ] {
+        assert!(shows(&app, cx, group), "{group}");
+    }
+    assert!(names.iter().any(|n| n == MODS_HOME));
+    click(
+        &app,
+        cx,
+        search_row_id(&SearchItem::Instance(MODS_HOME.into())),
+    );
+    assert_eq!(nav(&app, cx), Nav::Instances);
+    assert_eq!(selected(&m, cx).as_deref(), Some(MODS_HOME));
+    assert!(!shows(&app, cx, "search-popup"));
+
+    // Mods: the hit opens its instance's Mods tab on that row.
+    select(&app, cx, FORGE_1201);
+    click(&app, cx, "rail-settings");
+    let found = search_for(&app, cx, "E2E Legacy");
+    let hit = found.mod_hits().first().expect("the legacy mod is found");
+    eprintln!(
+        "\"E2E Legacy\": {} {:?} in {}",
+        hit.hit.name, hit.hit.version, hit.instance_name
+    );
+    let item = SearchItem::Mod {
+        instance_id: MODS_HOME.into(),
+        file_name: JARS[2].0.into(),
+    };
+    click(&app, cx, search_row_id(&item));
+    assert_eq!(nav(&app, cx), Nav::Instances);
+    assert_eq!(selected(&m, cx).as_deref(), Some(MODS_HOME));
+    let detail = cx.update(|cx| app.root.read(cx).instances().read(cx).detail().clone());
+    assert_eq!(detail.read_with(cx, |d, _| d.tab()), DetailTab::Mods);
+    let tab = mods_tab(&app, cx);
+    settle(cx, |cx| {
+        tab.read_with(cx, |t, _| t.highlighted() == Some(JARS[2].0))
+    });
+    assert!(shows(&app, cx, mod_row_id(JARS[2].0)));
+
+    // Online: the downloads page, with the words.
+    let found = search_for(&app, cx, "sodium");
+    assert!(found.items().contains(&SearchItem::Online));
+    click(&app, cx, search_row_id(&SearchItem::Online));
+    assert_eq!(nav(&app, cx), Nav::Downloads);
+    let downloads = cx.update(|cx| app.root.read(cx).downloads().read(cx).model().clone());
+    let text = downloads.read_with(cx, |m, _| m.text().to_owned());
+    eprintln!("downloads words: {text:?}");
+    assert_eq!(text, "sodium");
+}
+
+// ---- 10. global settings, scale, language -------------------------------
+
+/// Scrolls the settings page until `id` (if drawn) is in view.
+fn preveal(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+    let id = id.into();
+    preveal_found(app, cx, |app, cx| element(app, cx, id.clone()));
+}
+
+fn preveal_found(
+    app: &Booted,
+    cx: &mut TestAppContext,
+    find: impl Fn(&Booted, &mut TestAppContext) -> Option<ElementSnapshot>,
+) {
+    for _ in 0..60 {
+        let Some(found) = find(app, cx) else {
+            return;
+        };
+        if found.visible() {
+            return;
+        }
+        let column = element(app, cx, "prefs-content").expect("the page is drawn");
+        let up = found.bounds().center().y < column.bounds().top();
+        let dy = gpui_kit::px(if up { 120. } else { -120. });
+        cx.update_window(app.handle, |_, window, cx| {
+            window.scroll(
+                "prefs-content",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(gpui_kit::px(0.), dy)),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+fn pradio(app: &Booted, cx: &mut TestAppContext, group: &'static str, ix: usize) {
+    // The group's top can be visible while the requested radio is clipped.
+    preveal_found(app, cx, |app, cx| {
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within(group).try_find(ix)
+        })
+        .unwrap()
+    });
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.within(group).click(ix, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn on_disk_java(app: &Booted) -> patina_core::config::JavaSettings {
+    patina_core::config::GlobalConfig::load(&app.data.config_file())
+        .unwrap()
+        .java
+}
+
+fn settings_saved(app: &Booted, cx: &mut TestAppContext) {
+    let page = cx.update(|cx| app.root.read(cx).settings().clone());
+    wait_for(cx, Duration::from_secs(10), "saves", |cx| {
+        page.read_with(cx, |p, _| !p.is_saving())
+    });
+}
+
+#[gpui_kit::test]
+#[ignore = "real data dir"]
+fn e2e_10_settings_scale_and_language(cx: &mut TestAppContext) {
+    let gui = data_dir().join("gui.toml");
+    let gui_before = std::fs::read(&gui).ok();
+    let config_before = std::fs::read(data_dir().join("config.toml")).unwrap();
+    let app = boot(cx);
+    loaded(&app, cx);
+    select(&app, cx, FORGE_1201);
+    activate(&app, cx);
+    click(&app, cx, "rail-settings");
+    let page = cx.update(|cx| app.root.read(cx).settings().clone());
+    settle(cx, |cx| page.read_with(cx, |p, _| p.config().is_some()));
+
+    // A default changes on disk, and back.
+    let min_before = on_disk_java(&app).min_mem_mib;
+    preveal(&app, cx, "prefs-min-mem");
+    click(&app, cx, "prefs-min-mem");
+    press(&app, cx, "secondary-a");
+    type_text(&app, cx, "768");
+    press(&app, cx, "enter");
+    settings_saved(&app, cx);
+    wait_for(cx, Duration::from_secs(10), "min memory saved", |_| {
+        on_disk_java(&app).min_mem_mib == 768
+    });
+    eprintln!("default min memory {min_before} -> 768 on disk");
+    preveal(&app, cx, "prefs-min-mem");
+    click(&app, cx, "prefs-min-mem");
+    press(&app, cx, "secondary-a");
+    type_text(&app, cx, &min_before.to_string());
+    press(&app, cx, "enter");
+    settings_saved(&app, cx);
+    wait_for(cx, Duration::from_secs(10), "min memory back", |_| {
+        on_disk_java(&app).min_mem_mib == min_before
+    });
+
+    // 启动后: minimize, then back to keep.
+    pradio(&app, cx, "prefs-after-launch-choice", 1);
+    assert_eq!(
+        cx.update(|cx| SettingsStore::get(cx).after_launch),
+        AfterLaunch::Minimize
+    );
+    pradio(&app, cx, "prefs-after-launch-choice", 0);
+    assert_eq!(
+        cx.update(|cx| SettingsStore::get(cx).after_launch),
+        AfterLaunch::Keep
+    );
+
+    // Scale: 125 % zooms the interface and is kept.
+    let base = cx.update(|cx| gpui_kit::component::Theme::global(cx).font_size);
+    preveal(&app, cx, scale_step_id(1.25));
+    click(&app, cx, scale_step_id(1.25));
+    assert_eq!(cx.update(|cx| SettingsStore::get(cx).ui_scale), 1.25);
+    let zoomed = cx.update(|cx| gpui_kit::component::Theme::global(cx).font_size);
+    eprintln!("font size {base:?} -> {zoomed:?} at 125 %");
+    assert_eq!(zoomed, base * 1.25);
+    cx.update(|cx| SettingsStore::flush(cx));
+    let saved = std::fs::read_to_string(&gui).unwrap();
+    eprintln!("gui.toml: {saved:?}");
+    assert!(saved.contains("ui_scale = 1.25"));
+    preveal(&app, cx, scale_step_id(1.0));
+    click(&app, cx, scale_step_id(1.0));
+    assert_eq!(
+        cx.update(|cx| gpui_kit::component::Theme::global(cx).font_size),
+        base
+    );
+
+    // Language: 中文, then English again; every view follows.
+    pradio(&app, cx, "prefs-language", 0);
+    assert_eq!(
+        cx.update(|cx| SettingsStore::get(cx).language),
+        Language::ZhCn
+    );
+    click(&app, cx, "rail-instances");
+    let zh = (
+        label_of(&app, cx, "tab-overview"),
+        label_of(&app, cx, "launch"),
+        label_of(&app, cx, "status-source"),
+    );
+    eprintln!("zh: {zh:?}");
+    assert_eq!(zh.0.as_deref(), Some("概览"));
+    assert_eq!(zh.1.as_deref(), Some("启动"));
+    assert!(zh.2.unwrap_or_default().starts_with("下载源"));
+    click(&app, cx, "rail-settings");
+    pradio(&app, cx, "prefs-language", 1);
+    click(&app, cx, "rail-instances");
+    let en = (
+        label_of(&app, cx, "tab-overview"),
+        label_of(&app, cx, "launch"),
+    );
+    eprintln!("en: {en:?}");
+    assert_eq!(en.0.as_deref(), Some("Overview"));
+    assert_eq!(en.1.as_deref(), Some("Play"));
+    cx.update(|cx| SettingsStore::flush(cx));
+
+    // Leave the data dir as it was.
+    drop(app);
+    match gui_before {
+        Some(bytes) => std::fs::write(&gui, bytes).unwrap(),
+        None => std::fs::remove_file(&gui).unwrap(),
+    }
+    assert_eq!(
+        std::fs::read(data_dir().join("config.toml")).unwrap(),
+        config_before,
+        "the defaults went back through the page"
+    );
+}
+
+// ---- 11. GC presets on Java 8, 21 and 25 ---------------------------------
+
+/// What a launch through the app showed and ran.
+struct Launched {
+    pid: u32,
+    warnings: Vec<String>,
+    args: Vec<String>,
+}
+
+/// Clicks 启动 on the selected `id`, notes the pre-launch warnings (and
+/// continues), waits for the game to get going, and reads its command line.
+fn launch_noting(app: &Booted, cx: &mut TestAppContext, id: &str) -> Launched {
+    let m = model(app, cx);
+    assert!(!disabled(app, cx, "launch"));
+    click(app, cx, "launch");
+    let mut warnings = Vec::new();
+    wait_for(cx, SLOW, "game start", |cx| {
+        if shows(app, cx, "dialog") && element(app, cx, "prelaunch-title").is_some() {
+            warnings = cx
+                .update_window(app.handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let mut found = Vec::new();
+                    let dialog = window.within("dialog");
+                    for i in 0..8 {
+                        match dialog.try_find(patina_app::launch::prelaunch_dialog::warning_id(i)) {
+                            Some(w) => found.push(w.label().unwrap_or_default().to_owned()),
+                            None => break,
+                        }
+                    }
+                    found
+                })
+                .unwrap();
+            dialog_click(app, cx, "ok");
+        }
+        if let Some(OpState::Failed { message, .. }) = op_of(&m, cx, id) {
+            panic!("launch failed: {message}");
+        }
+        matches!(run_state(&m, cx, id), Some(RunState::Running { .. }))
+    });
+    let Some(RunState::Running { pid, .. }) = run_state(&m, cx, id) else {
+        unreachable!()
+    };
+    let mut args = Vec::new();
+    wait_for(cx, Duration::from_secs(60), "java command line", |_| {
+        args = cmdline(pid);
+        args.iter().any(|a| a.starts_with("-Xmx"))
+    });
+    // The JVM took its flags if the game gets as far as its user.
+    let start = Instant::now();
+    wait_for(cx, Duration::from_secs(300), "game log", |cx| {
+        log_text(app, cx, id).contains("Setting user:")
+            || (start.elapsed() > Duration::from_secs(150) && !gone(pid))
+    });
+    assert!(!gone(pid), "the game still runs with these flags");
+    Launched {
+        pid,
+        warnings,
+        args,
+    }
+}
+
+fn gc_flags(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| a.starts_with("-XX:") || a.starts_with("-Xm"))
+        .cloned()
+        .collect()
+}
+
+/// The instance's GC preset and Java override, as saved.
+fn saved_gc(app: &Booted, id: &str) -> Option<GcPreset> {
+    app.store
+        .load(id)
+        .unwrap()
+        .config
+        .java_override
+        .map(|j| j.gc_preset)
+}
+
+fn gc_disabled(app: &Booted, cx: &mut TestAppContext, ix: usize) -> bool {
+    reveal(app, cx, "settings-gc");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .within("settings-gc")
+            .try_find(ix)
+            .and_then(|e| e.disabled())
+            == Some(true)
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+#[ignore = "starts real Minecraft six times"]
+fn e2e_11_gc_presets_per_instance(cx: &mut TestAppContext) {
+    let app = boot(cx);
+    loaded(&app, cx);
+    activate(&app, cx);
+    for (id, java) in [("forge-1122", 8), ("neo-1211", 21), ("neo-new", 25)] {
+        select(&app, cx, id);
+        sclick(&app, cx, "tab-settings");
+        assert!(
+            saved_gc(&app, id).is_none(),
+            "{id} starts on the global settings"
+        );
+        sclick(&app, cx, "settings-use-global");
+        settle(cx, |_| saved_gc(&app, id).is_some());
+        // The managed Java's version becomes known.
+        wait_for(cx, Duration::from_secs(60), "java known", |cx| {
+            !sshows(&app, cx, "settings-gc-unknown")
+        });
+        let off: Vec<bool> = (0..4).map(|ix| gc_disabled(&app, cx, ix)).collect();
+        let reason = label_of(&app, cx, "settings-gc-reason-2");
+        eprintln!(
+            "[{id} Java {java}] presets disabled (none, G1, ZGC, custom): {off:?}; ZGC note: {reason:?}"
+        );
+        assert_eq!(off, [false, false, java < 21, false]);
+
+        for (ix, preset) in [(1, GcPreset::G1Aikar), (2, GcPreset::GenerationalZgc)] {
+            if off[ix] {
+                // Greyed: a click preserves the previous preset (G1 was
+                // selected and launched earlier in this instance's loop).
+                let before = saved_gc(&app, id);
+                click_radio(&app, cx, "settings-gc", ix);
+                idle(cx, Duration::from_millis(500));
+                assert_eq!(saved_gc(&app, id), before);
+                eprintln!("[{id} Java {java}] {preset:?}: greyed out, not chosen");
+                continue;
+            }
+            click_radio(&app, cx, "settings-gc", ix);
+            settle(cx, |_| saved_gc(&app, id) == Some(preset));
+            let run = launch_noting(&app, cx, id);
+            eprintln!(
+                "[{id} Java {java}] {preset:?}: pid {} java {:?}\n  warnings {:?}\n  flags {:?}",
+                run.pid,
+                run.args.first(),
+                run.warnings,
+                gc_flags(&run.args)
+            );
+            let has = |flag: &str| run.args.iter().any(|a| a == flag);
+            match preset {
+                GcPreset::G1Aikar => {
+                    assert!(has("-XX:+UseG1GC") && has("-XX:G1HeapRegionSize=8M"));
+                }
+                _ => {
+                    assert!(has("-XX:+UseZGC"));
+                    assert_eq!(has("-XX:+ZGenerational"), java < 23);
+                }
+            }
+            assert!(run.warnings.iter().all(|w| !w.contains("GC")));
+            idle(cx, Duration::from_secs(10));
+            force_stop(&app, cx, id);
+            settle(cx, |_| gone(run.pid));
+            sclick(&app, cx, "tab-settings");
+        }
+        // Back on the global settings.
+        sclick(&app, cx, "settings-use-global");
+        settle(cx, |_| saved_gc(&app, id).is_none());
+    }
+}
+
+#[gpui_kit::test]
+#[ignore = "starts real Minecraft"]
+fn e2e_12_global_gc_default_ignored_on_java_8(cx: &mut TestAppContext) {
+    let config_before = std::fs::read(data_dir().join("config.toml")).unwrap();
+    let app = boot(cx);
+    loaded(&app, cx);
+    activate(&app, cx);
+
+    // The global default offers every preset, with a note.
+    click(&app, cx, "rail-settings");
+    let page = cx.update(|cx| app.root.read(cx).settings().clone());
+    settle(cx, |cx| page.read_with(cx, |p, _| p.config().is_some()));
+    preveal(&app, cx, "prefs-gc");
+    let off: Vec<bool> = (0..4)
+        .map(|ix| {
+            cx.update_window(app.handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.within("prefs-gc").find(ix).disabled() == Some(true)
+            })
+            .unwrap()
+        })
+        .collect();
+    eprintln!(
+        "global presets disabled: {off:?}; note {:?}",
+        label_of(&app, cx, "prefs-gc-note")
+    );
+    assert_eq!(off, [false; 4]);
+    pradio(&app, cx, "prefs-gc", 2);
+    settings_saved(&app, cx);
+    wait_for(cx, Duration::from_secs(10), "ZGC default saved", |_| {
+        on_disk_java(&app).gc_preset == GcPreset::GenerationalZgc
+    });
+
+    // Java 8 on the global settings: launches without it, and says so.
+    click(&app, cx, "rail-instances");
+    select(&app, cx, "forge-1122");
+    assert!(saved_gc(&app, "forge-1122").is_none());
+    let run = launch_noting(&app, cx, "forge-1122");
+    eprintln!(
+        "[forge-1122 Java 8, global ZGC] pid {}\n  warnings {:?}\n  flags {:?}",
+        run.pid,
+        run.warnings,
+        gc_flags(&run.args)
+    );
+    assert!(
+        run.warnings
+            .iter()
+            .any(|w| w.contains("Generational ZGC") && w.contains("ignored")),
+        "{:?}",
+        run.warnings
+    );
+    assert!(!run.args.iter().any(|a| a.contains("ZGC")));
+    idle(cx, Duration::from_secs(10));
+    force_stop(&app, cx, "forge-1122");
+    settle(cx, |_| gone(run.pid));
+
+    // Java 21 on the global default: it applies.
+    select(&app, cx, "neo-1211");
+    let run = launch_noting(&app, cx, "neo-1211");
+    eprintln!(
+        "[neo-1211 Java 21, global ZGC] pid {}\n  warnings {:?}\n  flags {:?}",
+        run.pid,
+        run.warnings,
+        gc_flags(&run.args)
+    );
+    assert!(run.args.iter().any(|a| a == "-XX:+UseZGC"));
+    idle(cx, Duration::from_secs(10));
+    force_stop(&app, cx, "neo-1211");
+    settle(cx, |_| gone(run.pid));
+
+    // Back to no GC flags.
+    click(&app, cx, "rail-settings");
+    pradio(&app, cx, "prefs-gc", 0);
+    settings_saved(&app, cx);
+    wait_for(cx, Duration::from_secs(10), "default back", |_| {
+        on_disk_java(&app).gc_preset == GcPreset::None
+    });
+    drop(app);
+    assert_eq!(
+        std::fs::read(data_dir().join("config.toml")).unwrap(),
+        config_before
+    );
 }
 
 // ---- language and cleanup ------------------------------------------------

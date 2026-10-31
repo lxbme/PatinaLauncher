@@ -43,6 +43,7 @@ pub struct RootView {
     settings: Entity<SettingsPage>,
     focus: FocusHandle,
     _observe: Subscription,
+    _focus_lost: Subscription,
     _instances_changed: Subscription,
     _launch_events: Subscription,
 }
@@ -64,6 +65,15 @@ impl RootView {
             this.status_bar.update(cx, |s, cx| s.refresh_now(cx));
         });
         let _launch_events = cx.subscribe_in(&model, window, Self::on_launch_event);
+        // When the focused element leaves the window (its page was switched
+        // away), the keyboard would reach nothing and `/` would be dead:
+        // give it to the closest ancestor still drawn, else to the root.
+        let _focus_lost = cx.on_focus_lost(window, |this, window, cx| {
+            let target = window
+                .focus_lost_restore_target(cx)
+                .unwrap_or_else(|| this.focus.clone());
+            target.focus(window, cx);
+        });
         let page = instances.downgrade();
         let closing = Rc::new(Cell::new(false));
         window.on_window_should_close(cx, move |window, cx| {
@@ -91,6 +101,7 @@ impl RootView {
                 }
                 cx.notify();
             }),
+            _focus_lost,
             _instances_changed,
             _launch_events,
             shell,
