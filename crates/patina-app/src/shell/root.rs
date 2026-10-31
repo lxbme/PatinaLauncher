@@ -11,6 +11,7 @@ use gpui_kit::{
 use super::placeholder;
 use super::{Nav, Rail, ShellState, StatusBar, TitleBarView};
 use crate::fonts;
+use crate::instances::{InstancesChanged, InstancesPage};
 
 actions!(patina, [FocusSearch]);
 
@@ -24,8 +25,10 @@ pub struct RootView {
     title_bar: Entity<TitleBarView>,
     rail: Entity<Rail>,
     status_bar: Entity<StatusBar>,
+    instances: Entity<InstancesPage>,
     focus: FocusHandle,
     _observe: Subscription,
+    _instances_changed: Subscription,
 }
 
 impl RootView {
@@ -34,11 +37,20 @@ impl RootView {
         let shell = cx.new(|_| ShellState::new());
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let instances = cx.new(|cx| InstancesPage::new(window, cx));
+        let model = instances.read(cx).model().clone();
+        // This app's own instance operations change the status bar's
+        // count and size at once, without waiting for its throttle.
+        let _instances_changed = cx.subscribe(&model, |this, _, _: &InstancesChanged, cx| {
+            this.status_bar.update(cx, |s, cx| s.refresh_now(cx));
+        });
         Self {
             title_bar: cx.new(|cx| TitleBarView::new(shell.clone(), window, cx)),
             rail: cx.new(|cx| Rail::new(shell.clone(), cx)),
             status_bar: cx.new(|cx| StatusBar::new(window, cx)),
+            instances,
             _observe: cx.observe(&shell, |_, _, cx| cx.notify()),
+            _instances_changed,
             shell,
             focus,
         }
@@ -56,13 +68,17 @@ impl RootView {
         &self.status_bar
     }
 
+    pub fn instances(&self) -> &Entity<InstancesPage> {
+        &self.instances
+    }
+
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.title_bar
             .update(cx, |t, cx| t.focus_search(window, cx));
     }
 
-    /// The page for `nav`. The instances page is mounted by the instance
-    /// list (plan 4b, task 6); the others are placeholders until plan 4c.
+    /// The page for `nav`. Every page but the instances page is a
+    /// placeholder until plan 4c.
     fn render_page(&self, nav: Nav) -> AnyElement {
         let page = div()
             .id(nav.page_id())
@@ -71,7 +87,7 @@ impl RootView {
             .h_full()
             .test_support();
         match nav {
-            Nav::Instances => page.into_any_element(),
+            Nav::Instances => page.child(self.instances.clone()).into_any_element(),
             Nav::Downloads => page
                 .child(placeholder::page(Lucide::Download, nav.label()))
                 .into_any_element(),

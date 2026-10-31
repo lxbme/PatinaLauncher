@@ -5,8 +5,10 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod assets;
 pub mod core_bridge;
+pub mod disk_usage;
 pub mod fonts;
 pub mod i18n;
+pub mod instances;
 pub mod layout;
 pub mod logging;
 pub mod notice;
@@ -43,6 +45,7 @@ pub fn init(settings: SettingsStore, cx: &mut App) {
     fonts::init(cx);
     scale::init(cx);
     shell::init(cx);
+    instances::init(cx);
     core_bridge::AccountsChanged::init(cx);
     cx.on_app_quit(|cx| {
         SettingsStore::flush(cx);

@@ -14,10 +14,11 @@ mod title_bar;
 
 use gpui_kit::{App, KeyBinding};
 
+pub use crate::disk_usage::format_size;
 pub use nav::{Nav, ShellState};
 pub use rail::Rail;
 pub use root::{FocusSearch, ROOT_CONTEXT, RootView};
-pub use status_bar::{InstanceUsage, SCAN_INTERVAL, StatusBar, format_size};
+pub use status_bar::{InstanceUsage, SCAN_INTERVAL, StatusBar};
 pub use title_bar::{AccountLabel, TitleBarView};
 
 /// Binds the shell's keys: `/` focuses the search unless a text input has

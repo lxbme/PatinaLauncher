@@ -7,7 +7,6 @@
 //! time, and on activation at most once per [`SCAN_INTERVAL`]; code that
 //! adds or removes instances calls [`StatusBar::refresh_now`].
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::separator::Separator;
@@ -25,6 +24,7 @@ use patina_core::java::ManagedRuntimes;
 use rust_i18n::t;
 
 use crate::core_bridge::{Core, Revision, run_blocking};
+use crate::disk_usage::{Walk, format_size};
 use crate::layout::{GUTTER, TEXT_SECONDARY};
 
 /// Status bar height at UI scale 1.0 (26 px).
@@ -79,12 +79,9 @@ impl InstanceUsage {
         let per_instance = budget(count);
         let (mut bytes, mut complete) = (0, true);
         for instance in &listed.instances {
-            let mut walk = Walk {
-                bytes: 0,
-                left: per_instance,
-            };
+            let mut walk = Walk::new(per_instance);
             complete &= walk.add_tree(&instance.dir);
-            bytes += walk.bytes;
+            bytes += walk.bytes();
         }
         Ok(Self {
             count,
@@ -92,65 +89,6 @@ impl InstanceUsage {
             complete,
         })
     }
-}
-
-/// A disk-use walk with an entry budget.
-struct Walk {
-    bytes: u64,
-    left: usize,
-}
-
-impl Walk {
-    /// Adds the regular files under `root`, without following symbolic
-    /// links (a linked `root` counts nothing). False once the budget ran out.
-    fn add_tree(&mut self, root: &Path) -> bool {
-        match std::fs::symlink_metadata(root) {
-            Ok(m) if m.is_dir() => {}
-            _ => return true,
-        }
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if self.left == 0 {
-                    return false;
-                }
-                self.left -= 1;
-                // Neither `file_type` nor `metadata` of a directory entry
-                // follows a symbolic link.
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
-                if kind.is_dir() {
-                    stack.push(entry.path());
-                } else if kind.is_file()
-                    && let Ok(m) = entry.metadata()
-                {
-                    self.bytes += m.len();
-                }
-            }
-        }
-        true
-    }
-}
-
-/// `bytes` in decimal units with one decimal place (`25.1 GB`), as file
-/// managers show sizes.
-pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
-    if bytes < 1000 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1000.;
-    let mut unit = 0;
-    // Round first, so 999.96 KB reads 1.0 MB rather than 1000.0 KB.
-    while (value * 10.).round() / 10. >= 1000. && unit + 1 < UNITS.len() {
-        value /= 1000.;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// When a disk-use scan may start: one at a time, and an unforced request
@@ -405,27 +343,15 @@ impl Render for StatusBar {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
 
-    #[test]
-    fn sizes_read_like_a_file_manager() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(999), "999 B");
-        assert_eq!(format_size(1000), "1.0 KB");
-        assert_eq!(format_size(1_536), "1.5 KB");
-        assert_eq!(format_size(999_960), "1.0 MB");
-        assert_eq!(format_size(25_100_000_000), "25.1 GB");
-        assert_eq!(format_size(u64::MAX), "18446.7 PB");
-    }
+    use super::*;
 
     /// Bytes of the regular files under `dir`, not following links.
     fn regular_bytes(dir: &Path) -> u64 {
-        let mut walk = Walk {
-            bytes: 0,
-            left: usize::MAX,
-        };
+        let mut walk = Walk::new(usize::MAX);
         assert!(walk.add_tree(dir));
-        walk.bytes
+        walk.bytes()
     }
 
     #[test]

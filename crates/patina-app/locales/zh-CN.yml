@@ -34,3 +34,55 @@ shell:
     instances: "实例 %{count} 个 · 共 %{size}"
     instances_partial: "实例 %{count} 个 · 至少 %{size}"
     version: "Patina %{version}"
+
+instances:
+  title: "实例"
+  add: "添加实例…"
+  vanilla: "原版"
+  running: "运行中"
+  no_match: "没有匹配的实例"
+  list_failed: "无法读取实例列表"
+  filter:
+    all: "全部"
+    running: "运行中"
+  time:
+    just_now: "刚刚"
+    minutes_ago: "%{count} 分钟前"
+    hours_ago: "%{count} 小时前"
+    days_ago: "%{count} 天前"
+    never: "从未"
+  played: "上次游玩 %{when}"
+  played_never: "未游玩"
+  java: "Java %{version}"
+  launch: "启动"
+  tabs:
+    overview: "概览"
+    versions: "版本"
+    mods: "Mods"
+    resource_packs: "资源包"
+    shaders: "光影"
+    worlds: "存档"
+    settings: "设置"
+    log: "日志"
+  overview:
+    loader: "加载器"
+    game_version: "游戏版本"
+    last_played: "上次游玩"
+    created: "创建时间"
+    mods: "Mods"
+    worlds: "存档"
+    size: "磁盘占用"
+    size_partial: "至少 %{size}"
+    open_folder: "打开实例文件夹"
+  empty:
+    title: "还没有实例"
+    body: "添加一个实例，选择 Minecraft 版本和加载器。"
+  broken:
+    label: "配置损坏"
+    open_folder: "打开文件夹"
+    delete: "删除…"
+    delete_title: '删除"%{id}"？'
+    delete_body: "将永久删除这个文件夹及其中的全部内容。"
+    delete_confirm: "删除"
+    cancel: "取消"
+    delete_failed: '无法删除"%{id}"：%{error}'

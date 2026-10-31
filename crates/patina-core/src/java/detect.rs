@@ -66,13 +66,26 @@ fn run_properties(java_bin: &Path) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new(java_bin)
-        .args(["-XshowSettings:properties", "-version"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+    // A binary written moments ago can still be held open for writing by a
+    // child forked concurrently elsewhere in the process, until that child
+    // execs; exec then fails with ETXTBSY. That clears within milliseconds.
+    let mut attempt = 0;
+    let mut child = loop {
+        match Command::new(java_bin)
+            .args(["-XshowSettings:properties", "-version"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => break c,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    };
     let mut stderr = child.stderr.take()?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -197,6 +210,31 @@ mod tests {
         assert_eq!(got.version, "1.8.0_202");
         assert!(got.is_64bit);
         assert_eq!(got.path, java.canonicalize().unwrap());
+    }
+
+    /// A just-written executable can still be open for writing in a child
+    /// forked by a concurrent spawn (ETXTBSY on exec); the probe must wait
+    /// that out instead of reporting the Java as unusable.
+    #[cfg(unix)]
+    #[test]
+    fn probe_retries_while_the_binary_is_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let java = fake_jdk(
+            tmp.path(),
+            "#!/bin/sh\necho '    java.version = 21' >&2\necho '    sun.arch.data.model = 64' >&2\n",
+        );
+        // An open write handle makes exec fail with ETXTBSY.
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&java)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(writer);
+        });
+        let got = probe(&java).expect("probe must outlast a transient ETXTBSY");
+        release.join().unwrap();
+        assert_eq!(got.major, 21);
     }
 
     #[cfg(unix)]
