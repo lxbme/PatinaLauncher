@@ -1,4 +1,4 @@
-//! Instance icons: the built-in set (24 CC0 pixel icons, see
+//! Instance icons: the built-in set (pixel icons and loader logos, see
 //! `assets/instance-icons/LICENSE.md`), a custom uploaded image, and the
 //! letter tile that stands in when neither applies.
 //!
@@ -65,14 +65,34 @@ builtin_icons!(
     "hoe",
     "minecart",
     "stew",
+    "neoforge",
+    "forge",
+    "fabric",
 );
+
+/// Default for a new instance; persisted like any explicit built-in choice.
+pub(super) fn default_icon(loader: Option<patina_core::loader::LoaderKind>) -> IconChoice {
+    use patina_core::loader::LoaderKind;
+    IconChoice::Builtin(
+        match loader {
+            Some(LoaderKind::Neoforge) => "neoforge",
+            Some(LoaderKind::Forge) => "forge",
+            Some(LoaderKind::Fabric) => "fabric",
+            None => "grass-block",
+        }
+        .to_owned(),
+    )
+}
 
 const ASSET_DIR: &str = "instance-icons/";
 const ASSET_EXT: &str = ".png";
 
-/// The bytes behind asset path `path` (`instance-icons/<name>.png`), for the
-/// app's asset source.
+/// Embedded icons (`instance-icons/<name>.png`) and their shipped license
+/// credits (`instance-icons/LICENSE.md`), for the app's asset source.
 pub fn asset_bytes(path: &str) -> Option<&'static [u8]> {
+    if path == "instance-icons/LICENSE.md" {
+        return Some(include_bytes!("../../assets/instance-icons/LICENSE.md"));
+    }
     let name = path.strip_prefix(ASSET_DIR)?.strip_suffix(ASSET_EXT)?;
     builtin_png(name)
 }
@@ -234,7 +254,7 @@ mod tests {
 
     #[test]
     fn builtin_names_match_files() {
-        assert_eq!(BUILTIN_ICONS.len(), 24);
+        assert_eq!(BUILTIN_ICONS.len(), 27);
         let mut files: Vec<String> = std::fs::read_dir(assets_dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())

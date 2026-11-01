@@ -1316,7 +1316,10 @@ impl SettingsForm {
         cx.notify();
     }
 
-    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.deleting || self.busy_reason(cx).is_some() {
+            return;
+        }
         let name = self
             .model
             .read(cx)

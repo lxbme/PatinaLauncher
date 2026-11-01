@@ -31,7 +31,7 @@ use patina_core::loader::ops::OpOutcome;
 use patina_core::loader::{LoaderKind, VersionPick};
 use rust_i18n::t;
 
-use super::icon::{IconChoice, save_icon};
+use super::icon::{IconChoice, default_icon, save_icon};
 use super::icon_picker::{IconPicked, IconPicker};
 use super::labelled;
 use super::model::{InstancesChanged, InstancesModel, RefreshFailed};
@@ -73,6 +73,7 @@ pub struct AddInstanceForm {
     /// the choices.
     name_edited: bool,
     icon: IconChoice,
+    icon_edited: bool,
     icon_picker: Entity<IconPicker>,
     versions: Entity<VersionPicker>,
     loaders: Entity<LoaderPicker>,
@@ -90,7 +91,8 @@ impl EventEmitter<FormChanged> for AddInstanceForm {}
 impl AddInstanceForm {
     pub fn new(model: Entity<InstancesModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx));
-        let icon_picker = cx.new(|cx| IconPicker::new(IconChoice::None, cx));
+        let icon = default_icon(None);
+        let icon_picker = cx.new(|cx| IconPicker::new(icon.clone(), cx));
         let versions = cx.new(|cx| VersionPicker::new(None, window, cx));
         let loaders = cx.new(LoaderPicker::new);
         let _subscriptions = vec![
@@ -106,6 +108,7 @@ impl AddInstanceForm {
                 &icon_picker,
                 |this, _, IconPicked(choice): &IconPicked, _| {
                     this.icon = choice.clone();
+                    this.icon_edited = true;
                 },
             ),
             cx.subscribe_in(
@@ -130,7 +133,8 @@ impl AddInstanceForm {
             model,
             name,
             name_edited: false,
-            icon: IconChoice::None,
+            icon,
+            icon_edited: false,
             icon_picker,
             versions,
             loaders,
@@ -197,6 +201,14 @@ impl AddInstanceForm {
             if self.name.read(cx).value() != name.as_str() {
                 self.name
                     .update(cx, |input, cx| input.set_value(name, window, cx));
+            }
+        }
+        if !self.icon_edited {
+            let icon = default_icon(self.loaders.read(cx).kind());
+            if self.icon != icon {
+                self.icon = icon.clone();
+                self.icon_picker
+                    .update(cx, |picker, cx| picker.set_current(icon, cx));
             }
         }
         self.changed(cx);

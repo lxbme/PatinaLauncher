@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::Theme;
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestEventExt, TestWindowExt};
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, Pixels, TestAppContext, px};
 use patina_app::core_bridge::testing::{self, FakeCatalog};
 use patina_app::core_bridge::{Core, LaunchBackend};
@@ -2175,6 +2175,114 @@ fn recommended_is_preselected(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn creation_icon_follows_loader_until_explicit_pick(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    assert!(chosen(&app, cx, pick_id("grass-block")));
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    wait_name(&app, cx, "Fabric 1.21.1");
+    assert!(chosen(&app, cx, pick_id("fabric")));
+    click(&app, cx, loader_segment_id(None));
+    assert!(chosen(&app, cx, pick_id("grass-block")));
+    click(&app, cx, version_row_id("1.20.1"));
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
+    wait_name(&app, cx, "Forge 1.20.1");
+    assert!(chosen(&app, cx, pick_id("forge")));
+    click(&app, cx, pick_id("diamond"));
+    click(&app, cx, loader_segment_id(None));
+    assert!(
+        chosen(&app, cx, pick_id("diamond")),
+        "explicit builtin choice is preserved"
+    );
+    click(&app, cx, "icon-letter");
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Forge)));
+    click(&app, cx, loader_segment_id(None));
+    let model = instances_model(&app, cx);
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.20.1"));
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    assert_eq!(
+        store.load("1.20.1").unwrap().config.icon,
+        None,
+        "explicit letter choice is preserved"
+    );
+}
+
+#[gpui_kit::test]
+fn each_loader_default_is_preselected_and_persisted(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let catalog = FakeCatalog::new()
+        .with_manifest(VersionManifest {
+            latest: Latest {
+                release: "1.21.1".into(),
+                snapshot: "1.21.1".into(),
+            },
+            versions: vec![manifest_entry("1.21.1", VersionKind::Release)],
+        })
+        .with_loader_versions([
+            loader_version(LoaderKind::Fabric, "1.21.1", "0.16.5", true, false),
+            loader_version(LoaderKind::Forge, "1.21.1", "52.0.1", true, false),
+            loader_version(LoaderKind::Neoforge, "1.21.1", "21.1.1", true, false),
+        ]);
+    let app = boot_with(cx, tmp.path(), AppSettings::default(), Arc::new(catalog));
+    let model = instances_model(&app, cx);
+    list_settled(&model, cx);
+    for (kind, name, icon) in [
+        (LoaderKind::Fabric, "Fabric 1.21.1", "fabric"),
+        (LoaderKind::Forge, "Forge 1.21.1", "forge"),
+        (LoaderKind::Neoforge, "NeoForge 1.21.1", "neoforge"),
+    ] {
+        click(&app, cx, "instances-add");
+        wait_name(&app, cx, "1.21.1");
+        click(&app, cx, loader_segment_id(Some(kind)));
+        wait_name(&app, cx, name);
+        settle(cx, |cx| !disabled(&app, cx, "add-instance-create"));
+        assert!(chosen(&app, cx, pick_id(icon)));
+        // Exercise real create/persist, but never install/download a game.
+        let held = store.lock(name).unwrap();
+        click(&app, cx, "add-instance-create");
+        settle(cx, |cx| selected(&model, cx).as_deref() == Some(name));
+        settle(cx, |cx| {
+            matches!(op_of(&model, cx, name), Some(OpState::Failed { .. }))
+        });
+        assert_eq!(
+            store.load(name).unwrap().config.icon,
+            Some(InstanceIcon::Builtin(icon.into()))
+        );
+        assert_eq!(
+            model.read_with(cx, |m, _| icon_for(
+                m.instances().iter().find(|i| i.id == name).unwrap()
+            )),
+            IconSource::Builtin(icon)
+        );
+        drop(held);
+    }
+}
+
+#[gpui_kit::test]
+fn creation_preserves_uploaded_icon_when_loader_changes(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/instance-icons/diamond.png");
+    click(&app, cx, "icon-upload");
+    cx.simulate_path_prompt_response(move |_| Some(vec![image]));
+    cx.run_until_parked();
+    click(&app, cx, loader_segment_id(Some(LoaderKind::Fabric)));
+    wait_name(&app, cx, "Fabric 1.21.1");
+    assert!(!chosen(&app, cx, pick_id("fabric")));
+    click(&app, cx, loader_segment_id(None));
+    wait_name(&app, cx, "1.21.1");
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    let instance = store.load("1.21.1").unwrap();
+    assert_eq!(instance.config.icon, Some(InstanceIcon::Custom));
+    assert!(instance.icon_path().unwrap().is_file());
+}
+
+#[gpui_kit::test]
 fn create_closes_dialog_and_selects_new_instance(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
@@ -2189,7 +2297,10 @@ fn create_closes_dialog_and_selects_new_instance(cx: &mut TestAppContext) {
     assert_eq!(created.config.name, "1.21.1");
     assert_eq!(created.config.mc_version(), "1.21.1");
     assert!(created.config.loader().is_none());
-    assert_eq!(created.config.icon, None);
+    assert_eq!(
+        created.config.icon,
+        Some(InstanceIcon::Builtin("grass-block".into()))
+    );
     assert!(shows(&app, cx, "instance-detail"));
     assert!(
         model.read_with(cx, |m, cx| m.op("1.21.1", cx).is_none()),
@@ -2206,6 +2317,47 @@ fn create_closes_dialog_and_selects_new_instance(cx: &mut TestAppContext) {
         selected(&model, cx).as_deref() == Some("1.21.1 (2)")
     });
     assert_eq!(store.load("1.21.1 (2)").unwrap().config.name, "1.21.1");
+}
+
+#[gpui_kit::test]
+fn freshly_created_instance_deletes_without_download(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = DataDirs::new(tmp.path());
+    let store = InstanceStore::new(data.instances());
+    let app = open_dialog(cx, tmp.path());
+    let model = instances_model(&app, cx);
+    click(&app, cx, "add-instance-create");
+    settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
+    assert!(!data.versions().exists(), "no game has been downloaded");
+    let shared = data.versions().join("shared-version");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("keep.jar"), b"shared game files").unwrap();
+    cx.update(|cx| seed_java_list(vec![], cx));
+    assert!(inside_window(&app, cx, "instance-actions"));
+    click(&app, cx, "instance-actions");
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let at = window
+            .within("popup-menu")
+            .find_by_label("Delete instance…")
+            .bounds()
+            .center();
+        window.pointer_move(at, None, cx);
+        window.pointer_down(at, gpui_kit::MouseButton::Left, cx);
+        window.pointer_up(at, gpui_kit::MouseButton::Left, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    dialog_click(&app, cx, "ok");
+    settle(cx, |cx| {
+        model.read_with(cx, |m, _| m.instances().is_empty())
+    });
+    assert!(store.load("1.21.1").is_err());
+    assert!(shows(&app, cx, "add-instance-empty"));
+    assert_eq!(
+        std::fs::read(shared.join("keep.jar")).unwrap(),
+        b"shared game files"
+    );
 }
 
 #[gpui_kit::test]
@@ -2364,7 +2516,10 @@ fn icon_save_failure_is_reported_and_the_instance_kept(cx: &mut TestAppContext) 
     settle(cx, |cx| selected(&model, cx).as_deref() == Some("1.21.1"));
     settle(cx, |cx| notifications(cx) == 1);
     let created = store.load("1.21.1").unwrap();
-    assert_eq!(created.config.icon, None, "the letter tile, as before");
+    assert_eq!(
+        created.config.icon, None,
+        "failed upload does not persist a bogus custom icon"
+    );
     assert!(created.icon_path().is_none());
 }
 
@@ -4798,6 +4953,47 @@ fn finish<T: 'static>(cx: &mut TestAppContext, task: gpui_kit::Task<T>) -> T {
     });
     settle(cx, |_| slot.borrow().is_some());
     slot.borrow_mut().take().unwrap()
+}
+
+#[gpui_kit::test]
+fn header_delete_is_disabled_while_running_or_downloading(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, model, _) = op_model(cx, tmp.path(), &["Alpha"]);
+    model.update(cx, |m, cx| m.set_run_state("Alpha", Some(elsewhere()), cx));
+    let mut held = None;
+    for expected in ["The game is running", "An operation is in progress"] {
+        click(&app, cx, "instance-actions");
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let menu = window.within("popup-menu");
+            assert!(menu.find_by_label(expected).visible());
+            let at = menu.find_by_label("Delete instance…").bounds().center();
+            window.pointer_move(at, None, cx);
+            window.pointer_down(at, gpui_kit::MouseButton::Left, cx);
+            window.pointer_up(at, gpui_kit::MouseButton::Left, cx);
+        })
+        .unwrap();
+        press(&app, cx, "down");
+        press(&app, cx, "enter");
+        assert!(!shows(&app, cx, "dialog"));
+        press(&app, cx, "escape");
+        if expected == "The game is running" {
+            model.update(cx, |m, cx| m.set_run_state("Alpha", None, cx));
+            let (started, gate, tick) = start_gated(
+                &model,
+                cx,
+                "Alpha",
+                || Ok(()),
+                Rc::new(std::cell::Cell::new(0)),
+            );
+            assert!(started);
+            // Keep the download-shaped operation alive through the second check.
+            held = Some((gate, tick));
+        }
+    }
+    let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+    assert!(store.load("Alpha").is_ok());
+    drop(held);
 }
 
 #[gpui_kit::test]
@@ -8347,6 +8543,11 @@ token_ref = "00000000-0000-0000-0000-000000000002"
         // From the title bar's menu, by pointer: the current one is checked.
         click(&app, cx, "title-account");
         assert!(menu_open(&app, cx));
+        assert_eq!(
+            label_of(&app, cx, "account-menu-current").as_deref(),
+            Some("Alex")
+        );
+        assert!(shows(&app, cx, "account-menu-avatar-msa-1"));
         click_item(&app, cx, "Steve");
         assert!(!menu_open(&app, cx));
         settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
@@ -8360,9 +8561,15 @@ token_ref = "00000000-0000-0000-0000-000000000002"
         assert!(menu_open(&app, cx));
         press(&app, cx, "escape");
         assert!(!menu_open(&app, cx));
+        assert_eq!(
+            element(&app, cx, "title-account").and_then(|e| e.focused()),
+            Some(true)
+        );
         tab_to(&app, cx, "title-account");
         press(&app, cx, "enter");
         assert!(menu_open(&app, cx));
+        // The non-interactive current-account header precedes the two rows.
+        press(&app, cx, "down");
         press(&app, cx, "down");
         press(&app, cx, "down");
         press(&app, cx, "enter");
@@ -8376,6 +8583,50 @@ token_ref = "00000000-0000-0000-0000-000000000002"
         click(&app, cx, "title-account");
         click_item(&app, cx, "Manage accounts…");
         assert_eq!(nav(&app, cx), Nav::Accounts);
+    }
+
+    #[gpui_kit::test]
+    fn switcher_menu_layout_at_normal_and_double_scale(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("accounts.toml"), TWO).unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
+        for (scale, language) in [(1., Language::En), (2., Language::ZhCn)] {
+            app.language(language);
+            cx.update(|cx| patina_app::scale::apply_scale(scale, cx));
+            cx.simulate_window_resize(
+                app.handle,
+                gpui_kit::size(px(960. * scale), px(600. * scale)),
+            );
+            cx.run_until_parked();
+            click(&app, cx, "title-account");
+            assert!(menu_open(&app, cx));
+            for id in [
+                "account-menu-current",
+                "account-menu-avatar-msa-1",
+                "account-menu-name-msa-1",
+                "account-menu-avatar-msa-2",
+                "account-menu-name-msa-2",
+                "account-menu-manage",
+            ] {
+                assert!(inside_window(&app, cx, id), "{id} at {scale}×");
+            }
+            cx.update_window(app.handle, |_, window, cx| {
+                window.render_frame(cx);
+                let first = window.find("account-menu-avatar-msa-1").bounds();
+                let second = window.find("account-menu-avatar-msa-2").bounds();
+                let name = window.find("account-menu-name-msa-1").bounds();
+                let other = window.find("account-menu-name-msa-2").bounds();
+                assert_eq!(first.left(), second.left());
+                assert_eq!(name.left(), other.left());
+                assert_eq!(first.size.width, px(24. * scale));
+                assert!(first.bottom() <= second.top());
+                assert!(name.left() > first.right());
+            })
+            .unwrap();
+            press(&app, cx, "escape");
+            assert!(!menu_open(&app, cx));
+        }
     }
 
     #[gpui_kit::test]

@@ -135,6 +135,19 @@ impl IconPicker {
         }
     }
 
+    /// Follows an owner-supplied default without treating it as a user pick.
+    pub(super) fn set_current(&mut self, choice: IconChoice, cx: &mut Context<Self>) {
+        if let IconChoice::Builtin(name) = &choice
+            && let Some(at) = BUILTIN_ICONS.iter().position(|known| *known == name)
+        {
+            self.cursor = at;
+        }
+        self.before_pick = choice.clone();
+        self.current = choice;
+        self.error = None;
+        cx.notify();
+    }
+
     pub fn error(&self) -> Option<&SharedString> {
         self.error.as_ref()
     }
@@ -314,14 +327,16 @@ mod tests {
 
     #[test]
     fn cursor_steps_stay_in_the_grid() {
-        // 24 icons in rows of 8.
+        // 27 icons in rows of 8, with three in the last row.
         assert_eq!(step_cursor(0, -1, 0), 0);
         assert_eq!(step_cursor(0, 0, -1), 0);
         assert_eq!(step_cursor(0, 1, 0), 1);
         assert_eq!(step_cursor(7, 1, 0), 7, "no wrap");
         assert_eq!(step_cursor(3, 0, 1), 11);
-        assert_eq!(step_cursor(19, 0, 1), 19, "last row");
+        assert_eq!(step_cursor(19, 0, 1), 19, "no cell below");
         assert_eq!(step_cursor(23, 1, 0), 23);
+        assert_eq!(step_cursor(18, 0, 1), 26);
+        assert_eq!(step_cursor(26, 0, 1), 26);
     }
 
     #[test]

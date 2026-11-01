@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::base::{Tab as TabElement, Tabs};
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Rems, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    Subscription, Task, TestSupportExt, Window, actions, div, px, rems,
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Rems, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window, actions, div,
+    px, rems,
 };
 use patina_core::instance::Instance;
 use rust_i18n::t;
@@ -602,7 +604,7 @@ impl DetailView {
         });
     }
 
-    fn render_header(&self, instance: &Instance, cx: &App) -> impl IntoElement {
+    fn render_header(&self, instance: &Instance, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let config = &instance.config;
         let sep = || div().text_color(theme.border).child("|");
@@ -762,6 +764,46 @@ impl DetailView {
                             })
                             .detach();
                     })
+            })
+            .child(self.render_actions(&instance.id, cx))
+    }
+
+    /// Instance commands stay reachable before the first download.
+    fn render_actions(&self, id: &str, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let reason = self.model.read(cx).busy_reason(id, cx);
+        let this = cx.weak_entity();
+        let id = id.to_owned();
+        let label = t!("instances.actions").to_string();
+        Button::new("instance-actions")
+            .ghost()
+            .icon(IconName::Ellipsis)
+            .accessibility_label(label.clone())
+            .tooltip(label)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let this = this.clone();
+                let id = id.clone();
+                let disabled = reason.is_some();
+                let menu = match &reason {
+                    Some(reason) => menu.label(reason.clone()).separator(),
+                    None => menu,
+                };
+                menu.item(
+                    PopupMenuItem::new(t!("instance_settings.delete").to_string())
+                        .icon(gpui_kit::assets::IconName::Trash)
+                        .disabled(disabled)
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                if this.model.read(cx).selected() != Some(id.as_str()) {
+                                    return;
+                                }
+                                this.sync_settings(window, cx);
+                                if let Some(form) = &this.settings {
+                                    form.update(cx, |form, cx| form.confirm_delete(window, cx));
+                                }
+                            })
+                            .ok();
+                        }),
+                )
             })
     }
 

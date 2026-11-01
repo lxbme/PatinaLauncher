@@ -48,6 +48,7 @@ shell:
     source_latency: "Download source: %{source} · %{mirror} %{latency}"
 
 instances:
+  actions: "Instance actions"
   icon:
     upload: "Upload image…"
     letter: "Use letter"
@@ -379,6 +380,7 @@ accounts:
   failed_hint: "Patina won’t change this file. Fix or move it, then choose Read again."
   reload: "Read again"
   switcher:
+    current: "Current account"
     tooltip: "Accounts"
     manage: "Manage accounts…"
   login:

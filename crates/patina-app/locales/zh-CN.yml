@@ -48,6 +48,7 @@ shell:
     source_latency: "下载源：%{source} · %{mirror} %{latency}"
 
 instances:
+  actions: "实例操作"
   icon:
     upload: "上传图片…"
     letter: "使用首字母"
@@ -379,6 +380,7 @@ accounts:
   failed_hint: "启动器不会改动这个文件。修好或移走它之后，点“重新读取”。"
   reload: "重新读取"
   switcher:
+    current: "当前账号"
     tooltip: "账号"
     manage: "管理账号…"
   login:
