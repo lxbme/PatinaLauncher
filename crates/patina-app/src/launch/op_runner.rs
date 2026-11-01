@@ -18,6 +18,7 @@ use crate::instances::InstancesModel;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     InstallLoader,
+    InstallContent,
     ChangeVersion,
     RemoveLoader,
     Reinstall,

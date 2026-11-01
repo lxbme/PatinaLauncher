@@ -18,6 +18,8 @@ mod image_cache;
 mod list;
 mod local_tab;
 mod mods_tab;
+pub mod online_updates;
+mod origin;
 mod packs_tab;
 mod refresh;
 mod saves_tab;

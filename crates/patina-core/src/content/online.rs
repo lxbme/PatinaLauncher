@@ -1,10 +1,25 @@
-//! Online mod/pack search interface. Real Modrinth/CurseForge sources come
-//! later; until then [`UnavailableSource`] reports that search is unavailable.
+//! Online content catalog seam and platform-independent metadata.
+
+mod client;
+mod curseforge;
+mod installed;
+mod model;
+mod plan;
+mod service;
+mod updates;
+pub use installed::{ContentSources, SourceRecord, load_sources};
+pub use plan::*;
+pub use service::{ContentError, ContentService};
+pub use updates::{ContentUpdate, ContentUpdatePlan, UpdateSelection};
+mod modrinth;
+pub use client::ContentCatalogs;
+pub use model::*;
+use serde::{Deserialize, Serialize};
 
 use crate::loader::LoaderKind;
 use futures::future::BoxFuture;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentKind {
     Mod,
     ResourcePack,
@@ -12,7 +27,7 @@ pub enum ContentKind {
     Modpack,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Platform {
     Modrinth,
     CurseForge,
@@ -67,10 +82,53 @@ pub enum OnlineError {
     Unavailable,
     #[error("{}", rust_i18n::t!("errors.online.network", error = .0))]
     Network(String),
+    #[error("{}", rust_i18n::t!("errors.online.missing_key"))]
+    MissingApiKey,
+    #[error("{}", rust_i18n::t!("errors.online.rate_limited"))]
+    RateLimited(Option<u64>),
+    #[error("{}", rust_i18n::t!("errors.online.invalid_response"))]
+    InvalidResponse,
+    #[error("{}", rust_i18n::t!("errors.online.not_found"))]
+    NotFound,
 }
 
 pub trait ContentSource: Send + Sync {
     fn search(&self, q: OnlineQuery) -> BoxFuture<'static, Result<OnlinePage, OnlineError>>;
+    fn project(
+        &self,
+        _project: ProjectRef,
+    ) -> BoxFuture<'static, Result<ContentProject, OnlineError>> {
+        Box::pin(async { Err(OnlineError::Unavailable) })
+    }
+    fn versions(
+        &self,
+        _project: ProjectRef,
+        _target: TargetCompatibility,
+    ) -> BoxFuture<'static, Result<Vec<ContentVersion>, OnlineError>> {
+        Box::pin(async { Err(OnlineError::Unavailable) })
+    }
+    fn version(
+        &self,
+        _platform: Platform,
+        _id: String,
+    ) -> BoxFuture<'static, Result<ContentVersion, OnlineError>> {
+        Box::pin(async { Err(OnlineError::Unavailable) })
+    }
+    /// Platform must be explicit: identities contain fingerprints, not a guessed source.
+    fn identify(
+        &self,
+        _platform: Platform,
+        _files: Vec<FileIdentity>,
+    ) -> BoxFuture<'static, Result<Vec<IdentifiedFile>, OnlineError>> {
+        Box::pin(async { Err(OnlineError::Unavailable) })
+    }
+    fn categories(
+        &self,
+        _platform: Platform,
+        _kind: ContentKind,
+    ) -> BoxFuture<'static, Result<Vec<ContentCategory>, OnlineError>> {
+        Box::pin(async { Err(OnlineError::Unavailable) })
+    }
 }
 
 /// Stand-in used until a real source exists: always unavailable.

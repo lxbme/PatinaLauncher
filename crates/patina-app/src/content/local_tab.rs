@@ -52,6 +52,7 @@ use super::list::{
     matches_filter,
 };
 use super::mods_tab::{FILE_W, ICON, ROW_H, WindowAction, notify};
+use super::origin::{OpenOriginalProject, open_project, origin_badge};
 use super::refresh::{open_folder, with_instance_lock};
 use super::{packs_tab, saves_tab, shaders_tab};
 use crate::fonts::Strong as _;
@@ -86,6 +87,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("home", SelectFirstRow, context),
         KeyBinding::new("end", SelectLastRow, context),
         KeyBinding::new("delete", DeleteRow, context),
+        KeyBinding::new("alt-enter", OpenOriginalProject, context),
     ]);
 }
 
@@ -704,6 +706,20 @@ impl LocalTab {
             .text_size(TEXT_SECONDARY)
             .text_color(muted)
             .children(detail);
+        let origin = if kind == LocalKind::Saves {
+            None
+        } else {
+            let folder = if kind == LocalKind::ResourcePacks {
+                "resourcepacks"
+            } else {
+                "shaderpacks"
+            };
+            Some(origin_badge(
+                &format!("{folder}/{key}"),
+                self.list.read(cx).origin(&item.path),
+                cx,
+            ))
+        };
         let aside = div()
             .id(ElementId::Name(
                 format!("{}-aside-{key}", kind.prefix()).into(),
@@ -789,6 +805,7 @@ impl LocalTab {
                     .child(second),
             )
             .child(aside)
+            .children(origin)
             .children(delete)
             .test_support()
             .into_any_element()
@@ -810,6 +827,16 @@ impl LocalTab {
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::delete_selected))
+            .on_action(cx.listener(|this, _: &OpenOriginalProject, _, cx| {
+                let list = this.list.read(cx);
+                let project = this
+                    .selected
+                    .as_ref()
+                    .and_then(|key| list.items().iter().find(|i| &i.key == key))
+                    .and_then(|item| list.origin(&item.path))
+                    .cloned();
+                open_project(project.as_ref(), cx);
+            }))
             .relative()
             .flex_1()
             .min_h_0()
@@ -841,12 +868,32 @@ impl LocalTab {
         let list = self.list.read(cx);
         let dir = self.kind.dir(list.instance());
         let refresh = self.list.clone();
-        ContentToolbar::new(
+        let toolbar = ContentToolbar::new(
             &self.filter,
             move |window, cx| open_folder(dir.clone(), window, cx),
             move |_, cx| refresh.update(cx, |list, cx| list.reload(cx)),
         )
-        .refreshing(list.is_reloading())
+        .refreshing(list.is_reloading());
+        let kind = match self.kind {
+            LocalKind::ResourcePacks => patina_core::content::online::ContentKind::ResourcePack,
+            LocalKind::Shaders => patina_core::content::online::ContentKind::Shader,
+            LocalKind::Saves => return toolbar,
+        };
+        let instances = self.model.clone();
+        let id = self.id.clone();
+        toolbar.action(
+            Button::new(SharedString::from(format!(
+                "{}-check-updates",
+                self.kind.prefix()
+            )))
+            .outline()
+            .small()
+            .disabled(self.busy.is_some())
+            .label(t!("content.updates.check").to_string())
+            .on_click(move |_, window, cx| {
+                super::online_updates::open_updates(instances.clone(), id.clone(), kind, window, cx)
+            }),
+        )
     }
 
     /// The line under the toolbar while the instance takes no change (only

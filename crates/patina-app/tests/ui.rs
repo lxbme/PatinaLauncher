@@ -7823,6 +7823,7 @@ fn a_failed_index_says_so_and_retries(cx: &mut TestAppContext) {
 // --- the downloads page ------------------------------------------------------
 
 mod downloads {
+    mod online;
     use super::*;
     use patina_app::core_bridge::testing::FakeSource;
     use patina_app::downloads::{DEBOUNCE, DownloadsModel, Results, hit_row_id, kind_tab_id};
@@ -8000,7 +8001,7 @@ mod downloads {
         cx.run_until_parked();
         assert_eq!(
             label_of(&app, cx, "downloads-install").as_deref(),
-            Some("Install to Fab")
+            Some("Install to Fab…")
         );
         assert!(disabled(&app, cx, "downloads-install"));
     }
@@ -8301,7 +8302,7 @@ mod downloads {
         refresh(cx);
         assert_eq!(
             label_of(&app, cx, "downloads-install").as_deref(),
-            Some("Install to Fab2")
+            Some("Install to Fab2…")
         );
 
         // Deleted: no target any more, filters stay.
@@ -10242,3 +10243,6 @@ mod settings_page {
         }
     }
 }
+
+#[path = "content/origin.rs"]
+mod content_origin;

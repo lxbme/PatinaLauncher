@@ -4,8 +4,7 @@
 //! target instance) and the content source's answer; [`DownloadsPage`] is
 //! the view over it and keeps the controls (the dropdowns, the search box)
 //! in step with it. The source behind the page is `Core.content_source`; for
-//! now it is always unavailable and the results say so, so a real source
-//! only has to replace that one object.
+//! production uses the platform catalogs; offline tests inject isolated sources.
 //!
 //! The kind tabs are not focusable by themselves (as the instance tabs):
 //! `ctrl-tab` / `ctrl-pagedown` and `ctrl-shift-tab` / `ctrl-pageup` step
@@ -13,6 +12,7 @@
 
 mod detail;
 mod filters;
+pub mod install;
 mod model;
 mod results;
 
@@ -33,7 +33,7 @@ use patina_core::loader::LoaderKind;
 use patina_core::meta::VersionKind;
 use rust_i18n::t;
 
-pub use model::{DEBOUNCE, DownloadsModel, PAGE_SIZE, Results, takes_loader};
+pub use model::{DEBOUNCE, Detail, DownloadsModel, PAGE_SIZE, Results, takes_loader};
 pub use results::hit_row_id;
 
 use crate::core_bridge::{Core, run};
@@ -185,6 +185,9 @@ pub struct DownloadsPage {
     category: Dropdown<Option<String>>,
     target: Dropdown<Option<String>>,
     sort: Dropdown<SortOrder>,
+    file_version: Dropdown<Option<String>>,
+    category_listing: Vec<(String, String)>,
+    file_listing: Vec<(String, String)>,
     /// The release ids of the game, newest first, once the manifest is in.
     releases: Vec<String>,
     versions: Versions,
@@ -268,6 +271,12 @@ impl DownloadsPage {
             cx,
         );
         let sort = dropdown(sort_choices(), false, window, cx);
+        let file_version = dropdown(
+            vec![Choice::key(None, "downloads.detail.choose_file")],
+            false,
+            window,
+            cx,
+        );
         let mut this = Self {
             model: model.clone(),
             instances: instances.clone(),
@@ -278,6 +287,9 @@ impl DownloadsPage {
             category,
             target,
             sort,
+            file_version,
+            category_listing: vec![],
+            file_listing: vec![],
             releases: Vec::new(),
             versions: Versions::NotLoaded,
             hits_focus: cx.focus_handle().tab_stop(true),
@@ -322,6 +334,24 @@ impl DownloadsPage {
                     let v = v.clone().flatten();
                     this.model
                         .update(cx, |m, cx| m.set_target(v.as_deref(), cx));
+                },
+            ),
+            cx.subscribe_in(
+                &this.category,
+                window,
+                |this, _, e: &SelectEvent<_>, _, cx| {
+                    let SelectEvent::Confirm(value) = e;
+                    let value = value.clone().flatten();
+                    this.model.update(cx, |m, cx| m.set_category(value, cx));
+                },
+            ),
+            cx.subscribe_in(
+                &this.file_version,
+                window,
+                |this, _, e: &SelectEvent<_>, _, cx| {
+                    let SelectEvent::Confirm(value) = e;
+                    let value = value.clone().flatten();
+                    this.model.update(cx, |m, cx| m.select_version(value, cx));
                 },
             ),
             cx.subscribe_in(&this.sort, window, |this, _, e: &SelectEvent<_>, _, cx| {
@@ -463,6 +493,46 @@ impl DownloadsPage {
         let mc = model.mc_version().map(str::to_string);
         let (loader, sort) = (model.loader(), model.sort());
         let target = model.target().map(str::to_string);
+        let category = model.category().map(str::to_owned);
+        let category_listing = model
+            .categories()
+            .iter()
+            .map(|c| (c.id().to_string(), c.name().to_string()))
+            .collect::<Vec<_>>();
+        let file_listing = match model.detail() {
+            Detail::Loaded { versions, .. } => versions
+                .iter()
+                .map(|v| (v.reference().id().to_string(), v.name().to_string()))
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        let selected_file = model
+            .selected_version()
+            .map(|v| v.reference().id().to_string());
+        if self.category_listing != category_listing {
+            let mut items = vec![Choice::key(None, "downloads.filters.all_categories")];
+            items.extend(
+                category_listing
+                    .iter()
+                    .map(|(id, name)| Choice::text(Some(id.clone()), name.clone())),
+            );
+            self.category_listing = category_listing;
+            self.category
+                .update(cx, |s, cx| s.set_items(items, window, cx));
+        }
+        if self.file_listing != file_listing {
+            let mut items = vec![Choice::key(None, "downloads.detail.choose_file")];
+            items.extend(
+                file_listing
+                    .iter()
+                    .map(|(id, name)| Choice::text(Some(id.clone()), name.clone())),
+            );
+            self.file_listing = file_listing;
+            self.file_version
+                .update(cx, |s, cx| s.set_items(items, window, cx));
+        }
+        select_value(&self.category, category, window, cx);
+        select_value(&self.file_version, selected_file, window, cx);
 
         if self.input.read(cx).value() != text {
             self.input.update(cx, |i, cx| i.set_value(text, window, cx));

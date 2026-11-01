@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use gpui_kit::{Context, Entity, SharedString, Subscription, Task};
 use patina_core::content::online::{
-    ContentKind, OnlineError, OnlinePage, OnlineQuery, Platform, SortOrder,
+    ContentCategory, ContentKind, ContentProject, ContentVersion, OnlineError, OnlinePage,
+    OnlineQuery, Platform, ProjectRef, ReleaseChannel, SortOrder, TargetCompatibility,
 };
 use patina_core::instance::Instance;
 use patina_core::loader::LoaderKind;
@@ -40,6 +41,18 @@ pub enum Results {
     Loaded(OnlinePage),
 }
 
+/// Metadata is bound to a selected platform/project and compatibility revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detail {
+    Idle,
+    Loading,
+    Failed(SharedString),
+    Loaded {
+        project: ContentProject,
+        versions: Vec<ContentVersion>,
+    },
+}
+
 /// Whether `kind` is filtered by the mod loader: only mods are; packs and
 /// shaders do not depend on it and a modpack brings its own.
 pub fn takes_loader(kind: ContentKind) -> bool {
@@ -60,6 +73,16 @@ pub struct DownloadsModel {
     /// The hit shown in the detail column.
     selected: Option<String>,
     results: Results,
+    offset: u32,
+    detail: Detail,
+    selected_version: Option<String>,
+    preview_channels: bool,
+    detail_revision: Revision,
+    detail_task: Task<()>,
+    categories: Vec<ContentCategory>,
+    category_key: Option<(Platform, ContentKind)>,
+    category_revision: Revision,
+    category_task: Task<()>,
     /// A request is in flight (its answer not in yet): the previous
     /// results stay on show meanwhile.
     searching: bool,
@@ -84,6 +107,16 @@ impl DownloadsModel {
             target: None,
             selected: None,
             results: Results::Idle,
+            offset: 0,
+            detail: Detail::Idle,
+            selected_version: None,
+            preview_channels: false,
+            detail_revision: Revision::default(),
+            detail_task: Task::ready(()),
+            categories: vec![],
+            category_key: None,
+            category_revision: Revision::default(),
+            category_task: Task::ready(()),
             searching: false,
             active: false,
             revision: Revision::default(),
@@ -130,6 +163,98 @@ impl DownloadsModel {
         self.selected.as_deref()
     }
 
+    pub fn install_request(&self) -> Option<patina_core::content::online::InstallRequest> {
+        if self.kind == ContentKind::Modpack {
+            return None;
+        }
+        let version = self.selected_version()?;
+        let instance = self.target.as_ref()?;
+        let target = TargetCompatibility::new(self.kind, self.mc_version.as_ref()?, self.loader)
+            .with_channels(if self.preview_channels {
+                vec![
+                    ReleaseChannel::Release,
+                    ReleaseChannel::Beta,
+                    ReleaseChannel::Alpha,
+                ]
+            } else {
+                vec![ReleaseChannel::Release]
+            });
+        if !target.accepts(version) {
+            return None;
+        }
+        Some(patina_core::content::online::InstallRequest::new(
+            instance,
+            version.reference().clone(),
+            target,
+        ))
+    }
+    pub fn detail(&self) -> &Detail {
+        &self.detail
+    }
+    pub fn categories(&self) -> &[ContentCategory] {
+        &self.categories
+    }
+    pub fn preview_channels(&self) -> bool {
+        self.preview_channels
+    }
+    pub fn selected_version(&self) -> Option<&ContentVersion> {
+        let Detail::Loaded { versions, .. } = &self.detail else {
+            return None;
+        };
+        versions
+            .iter()
+            .find(|v| Some(v.reference().id()) == self.selected_version.as_deref())
+    }
+    pub fn select_version(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if let Detail::Loaded { versions, .. } = &self.detail {
+            self.selected_version =
+                id.filter(|id| versions.iter().any(|v| v.reference().id() == id));
+            cx.notify();
+        }
+    }
+    pub fn set_preview_channels(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.preview_channels != value {
+            self.preview_channels = value;
+            self.refresh_detail(cx);
+        }
+    }
+    pub fn retry_detail(&mut self, cx: &mut Context<Self>) {
+        self.refresh_detail(cx);
+    }
+
+    pub fn has_previous_page(&self) -> bool {
+        self.offset > 0
+    }
+    pub fn has_next_page(&self) -> bool {
+        match &self.results {
+            Results::Loaded(page) => {
+                !page.hits.is_empty()
+                    && u64::from(self.offset) + (page.hits.len() as u64) < page.total
+                    && (self.platform != Platform::CurseForge
+                        || self.offset + (page.hits.len() as u32) < 10_000)
+            }
+            _ => false,
+        }
+    }
+    pub fn change_page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.searching {
+            return;
+        }
+        let Results::Loaded(page) = &self.results else {
+            return;
+        };
+        if forward {
+            if !self.has_next_page() {
+                return;
+            }
+            self.offset += page.hits.len() as u32;
+        } else {
+            self.offset = self.offset.saturating_sub(PAGE_SIZE);
+        }
+        self.selected = None;
+        self.results = Results::Loading;
+        self.search_page(None, cx);
+    }
     pub fn results(&self) -> &Results {
         &self.results
     }
@@ -150,7 +275,7 @@ impl DownloadsModel {
             loader: self.loader.filter(|_| takes_loader(self.kind)),
             category: self.category.clone(),
             sort: self.sort,
-            offset: 0,
+            offset: self.offset,
             limit: PAGE_SIZE,
         }
     }
@@ -229,6 +354,10 @@ impl DownloadsModel {
             return;
         }
         self.platform = platform;
+        if self.active {
+            self.results = Results::Loading;
+        }
+        self.selected = None;
         self.category = None;
         self.search(None, cx);
     }
@@ -290,7 +419,7 @@ impl DownloadsModel {
     pub fn select(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
         if self.selected.as_deref() != id {
             self.selected = id.map(str::to_string);
-            cx.notify();
+            self.refresh_detail(cx);
         }
     }
 
@@ -356,10 +485,17 @@ impl DownloadsModel {
     /// the task drops the previous request; the revision drops its answer
     /// should it land anyway.
     fn search(&mut self, delay: Option<Duration>, cx: &mut Context<Self>) {
+        self.offset = 0;
+        self.search_page(delay, cx);
+    }
+    fn search_page(&mut self, delay: Option<Duration>, cx: &mut Context<Self>) {
+        self.refresh_detail(cx);
+        self.load_categories(cx);
         cx.notify();
         if !self.active {
             return;
         }
+        self.searching = true;
         let id = self.revision.start();
         if self.results == Results::Idle {
             self.results = Results::Loading;
@@ -384,6 +520,102 @@ impl DownloadsModel {
         });
     }
 
+    fn refresh_detail(&mut self, cx: &mut Context<Self>) {
+        let revision = self.detail_revision.start();
+        self.selected_version = None;
+        self.detail_task = Task::ready(());
+        let Some(selected) = self.selected.clone() else {
+            self.detail = Detail::Idle;
+            cx.notify();
+            return;
+        };
+        self.detail = Detail::Loading;
+        let reference = ProjectRef::new(self.platform, selected);
+        let target = self.mc_version.as_ref().map(|mc| {
+            TargetCompatibility::new(self.kind, mc, self.loader).with_channels(
+                if self.preview_channels {
+                    vec![
+                        ReleaseChannel::Release,
+                        ReleaseChannel::Beta,
+                        ReleaseChannel::Alpha,
+                    ]
+                } else {
+                    vec![ReleaseChannel::Release]
+                },
+            )
+        });
+        let kind = self.kind;
+        let source = Core::global(cx).content_source.clone();
+        cx.notify();
+        self.detail_task = cx.spawn(async move |this, cx| {
+            let Ok(work) = this.update(cx, |_, cx| {
+                run(cx, async move {
+                    let project = source.project(reference.clone()).await?;
+                    if project.reference() != &reference || project.kind() != kind {
+                        return Err(OnlineError::InvalidResponse);
+                    }
+                    let versions = if project.is_client_supported() {
+                        if let Some(target) = target {
+                            if target.kind() != ContentKind::Mod || target.loader().is_some() {
+                                source.versions(reference, target).await?
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    };
+                    Ok((project, versions))
+                })
+            }) else {
+                return;
+            };
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                if !this.detail_revision.is_current(revision) {
+                    return;
+                }
+                this.detail = match result {
+                    Ok(Ok((project, versions))) => {
+                        this.selected_version =
+                            versions.first().map(|v| v.reference().id().to_string());
+                        Detail::Loaded { project, versions }
+                    }
+                    Ok(Err(e)) => Detail::Failed(e.to_string().into()),
+                    Err(e) => Detail::Failed(e.to_string().into()),
+                };
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn load_categories(&mut self, cx: &mut Context<Self>) {
+        if !self.active || self.category_key == Some((self.platform, self.kind)) {
+            return;
+        }
+        let key = (self.platform, self.kind);
+        self.category_key = Some(key);
+        self.categories.clear();
+        let revision = self.category_revision.start();
+        let source = Core::global(cx).content_source.clone();
+        self.category_task = cx.spawn(async move |this, cx| {
+            let Ok(work) = this.update(cx, |_, cx| run(cx, source.categories(key.0, key.1))) else {
+                return;
+            };
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                if this.category_revision.is_current(revision) {
+                    this.categories = result.ok().and_then(Result::ok).unwrap_or_default();
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+    }
+
     fn apply(
         &mut self,
         id: RevisionId,
@@ -404,6 +636,7 @@ impl DownloadsModel {
             && !(self.selected.as_deref()).is_some_and(|s| page.hits.iter().any(|h| h.id == s))
         {
             self.selected = None;
+            self.refresh_detail(cx);
         }
         cx.notify();
     }

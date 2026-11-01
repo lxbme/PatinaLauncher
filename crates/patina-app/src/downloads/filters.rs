@@ -54,12 +54,12 @@ impl DownloadsPage {
             .small()
             .w_full()
             .accessibility_label(t!("downloads.filters.loader").to_string());
-        // The source offers no categories yet: the one entry, disabled.
+        // Categories retain the selected platform’s IDs.
         let category = Select::new(&self.category)
             .id("downloads-category")
             .small()
             .w_full()
-            .disabled(true)
+            .disabled(model.categories().is_empty())
             .accessibility_label(t!("downloads.filters.category").to_string());
         let target = Select::new(&self.target)
             .id("downloads-target")
@@ -70,12 +70,7 @@ impl DownloadsPage {
         let field = |label: String, control: AnyElement| {
             v_flex()
                 .gap_1()
-                .child(
-                    div()
-                        .text_size(TEXT_SECONDARY)
-                        .text_color(muted)
-                        .child(label),
-                )
+                .child(div().text_size(TEXT_PRIMARY).child(label))
                 .child(control)
         };
         let body = v_flex()

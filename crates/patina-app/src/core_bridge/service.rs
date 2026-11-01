@@ -11,7 +11,9 @@ use patina_core::accounts::{
     Account, AccountService, AccountSnapshot, RemovalOutcome, error::AuthError,
 };
 use patina_core::config::{ConfigError, GlobalConfig, SourceChoice};
-use patina_core::content::online::{ContentSource, UnavailableSource};
+#[cfg(any(test, feature = "test-support"))]
+use patina_core::content::online::UnavailableSource;
+use patina_core::content::online::{ContentCatalogs, ContentService, ContentSource};
 use patina_core::download::{Mirror, resolve_choice};
 use patina_core::instance::InstanceStore;
 use patina_core::java::{JavaInstall, detect_all};
@@ -107,9 +109,9 @@ pub struct Core {
     pub launch_backend: Arc<dyn LaunchBackend>,
     /// Loader and version changes, injectable for UI tests.
     pub version_ops: Arc<dyn VersionOps>,
-    /// Online mod/pack search, injectable for UI tests. Production has no
-    /// real source yet ([`UnavailableSource`]).
+    /// Online platform catalogs, injectable for isolated UI tests.
     pub content_source: Arc<dyn ContentSource>,
+    pub content_service: Arc<ContentService>,
     /// Production sign-in uses the same account service; tests may explicitly inject a flow.
     pub login: Arc<dyn DeviceCodeLogin>,
     /// Probes the download sources, injectable for UI tests.
@@ -295,7 +297,16 @@ impl Core {
                 store: store.clone(),
             })
         });
-        let content_source = content_source.unwrap_or_else(|| Arc::new(UnavailableSource));
+        let content_source: Arc<dyn ContentSource> = match content_source {
+            Some(source) => source,
+            None => match startup {
+                Startup::SpeedTest => Arc::new(
+                    ContentCatalogs::new().map_err(|e| InitError::HttpClient(e.to_string()))?,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
+                Startup::Offline => Arc::new(UnavailableSource),
+            },
+        };
         let make_accounts = || match startup {
             Startup::SpeedTest => AccountService::production(data.clone()).map(Arc::new),
             #[cfg(any(test, feature = "test-support"))]
@@ -316,6 +327,14 @@ impl Core {
             #[cfg(any(test, feature = "test-support"))]
             Startup::Offline => Arc::new(Vec::new),
         });
+        let content_service = Arc::new(ContentService::new(
+            store.clone(),
+            content_source.clone(),
+            Arc::new(patina_core::download::Downloader::new(
+                current(&launcher).downloader.client().clone(),
+                Mirror::official(),
+            )),
+        ));
         let core = Core {
             rt,
             store,
@@ -324,6 +343,7 @@ impl Core {
             launch_backend,
             version_ops,
             content_source,
+            content_service,
             login,
             speed_test,
             detect_java,

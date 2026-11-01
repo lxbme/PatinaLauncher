@@ -4546,6 +4546,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
+name = "murmur2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb585ade2549a017db2e35978b77c319214fa4b37cede841e27954dd6e8f3ca8"
+
+[[package]]
 name = "naga"
 version = "29.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5405,6 +5411,7 @@ dependencies = [
  "image",
  "lzma-rust2",
  "md-5 0.11.0",
+ "murmur2",
  "oo7",
  "quick-xml 0.42.0",
  "regex",
@@ -5415,6 +5422,7 @@ dependencies = [
  "serde-saphyr 2.0.0",
  "serde_json",
  "sha1",
+ "sha2 0.11.1",
  "sysinfo 0.40.0",
  "tempfile",
  "thiserror 2.0.21",

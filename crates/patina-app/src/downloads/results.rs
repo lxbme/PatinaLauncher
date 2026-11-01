@@ -5,7 +5,7 @@
 use gpui_kit::component::button::Button;
 use gpui_kit::component::select::Select;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement,
@@ -44,6 +44,7 @@ impl DownloadsPage {
         let model = self.model.read(cx);
         let selected = model.selected().map(str::to_string);
         let searching = model.is_searching();
+        let (has_previous, has_next) = (model.has_previous_page(), model.has_next_page());
         let status = |id: &'static str, title: String, hint: Option<String>| {
             v_flex()
                 .id(id)
@@ -118,17 +119,46 @@ impl DownloadsPage {
                         self.hit_row(hit, is_selected, ring, cx)
                     })
                     .collect();
-                scroll_y(
-                    v_flex()
-                        .id("downloads-hits")
-                        // Before `track_focus`, so tests see the focus.
-                        .test_support()
-                        .key_context(HITS_CONTEXT)
-                        .track_focus(&self.hits_focus)
-                        .children(rows),
-                    &self.results_scroll,
-                )
-                .into_any_element()
+                v_flex()
+                    .size_full()
+                    .child(
+                        div().flex_1().min_h_0().child(scroll_y(
+                            v_flex()
+                                .id("downloads-hits")
+                                // Before `track_focus`, so tests see the focus.
+                                .test_support()
+                                .key_context(HITS_CONTEXT)
+                                .track_focus(&self.hits_focus)
+                                .children(rows),
+                            &self.results_scroll,
+                        )),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .justify_end()
+                            .gap_2()
+                            .p_2()
+                            .child(
+                                Button::new("downloads-prev-page")
+                                    .small()
+                                    .disabled(searching || !has_previous)
+                                    .label(t!("downloads.results.previous_page").to_string())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.model.update(cx, |m, cx| m.change_page(false, cx))
+                                    })),
+                            )
+                            .child(
+                                Button::new("downloads-next-page")
+                                    .small()
+                                    .disabled(searching || !has_next)
+                                    .label(t!("downloads.results.next_page").to_string())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.model.update(cx, |m, cx| m.change_page(true, cx))
+                                    })),
+                            ),
+                    )
+                    .into_any_element()
             }
         };
         // The previous answer stays while a new one is awaited.
@@ -165,6 +195,25 @@ impl DownloadsPage {
         let (hover, active) = (theme.list_hover, theme.list_active);
         let id = hit.id.clone();
         let focus = self.hits_focus.clone();
+        let icon = hit.icon_url.as_ref().map(|url| {
+            let key = crate::content::ImageKey::new(
+                format!("online:{:?}", self.model.read(cx).platform()),
+                url,
+                0,
+                None,
+            );
+            let url = url.clone();
+            let core = crate::core_bridge::Core::global(cx);
+            let runtime = core.rt.clone();
+            let service = core.content_service.clone();
+            crate::content::icon_tile(
+                key,
+                move || runtime.block_on(service.fetch_icon(url)),
+                rems(2.),
+                gpui_kit::assets::IconName::Package,
+                cx,
+            )
+        });
         div()
             .id(hit_row_id(&hit.id))
             .test_support()
@@ -190,6 +239,7 @@ impl DownloadsPage {
                     } else {
                         gpui_kit::transparent_black()
                     })
+                    .children(icon)
                     .child(
                         v_flex()
                             .flex_1()

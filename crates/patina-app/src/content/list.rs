@@ -1,7 +1,10 @@
 //! [`ContentTab`]: the model behind one local-content tab, plus the toolbar
 //! and the empty state the tabs share.
 
+use patina_core::content::online::ProjectRef;
+use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Lucide;
@@ -64,6 +67,7 @@ pub struct ContentTab<T: Send + 'static> {
     instance: Instance,
     loader: ContentLoader<T>,
     items: Vec<T>,
+    origins: HashMap<PathBuf, ProjectRef>,
     state: LoadState,
     reloading: bool,
     /// A reload was asked for while one ran: one more follows it.
@@ -89,6 +93,7 @@ impl<T: Send + 'static> ContentTab<T> {
             instance,
             loader: Arc::new(loader),
             items: Vec::new(),
+            origins: HashMap::new(),
             state: LoadState::Loading,
             reloading: false,
             rerun: false,
@@ -107,6 +112,16 @@ impl<T: Send + 'static> ContentTab<T> {
     /// All loaded items (the previous load's while a reload runs).
     pub fn items(&self) -> &[T] {
         &self.items
+    }
+
+    /// The recorded platform/project of an actual listed file, never inferred from its name.
+    pub fn origin(&self, path: &Path) -> Option<&ProjectRef> {
+        self.origins.get(path)
+    }
+    pub(crate) fn rename_origin(&mut self, from: &Path, to: PathBuf) {
+        if let Some(origin) = self.origins.remove(from) {
+            self.origins.insert(to, origin);
+        }
     }
 
     pub fn state(&self) -> &LoadState {
@@ -138,6 +153,7 @@ impl<T: Send + 'static> ContentTab<T> {
         self.instance = instance;
         if moved {
             self.items.clear();
+            self.origins.clear();
             self.state = LoadState::Loading;
             // Whatever listed the old directory is stale from now on.
             self.revision.start();
@@ -166,7 +182,10 @@ impl<T: Send + 'static> ContentTab<T> {
         let id = self.revision.start();
         let instance = self.instance.clone();
         let loader = self.loader.clone();
-        let load = run_blocking(cx, move || loader(&instance));
+        let load = run_blocking(cx, move || {
+            let items = loader(&instance)?;
+            Ok::<_, io::Error>((items, super::origin::load_origins(&instance)))
+        });
         let edits = self.edits;
         self.reloading = true;
         self.task = cx.spawn(async move |this, cx| {
@@ -186,8 +205,9 @@ impl<T: Send + 'static> ContentTab<T> {
                     return;
                 }
                 match result {
-                    Ok(Ok(items)) => {
+                    Ok(Ok((items, origins))) => {
                         this.items = items;
+                        this.origins = origins;
                         this.state = LoadState::Loaded;
                     }
                     Ok(Err(error)) => this.state = LoadState::Failed(error.to_string()),

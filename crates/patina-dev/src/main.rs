@@ -783,6 +783,7 @@ fn phase_name(p: Phase) -> &'static str {
         Phase::DownloadRuntime => "download-runtime",
         Phase::DownloadAssetIndex => "download-asset-index",
         Phase::DownloadGameFiles => "download-game-files",
+        Phase::DownloadContent => "download-content",
         Phase::DownloadInstaller => "download-installer",
         Phase::DownloadLibraries => "download-libraries",
         Phase::RunProcessor => "run-processor",

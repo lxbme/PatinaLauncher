@@ -58,6 +58,7 @@ use super::list::{
     ContentTab, ContentToolbar, EmptyKind, EmptyState, LoadState, Named, Reloaded, filter_input,
     matches_filter,
 };
+use super::origin::{OpenOriginalProject, open_project, origin_badge};
 use super::refresh::{open_folder, with_instance_lock};
 use crate::fonts::Strong as _;
 use crate::instances::{Entry, InstancesModel, labelled};
@@ -106,6 +107,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("end", SelectLastMod, context),
         KeyBinding::new("space", ToggleMod, context),
         KeyBinding::new("delete", DeleteMod, context),
+        KeyBinding::new("alt-enter", OpenOriginalProject, context),
     ]);
 }
 
@@ -750,6 +752,7 @@ impl ModsTab {
             cache.rename(&item.meta_key(), renamed);
         }
         self.list.update(cx, |list, cx| {
+            list.rename_origin(&item.path, path.clone());
             list.update_items(
                 |items| {
                     if let Some(row) = items.iter_mut().find(|m| m.file_name == old_name) {
@@ -1044,6 +1047,11 @@ impl ModsTab {
             .text_size(TEXT_SECONDARY)
             .text_color(muted)
             .children(detail);
+        let origin = origin_badge(
+            &format!("mods/{file}"),
+            self.list.read(cx).origin(&item.path),
+            cx,
+        );
         let file_label = div()
             .min_w_0()
             .max_w(FILE_W)
@@ -1143,6 +1151,7 @@ impl ModsTab {
                     .child(second),
             )
             .child(file_label)
+            .child(origin)
             .child(switch)
             .child(delete)
             .test_support()
@@ -1165,6 +1174,16 @@ impl ModsTab {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::toggle_selected))
             .on_action(cx.listener(Self::delete_selected))
+            .on_action(cx.listener(|this, _: &OpenOriginalProject, _, cx| {
+                let list = this.list.read(cx);
+                let project = this
+                    .selected
+                    .as_ref()
+                    .and_then(|name| list.items().iter().find(|i| &i.file_name == name))
+                    .and_then(|item| list.origin(&item.path))
+                    .cloned();
+                open_project(project.as_ref(), cx);
+            }))
             .relative()
             .flex_1()
             .min_h_0()
@@ -1209,7 +1228,26 @@ impl ModsTab {
             move |_, cx| refresh.update(cx, |list, cx| list.reload(cx)),
         )
         .refreshing(list.is_reloading())
-        .action(online)
+        .action({
+            let instances = self.model.clone();
+            let id = self.id.clone();
+            h_flex().gap_2().child(online).child(
+                Button::new("mods-check-updates")
+                    .outline()
+                    .small()
+                    .disabled(self.busy.is_some())
+                    .label(t!("content.updates.check").to_string())
+                    .on_click(move |_, window, cx| {
+                        super::online_updates::open_updates(
+                            instances.clone(),
+                            id.clone(),
+                            patina_core::content::online::ContentKind::Mod,
+                            window,
+                            cx,
+                        )
+                    }),
+            )
+        })
     }
 
     /// The line under the toolbar while the instance takes no change.

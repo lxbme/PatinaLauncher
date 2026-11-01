@@ -1,7 +1,7 @@
 //! [`ImageCache`]: icon images of local content (mod icons, pack icons,
 //! world icons) keyed by where they came from.
 //!
-//! PNGs are decoded with icon-sized limits and normalized on the blocking
+//! PNG/JPEG/WebP icons are decoded with icon-sized limits and normalized on the blocking
 //! pool before GPUI sees them. Cache accounting includes the retained PNG
 //! and an upper bound for GPUI's decoded raster.
 
@@ -180,11 +180,18 @@ impl ImageCache {
         evicted
     }
 
-    /// Validates and normalizes a PNG on the blocking pool, never the UI thread.
-    fn image_from_png(bytes: Vec<u8>) -> Option<Arc<Image>> {
+    /// Sniffs supported raster bytes and normalizes to PNG on the blocking pool.
+    fn image_from_icon(bytes: Vec<u8>) -> Option<Arc<Image>> {
         use std::io::Cursor;
-        let mut reader =
-            image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
+        let mut reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        if !matches!(
+            reader.format(),
+            Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP)
+        ) {
+            return None;
+        }
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(MAX_SOURCE_SIDE);
         limits.max_image_height = Some(MAX_SOURCE_SIDE);
@@ -217,7 +224,7 @@ pub fn read_icon_file(path: &std::path::Path) -> Option<Vec<u8>> {
     (bytes.len() <= MAX_ICON_BYTES).then_some(bytes)
 }
 
-/// Starts loading the image for `key` through `read` (PNG bytes; it runs on
+/// Starts loading the image for `key` through `read` (PNG/JPEG/WebP bytes; it runs on
 /// the blocking pool; more than [`MAX_ICON_BYTES`] counts as unreadable)
 /// unless it is cached, loading or known unreadable. The result goes into
 /// the global cache even when `view` is gone by then; `view` is notified
@@ -234,7 +241,7 @@ pub fn request_image<V: 'static>(
     let load = run_blocking(cx, move || {
         read()
             .filter(|bytes| bytes.len() <= MAX_ICON_BYTES)
-            .and_then(ImageCache::image_from_png)
+            .and_then(ImageCache::image_from_icon)
     });
     cx.spawn(async move |this, cx| {
         let loaded = load.await.ok().flatten();
@@ -403,6 +410,64 @@ mod tests {
         let decoded = image::load_from_memory(&image.bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (64, 64));
         assert_eq!(retained, image.bytes.len() + 16_384);
+    }
+
+    #[gpui_kit::test]
+    async fn png_jpeg_webp_icons_are_sniffed_normalized_and_retained(cx: &mut TestAppContext) {
+        use std::io::Cursor;
+        let (_rt, _dir) = boot(cx);
+        let view = cx.new(|_| View);
+        for (ix, format) in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::WebP,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut encoded = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                96,
+                96,
+                image::Rgb([40, 150, 220]),
+            ))
+            .write_to(&mut encoded, format)
+            .unwrap();
+            let bytes = encoded.into_inner();
+            let k = ImageKey::new("online", format!("opaque-icon-{ix}"), 0, None);
+            view.update(cx, |_, cx| {
+                request_image(k.clone(), move || Some(bytes), cx)
+            })
+            .await;
+            let image = cx
+                .update(|cx| cx.global_mut::<ImageCache>().get(&k))
+                .expect("supported CDN representation must be cached");
+            assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let decoded = image::load_from_memory(&image.bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (64, 64));
+            view.update(cx, |_, cx| {
+                let _ = icon_tile(
+                    k.clone(),
+                    || panic!("retained image must render without another read"),
+                    rems(2.),
+                    IconName::Package,
+                    cx,
+                );
+            });
+            let retained = cx
+                .update(|cx| cx.global_mut::<ImageCache>().get(&k))
+                .unwrap();
+            assert!(Arc::ptr_eq(&image, &retained));
+        }
+        let mut oversized = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2048, 2048))
+            .write_to(&mut oversized, image::ImageFormat::WebP)
+            .unwrap();
+        let bytes = oversized.into_inner();
+        assert!(bytes.len() < MAX_ICON_BYTES);
+        view.update(cx, |_, cx| request_image(key(99), move || Some(bytes), cx))
+            .await;
+        assert!(!cx.update(|cx| cx.global::<ImageCache>().contains(&key(99))));
     }
 
     struct View;
