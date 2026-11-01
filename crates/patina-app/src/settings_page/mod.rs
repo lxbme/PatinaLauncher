@@ -32,8 +32,8 @@ pub use behavior::AFTER_LAUNCH;
 pub use download::{SOURCES, speed_row_id};
 pub use java::{runtime_delete_id, runtime_row_id};
 
-use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -145,6 +145,8 @@ impl Section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Source,
+    Java,
+    LowMemoryWarning,
     Memory,
     Gc,
     Args,
@@ -154,6 +156,8 @@ enum Field {
 #[derive(Default)]
 struct Errors {
     source: Option<SharedString>,
+    java: Option<SharedString>,
+    low_memory_warning: Option<SharedString>,
     memory: Option<SharedString>,
     gc: Option<SharedString>,
     args: Option<SharedString>,
@@ -163,6 +167,8 @@ impl Errors {
     fn slot(&mut self, field: Field) -> &mut Option<SharedString> {
         match field {
             Field::Source => &mut self.source,
+            Field::Java => &mut self.java,
+            Field::LowMemoryWarning => &mut self.low_memory_warning,
             Field::Memory => &mut self.memory,
             Field::Gc => &mut self.gc,
             Field::Args => &mut self.args,
@@ -201,6 +207,12 @@ pub struct SettingsPage {
     saving: bool,
     idle_waiters: Vec<futures::channel::oneshot::Sender<()>>,
     /// Latest accepted intent, kept until matching readback or its final write fails.
+    requested_java: Option<Option<PathBuf>>,
+    requested_low_memory_warning: Option<bool>,
+    java_choice_revision: u64,
+    java_file_pending: Option<PathBuf>,
+    probed_java: HashMap<PathBuf, Option<u32>>,
+    gc_details_open: bool,
     requested_memory: Option<(u32, Option<u32>)>,
     requested_args: Option<String>,
     requested_gc: Option<patina_core::jvm::GcPreset>,
@@ -281,6 +293,12 @@ impl SettingsPage {
             queue: VecDeque::new(),
             saving: false,
             idle_waiters: Vec::new(),
+            requested_java: None,
+            requested_low_memory_warning: None,
+            java_choice_revision: 0,
+            java_file_pending: None,
+            probed_java: HashMap::new(),
+            gc_details_open: false,
             requested_memory: None,
             requested_args: None,
             requested_gc: None,
@@ -360,7 +378,7 @@ impl SettingsPage {
 
     /// Whether a save is queued or in flight.
     pub fn is_saving(&self) -> bool {
-        self.saving || !self.queue.is_empty()
+        self.saving || !self.queue.is_empty() || self.java_file_pending.is_some()
     }
 
     /// Validates focused inputs and waits for all queued writes to finish.
@@ -406,6 +424,12 @@ impl SettingsPage {
                 }
                 if let Ok(config) = config {
                     if !this.is_saving() {
+                        if this.requested_java.as_ref() == Some(&config.java.java_path) {
+                            this.requested_java = None;
+                        }
+                        if this.requested_low_memory_warning == Some(config.java.low_mem_warning) {
+                            this.requested_low_memory_warning = None;
+                        }
                         if this.requested_memory
                             == Some((config.java.min_mem_mib, config.java.max_mem_mib))
                         {
@@ -478,6 +502,9 @@ impl SettingsPage {
             return;
         }
         let Some((field, edit)) = self.queue.pop_front() else {
+            if self.java_file_pending.is_some() {
+                return;
+            }
             for waiter in self.idle_waiters.drain(..) {
                 waiter.send(()).ok();
             }
@@ -498,6 +525,8 @@ impl SettingsPage {
                     Err(error) => {
                         if !this.queue.iter().any(|(queued, _)| *queued == field) {
                             match field {
+                                Field::Java => this.requested_java = None,
+                                Field::LowMemoryWarning => this.requested_low_memory_warning = None,
                                 Field::Memory => this.requested_memory = None,
                                 Field::Args => this.requested_args = None,
                                 Field::Gc => this.requested_gc = None,

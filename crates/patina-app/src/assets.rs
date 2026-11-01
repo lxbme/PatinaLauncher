@@ -8,7 +8,17 @@ use gpui_kit::{AssetSource, Result, SharedString};
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
-        Download, Boxes, Puzzle, Image, SunMedium, Earth, Trash, Package
+        Download,
+        Boxes,
+        Puzzle,
+        Image,
+        SunMedium,
+        Earth,
+        Trash,
+        Package,
+        Cpu,
+        MemoryStick,
+        SlidersHorizontal
     ]
 );
 
@@ -17,6 +27,9 @@ pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = crate::accounts::offline_heads::asset_bytes(path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         if let Some(bytes) = crate::instances::asset_bytes(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
@@ -34,6 +47,13 @@ impl AssetSource for AppAssets {
                 .iter()
                 .map(|name| SharedString::from(format!("instance-icons/{name}.png")))
                 .filter(|asset| asset.starts_with(path)),
+        );
+        all.extend(
+            crate::accounts::offline_heads::ASSETS
+                .iter()
+                .copied()
+                .filter(|asset| asset.starts_with(path))
+                .map(SharedString::from),
         );
         all.sort();
         all.dedup();
@@ -57,6 +77,9 @@ mod tests {
             IconName::Earth,
             IconName::Trash,
             IconName::Package,
+            IconName::Cpu,
+            IconName::MemoryStick,
+            IconName::SlidersHorizontal,
             IconName::Close,
         ] {
             let path = icon.path();
@@ -65,6 +88,15 @@ mod tests {
         for name in crate::instances::BUILTIN_ICONS {
             let path = format!("instance-icons/{name}.png");
             assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");
+        }
+        for path in crate::accounts::offline_heads::ASSETS {
+            assert!(AppAssets.load(path).unwrap().is_some(), "{path}");
+            assert!(
+                AppAssets
+                    .list("account-heads/")
+                    .unwrap()
+                    .contains(&path.into())
+            );
         }
         assert!(!matches!(
             AppAssets.load("icons/no-such-icon.svg"),

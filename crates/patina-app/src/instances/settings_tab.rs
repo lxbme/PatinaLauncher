@@ -298,6 +298,7 @@ pub struct SettingsForm {
     discarded: Arc<Mutex<Option<JavaSettings>>>,
     /// The Java and GC preset a reset notice was already given for.
     gc_reset_for: Option<(Option<PathBuf>, GcPreset)>,
+    gc_details_open: bool,
     required_done: bool,
     /// The model or the Java list changed since `render` last followed up.
     stale: bool,
@@ -415,6 +416,7 @@ impl SettingsForm {
             idle_waiters: Vec::new(),
             discarded: Arc::new(Mutex::new(None)),
             gc_reset_for: None,
+            gc_details_open: false,
             required_done: false,
             stale: false,
             errors: Errors::default(),
@@ -1382,48 +1384,42 @@ fn choice_of(instance: &Instance) -> IconChoice {
 // --- drawing ------------------------------------------------------------------
 
 /// One entry of the Java choice.
-struct JavaOption {
+pub(crate) struct JavaOption {
     /// `None`: the managed runtime.
-    path: Option<PathBuf>,
-    label: String,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) label: String,
+}
+
+pub(crate) fn java_options(installs: &[JavaInstall], current: Option<&PathBuf>) -> Vec<JavaOption> {
+    let mut options = vec![JavaOption {
+        path: None,
+        label: t!("instance_settings.java_auto").to_string(),
+    }];
+    options.extend(installs.iter().map(|install| {
+        JavaOption {
+            path: Some(install.path.clone()),
+            label: t!(
+                "instance_settings.java_option",
+                major = install.major,
+                version = install.version,
+                path = install.path.display()
+            )
+            .to_string(),
+        }
+    }));
+    // A saved or chosen file the detection did not list.
+    if let Some(path) = current
+        && !installs.iter().any(|i| &i.path == path)
+    {
+        options.push(JavaOption {
+            path: Some(path.clone()),
+            label: path.display().to_string(),
+        });
+    }
+    options
 }
 
 impl SettingsForm {
-    fn java_options(&self, current: Option<&PathBuf>, cx: &App) -> Vec<JavaOption> {
-        let installs = self
-            .java_list
-            .read(cx)
-            .installs
-            .as_deref()
-            .unwrap_or_default();
-        let mut options = vec![JavaOption {
-            path: None,
-            label: t!("instance_settings.java_auto").to_string(),
-        }];
-        options.extend(installs.iter().map(|install| {
-            JavaOption {
-                path: Some(install.path.clone()),
-                label: t!(
-                    "instance_settings.java_option",
-                    major = install.major,
-                    version = install.version,
-                    path = install.path.display()
-                )
-                .to_string(),
-            }
-        }));
-        // A saved or chosen file the detection did not list.
-        if let Some(path) = current
-            && !installs.iter().any(|i| &i.path == path)
-        {
-            options.push(JavaOption {
-                path: Some(path.clone()),
-                label: path.display().to_string(),
-            });
-        }
-        options
-    }
-
     fn heading(text: String, cx: &App) -> impl IntoElement {
         div()
             .text_size(TEXT_ROW)
@@ -1550,30 +1546,38 @@ impl SettingsForm {
             cx,
         )
         .child(
-            v_flex()
-                .gap_1()
-                .child(
-                    Switch::new("settings-use-global")
-                        .checked(global)
-                        .label(t!("instance_settings.use_global").to_string())
-                        .on_click(cx.listener(|this, checked: &bool, window, cx| {
-                            this.set_use_global(*checked, window, cx);
-                        })),
-                )
-                .child(Self::hint(
-                    "settings-use-global-hint",
-                    t!("instance_settings.use_global_hint").to_string(),
-                    cx,
-                )),
+            v_flex().gap_1().child(
+                Switch::new("settings-use-global")
+                    .checked(global)
+                    .label(t!("instance_settings.use_global").to_string())
+                    .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                        this.set_use_global(*checked, window, cx);
+                    })),
+            ),
         );
         let Some(java) = config.java_override.as_ref().filter(|_| !global) else {
             return section;
         };
         section
             .child(self.render_java_choice(java, cx))
-            .child(self.render_memory(cx))
-            .child(self.render_gc(java, cx))
-            .child(self.render_args(cx))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .mt_3()
+                    .child(crate::java_settings::group_heading(
+                        gpui_kit::assets::IconName::MemoryStick,
+                        t!("java_settings.memory").to_string(),
+                        cx,
+                    ))
+                    .child(self.render_memory(cx)),
+            )
+            .child(
+                v_flex()
+                    .gap_3()
+                    .mt_3()
+                    .child(self.render_gc(java, cx))
+                    .child(self.render_args(cx)),
+            )
     }
 
     fn render_java_choice(
@@ -1583,7 +1587,10 @@ impl SettingsForm {
     ) -> impl IntoElement + use<> {
         let chosen = self.requested_java.as_ref().unwrap_or(&java.java_path);
         let current = self.java_file_pending.as_ref().or(chosen.as_ref());
-        let options = self.java_options(current, cx);
+        let options = java_options(
+            self.java_list.read(cx).installs().unwrap_or_default(),
+            current,
+        );
         let selected = options.iter().position(|o| o.path.as_ref() == current);
         let detecting = self.java_list.read(cx).installs.is_none();
         let radios: Vec<Radio> = options
@@ -1591,52 +1598,56 @@ impl SettingsForm {
             .map(|o| Radio::new("java").label(o.label.clone()))
             .collect();
         let paths: Vec<Option<PathBuf>> = options.into_iter().map(|o| o.path).collect();
-        Self::field(t!("instance_settings.java").to_string(), cx)
-            .child(
-                RadioGroup::new("settings-java")
-                    .selected_index(selected)
-                    .children(radios)
-                    .on_click(cx.listener(move |this, ix: &usize, window, cx| {
-                        let Some(path) = paths.get(*ix).cloned() else {
-                            return;
-                        };
-                        let major = match &path {
-                            Some(path) => this
-                                .detected_major(path, cx)
-                                .or_else(|| this.probed.get(path).copied().flatten()),
-                            None => this.required,
-                        };
-                        this.set_java(path, major, window, cx);
-                    })),
-            )
-            .when(detecting, |f| {
-                f.child(Self::hint(
-                    "settings-java-detecting",
-                    t!("instance_settings.java_detecting").to_string(),
-                    cx,
-                ))
-            })
-            .child(
-                h_flex().child(
-                    Button::new("settings-java-choose")
-                        .outline()
-                        .small()
-                        .label(t!("instance_settings.java_choose").to_string())
-                        .on_click(cx.listener(|this, _, window, cx| this.choose_file(window, cx))),
-                ),
-            )
-            .when(self.java_file_pending.is_some(), |field| {
-                field.child(Self::hint(
-                    "settings-java-checking",
-                    t!("instance_settings.java_checking").to_string(),
-                    cx,
-                ))
-            })
-            .children(Self::error(
-                "settings-java-error",
-                self.errors.java.as_ref(),
+        crate::java_settings::field(
+            t!("instance_settings.java").to_string(),
+            Some(gpui_kit::assets::IconName::Cpu),
+            cx,
+        )
+        .child(
+            RadioGroup::new("settings-java")
+                .selected_index(selected)
+                .children(radios)
+                .on_click(cx.listener(move |this, ix: &usize, window, cx| {
+                    let Some(path) = paths.get(*ix).cloned() else {
+                        return;
+                    };
+                    let major = match &path {
+                        Some(path) => this
+                            .detected_major(path, cx)
+                            .or_else(|| this.probed.get(path).copied().flatten()),
+                        None => this.required,
+                    };
+                    this.set_java(path, major, window, cx);
+                })),
+        )
+        .when(detecting, |f| {
+            f.child(Self::hint(
+                "settings-java-detecting",
+                t!("instance_settings.java_detecting").to_string(),
                 cx,
             ))
+        })
+        .child(
+            h_flex().child(
+                Button::new("settings-java-choose")
+                    .outline()
+                    .small()
+                    .label(t!("instance_settings.java_choose").to_string())
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_file(window, cx))),
+            ),
+        )
+        .when(self.java_file_pending.is_some(), |field| {
+            field.child(Self::hint(
+                "settings-java-checking",
+                t!("instance_settings.java_checking").to_string(),
+                cx,
+            ))
+        })
+        .children(Self::error(
+            "settings-java-error",
+            self.errors.java.as_ref(),
+            cx,
+        ))
     }
 
     fn render_memory(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1647,14 +1658,24 @@ impl SettingsForm {
                     .gap_4()
                     .items_end()
                     .child(
-                        Self::field(t!("instance_settings.min_mem").to_string(), cx).child(
+                        crate::java_settings::field(
+                            t!("instance_settings.min_mem").to_string(),
+                            None,
+                            cx,
+                        )
+                        .child(
                             Input::new(&self.min_mem)
                                 .id("settings-min-mem")
                                 .w(rems(NUMBER_W.0)),
                         ),
                     )
                     .child(
-                        Self::field(t!("instance_settings.max_mem").to_string(), cx).child(
+                        crate::java_settings::field(
+                            t!("instance_settings.max_mem").to_string(),
+                            None,
+                            cx,
+                        )
+                        .child(
                             h_flex()
                                 .gap_2()
                                 .child(
@@ -1683,6 +1704,11 @@ impl SettingsForm {
 
     fn render_gc(&self, java: &JavaSettings, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let major = self.java_major(java, cx);
+        let mut effective = java.clone();
+        if let Some(path) = &self.requested_java {
+            effective.java_path = path.clone();
+        }
+        let disclosure_major = self.java_major(&effective, cx);
         let unknown = self.java_unknown(java, cx);
         // Without a known Java only the presets that need none are open.
         let compatible = |preset: GcPreset| gc_selectable(preset, major);
@@ -1707,42 +1733,66 @@ impl SettingsForm {
                 (ix, reason.to_string())
             })
             .collect();
-        Self::field(t!("instance_settings.gc").to_string(), cx)
-            .child(
-                RadioGroup::new("settings-gc")
-                    .selected_index(
-                        GC_PRESETS
-                            .iter()
-                            .position(|p| *p == self.requested_gc.unwrap_or(java.gc_preset)),
-                    )
-                    .children(radios)
-                    .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                        if let Some(preset) = GC_PRESETS.get(*ix) {
-                            this.set_gc(*preset, window, cx);
-                        }
-                    })),
-            )
-            .children(unknown.map(|why| {
-                let reason = match why {
-                    JavaUnknown::Checking => t!("instance_settings.gc_checking"),
-                    JavaUnknown::Unknown => t!("instance_settings.gc_unknown"),
-                }
-                .to_string();
-                Self::hint("settings-gc-unknown", reason, cx)
-            }))
-            .children(reasons.into_iter().map(|(ix, reason)| {
-                div()
-                    .id(SharedString::from(format!("settings-gc-reason-{ix}")))
-                    .test_support()
-                    .aria_label(reason.clone())
-                    .text_size(TEXT_SECONDARY)
-                    .text_color(cx.theme().muted_foreground)
-                    .child(reason)
-            }))
+        crate::java_settings::field(
+            t!("instance_settings.gc").to_string(),
+            Some(gpui_kit::assets::IconName::SlidersHorizontal),
+            cx,
+        )
+        .child(
+            RadioGroup::new("settings-gc")
+                .selected_index(
+                    GC_PRESETS
+                        .iter()
+                        .position(|p| *p == self.requested_gc.unwrap_or(java.gc_preset)),
+                )
+                .children(radios)
+                .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                    if let Some(preset) = GC_PRESETS.get(*ix) {
+                        this.set_gc(*preset, window, cx);
+                    }
+                })),
+        )
+        .child(crate::java_settings::gc_disclosure(
+            "settings-gc-details",
+            self.requested_gc.unwrap_or(java.gc_preset),
+            disclosure_major,
+            self.gc_details_open,
+            Button::new("settings-gc-details-toggle")
+                .ghost()
+                .small()
+                .icon(if self.gc_details_open {
+                    gpui_kit::assets::IconName::ChevronDown
+                } else {
+                    gpui_kit::assets::IconName::ChevronRight
+                })
+                .label(t!("java_settings.gc_details").to_string())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.gc_details_open = !this.gc_details_open;
+                    cx.notify();
+                })),
+            cx,
+        ))
+        .children(unknown.map(|why| {
+            let reason = match why {
+                JavaUnknown::Checking => t!("instance_settings.gc_checking"),
+                JavaUnknown::Unknown => t!("instance_settings.gc_unknown"),
+            }
+            .to_string();
+            Self::hint("settings-gc-unknown", reason, cx)
+        }))
+        .children(reasons.into_iter().map(|(ix, reason)| {
+            div()
+                .id(SharedString::from(format!("settings-gc-reason-{ix}")))
+                .test_support()
+                .aria_label(reason.clone())
+                .text_size(TEXT_SECONDARY)
+                .text_color(cx.theme().muted_foreground)
+                .child(reason)
+        }))
     }
 
     fn render_args(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        Self::field(t!("instance_settings.jvm_args").to_string(), cx)
+        crate::java_settings::field(t!("instance_settings.jvm_args").to_string(), None, cx)
             .child(
                 crate::fields::tab_leaves(div().id("settings-args").test_support())
                     .child(Textarea::new(&self.args).h(rems(5.5))),

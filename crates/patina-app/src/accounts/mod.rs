@@ -5,6 +5,7 @@ pub(crate) mod avatar;
 mod fake_login;
 mod login_dialog;
 mod offline_dialog;
+pub(crate) mod offline_heads;
 mod page;
 mod switcher;
 
@@ -66,12 +67,27 @@ pub fn switch_to(id: String, window: &mut Window, cx: &mut App) -> Task<()> {
     })
 }
 
-/// Read-only retained skin head, or the unchanged UUID-tinted letter tile.
+/// Local offline head, retained MSA skin head, or its unchanged letter tile.
 pub fn avatar(account: &Account, size: Rems, cx: &App) -> AnyElement {
     use gpui_kit::{
         InteractiveElement, IntoElement, ObjectFit, ParentElement, StatefulInteractiveElement,
         Styled, StyledImage, TestSupportExt, div, img, rems,
     };
+    if let Some(path) = offline_heads::asset_for(account) {
+        return div()
+            .id(format!("account-offline-head-{}", account.id))
+            .test_support()
+            .aria_label(account.username.clone())
+            .flex_none()
+            .size(size)
+            .child(
+                img(gpui_kit::SharedString::from(path))
+                    .size_full()
+                    .rounded(rems(size.0 * 0.22))
+                    .object_fit(ObjectFit::Cover),
+            )
+            .into_any_element();
+    }
     if let Some(image) = avatar::cached_image(account, cx) {
         return div()
             .id(format!("account-head-{}", account.id))

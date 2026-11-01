@@ -4440,10 +4440,13 @@ fn reveal(app: &Booted, cx: &mut TestAppContext, id: impl Into<gpui_kit::Element
         let Some(found) = element(app, cx, id.clone()) else {
             return;
         };
-        if found.visible() {
+        let Some(viewport) = element(app, cx, "settings-tab").map(|tab| tab.bounds()) else {
+            return;
+        };
+        if found.visible() && viewport.contains(&found.bounds().center()) {
             return;
         }
-        let top = element(app, cx, "settings-tab").map_or(px(0.), |tab| tab.bounds().top());
+        let top = viewport.top();
         let up = found.bounds().center().y < top;
         let dy = if up { px(120.) } else { px(-120.) };
         cx.update_window(app.handle, |_, window, cx| {
@@ -4576,7 +4579,27 @@ fn radio(
 }
 
 fn click_radio(app: &Booted, cx: &mut TestAppContext, group: &'static str, ix: usize) {
-    reveal(app, cx, group);
+    for _ in 0..40 {
+        let found = radio(app, cx, group, ix).expect("the radio is drawn");
+        let column = element(app, cx, "settings-tab").unwrap().bounds();
+        if found.visible() && column.contains(&found.bounds().center()) {
+            break;
+        }
+        let dy = if found.bounds().center().y < column.top() {
+            px(120.)
+        } else {
+            px(-120.)
+        };
+        cx.update_window(app.handle, |_, window, cx| {
+            window.scroll(
+                "settings-tab",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), dy)),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
     cx.update_window(app.handle, |_, window, cx| {
         window.render_frame(cx);
         window.within(group).click(ix, cx);
@@ -4620,6 +4643,66 @@ fn override_toggle_writes_java_override(cx: &mut TestAppContext) {
     sclick(&app, cx, "settings-use-global");
     settle(cx, |_| saved_java(&store, "Alpha").is_none());
     settle(cx, |cx| !sshows(&app, cx, "settings-min-mem"));
+}
+
+#[gpui_kit::test]
+fn instance_gc_disclosure_tracks_runtime_and_keeps_custom_args_separate(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _model, store) = settings_app(
+        cx,
+        tmp.path(),
+        &["Alpha"],
+        vec![
+            java_install("/opt/j21/bin/java", 21),
+            java_install("/opt/j23/bin/java", 23),
+        ],
+    );
+    override_on(&app, cx, &store, "Alpha");
+    assert!(element(&app, cx, "settings-use-global-hint").is_none());
+    assert!(
+        element(&app, cx, "settings-args-hint").is_some(),
+        "JVM restrictions remain visible"
+    );
+    click_radio(&app, cx, "settings-java", 1);
+    click_radio(&app, cx, "settings-gc", 2);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().gc_preset == GcPreset::GenerationalZgc
+    });
+    sclick(&app, cx, "settings-gc-details-toggle");
+    assert_eq!(
+        label_of(&app, cx, "settings-gc-details-args").as_deref(),
+        Some("-XX:+UseZGC\n-XX:+ZGenerational")
+    );
+    click_radio(&app, cx, "settings-java", 2);
+    settle(cx, |_| {
+        saved_java(&store, "Alpha").unwrap().java_path == Some("/opt/j23/bin/java".into())
+    });
+    assert_eq!(
+        label_of(&app, cx, "settings-gc-details-args").as_deref(),
+        Some("-XX:+UseZGC")
+    );
+    for scale in [1., 2.] {
+        cx.update(|cx| patina_app::scale::apply_scale(scale, cx));
+        cx.simulate_window_resize(
+            app.handle,
+            gpui_kit::size(px(1280. * scale), px(800. * scale)),
+        );
+        cx.run_until_parked();
+        reveal(&app, cx, "settings-gc-details-args");
+        let args = element(&app, cx, "settings-gc-details-args")
+            .unwrap()
+            .bounds();
+        let viewport = element(&app, cx, "settings-tab").unwrap().bounds();
+        assert!(args.left() >= viewport.left() && args.right() <= viewport.right());
+        let minimum = element(&app, cx, "settings-min-mem").unwrap().bounds();
+        assert_eq!(args.left(), minimum.left());
+    }
+    assert!(
+        saved_java(&store, "Alpha")
+            .unwrap()
+            .extra_jvm_args
+            .is_empty()
+    );
 }
 
 #[gpui_kit::test]
@@ -8515,6 +8598,90 @@ token_ref = "00000000-0000-0000-0000-000000000002"
     }
 
     #[gpui_kit::test]
+    fn offline_heads_render_on_page_title_and_popup_without_skin_requests(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("accounts.toml"),
+            r#"
+current = "offline-one"
+[[accounts]]
+id = "offline-one"
+kind = "offline"
+offline_origin = "entitled"
+username = "PlayerOne"
+uuid = "00000000-0000-0000-0000-000000000001"
+[[accounts]]
+id = "offline-two"
+kind = "offline"
+offline_origin = "development"
+username = "PlayerTwo"
+uuid = "00000000-0000-0000-0000-000000000002"
+[[accounts]]
+id = "owner"
+kind = "msa"
+username = "Owner"
+uuid = "00000000-0000-0000-0000-000000000003"
+verification = { profile_uuid = "00000000-0000-0000-0000-000000000003", verified_at = 1 }
+"#,
+        )
+        .unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        settle(cx, |cx| title_label(&app, cx) != AccountLabel::Loading);
+        assert_eq!(title_label(&app, cx), signed_in("PlayerOne"));
+        assert!(shows(&app, cx, "switcher-head"));
+        open_page(&app, cx);
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .within(account_row_id("offline-one"))
+                    .try_find("account-offline-head-offline-one")
+                    .is_some()
+            );
+            #[cfg(feature = "dev-offline")]
+            assert!(
+                window
+                    .within(account_row_id("offline-two"))
+                    .try_find("account-offline-head-offline-two")
+                    .is_some()
+            );
+        })
+        .unwrap();
+        for scale in [1., 2.] {
+            cx.update(|cx| patina_app::scale::apply_scale(scale, cx));
+            cx.simulate_window_resize(
+                app.handle,
+                gpui_kit::size(px(960. * scale), px(600. * scale)),
+            );
+            cx.run_until_parked();
+            click(&app, cx, "title-account");
+            cx.update_window(app.handle, |_, window, cx| {
+                window.render_frame(cx);
+                let ids = if cfg!(feature = "dev-offline") {
+                    vec!["offline-one", "offline-two"]
+                } else {
+                    vec!["offline-one"]
+                };
+                for id in ids {
+                    assert!(
+                        window
+                            .within(format!("account-menu-avatar-{id}"))
+                            .try_find(format!("account-offline-head-{id}"))
+                            .is_some()
+                    );
+                }
+            })
+            .unwrap();
+            let title_head = element(&app, cx, "switcher-head").unwrap().bounds();
+            assert_eq!(title_head.size.width, px(16. * scale));
+            assert_eq!(title_head.size.height, px(16. * scale));
+            press(&app, cx, "escape");
+        }
+        let cache = DataDirs::new(tmp.path()).cache().join("account-heads");
+        assert!(std::fs::read_dir(cache).is_ok_and(|mut files| files.next().is_none()));
+    }
+
+    #[gpui_kit::test]
     fn set_current_updates_title_bar(cx: &mut TestAppContext) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("accounts.toml"), TWO).unwrap();
@@ -8758,10 +8925,10 @@ mod settings_page {
             let Some(found) = find(app, cx) else {
                 return;
             };
-            if found.visible() {
+            let column = element(app, cx, "prefs-content").expect("the page is drawn");
+            if found.visible() && column.bounds().contains(&found.bounds().center()) {
                 return;
             }
-            let column = element(app, cx, "prefs-content").expect("the page is drawn");
             let up = found.bounds().center().y < column.bounds().top();
             let dy = if up { px(120.) } else { px(-120.) };
             cx.update_window(app.handle, |_, window, cx| {
@@ -8856,6 +9023,261 @@ mod settings_page {
 
     fn status_source(app: &Booted, cx: &mut TestAppContext) -> String {
         label_of(app, cx, "status-source").unwrap_or_default()
+    }
+
+    #[gpui_kit::test]
+    async fn global_manual_java_validates_before_save_and_reloads(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+            let mut core = testing::core(rt, data, Arc::new(FakeCatalog::new()));
+            core.probe_java = Arc::new(|path| {
+                (path == Path::new("/manual/bin/java"))
+                    .then(|| java_install("/manual/bin/java", 23))
+            });
+            core
+        });
+        cx.update(|cx| seed_java_list(vec![], cx));
+        let page = open(&app, cx);
+        let probe = cx
+            .update_window(app.handle, |_, window, cx| {
+                page.update(cx, |p, cx| p.use_java_file("/not/java".into(), window, cx))
+            })
+            .unwrap();
+        probe.await;
+        assert!(on_disk(tmp.path()).java.java_path.is_none());
+        assert!(pshows(&app, cx, "prefs-java-choice-error"));
+        let probe = cx
+            .update_window(app.handle, |_, window, cx| {
+                page.update(cx, |p, cx| {
+                    p.use_java_file("/manual/bin/java".into(), window, cx)
+                })
+            })
+            .unwrap();
+        probe.await;
+        saves_done(&page, cx);
+        assert_eq!(
+            on_disk(tmp.path()).java.java_path,
+            Some("/manual/bin/java".into())
+        );
+        click(&app, cx, "rail-instances");
+        click(&app, cx, "rail-settings");
+        settle(cx, |cx| {
+            page.read_with(cx, |p, _| {
+                p.config().unwrap().java.java_path == Some("/manual/bin/java".into())
+            })
+        });
+        assert_eq!(
+            pradio(&app, cx, "prefs-java-choice", 1).checked(),
+            Some(true)
+        );
+        assert!(!pshows(&app, cx, "prefs-java-choice-error"));
+    }
+
+    #[gpui_kit::test]
+    async fn close_waits_for_global_java_validation_and_its_save(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = Arc::new(std::sync::Mutex::new(gate));
+        let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+            let mut core = testing::core(rt, data, Arc::new(FakeCatalog::new()));
+            core.probe_java = Arc::new(move |_| {
+                entered.send(()).unwrap();
+                gate.lock().unwrap().recv().ok();
+                Some(java_install("/manual/bin/java", 21))
+            });
+            core
+        });
+        cx.update(|cx| seed_java_list(vec![], cx));
+        let page = open(&app, cx);
+        let probe = cx
+            .update_window(app.handle, |_, window, cx| {
+                page.update(cx, |p, cx| {
+                    p.use_java_file("/manual/bin/java".into(), window, cx)
+                })
+            })
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut window = gpui_kit::VisualTestContext::from_window(app.handle, cx);
+        assert!(
+            !window.simulate_close(),
+            "validation and the save must drain first"
+        );
+        assert!(!cx.update(|cx| cx.windows().is_empty()));
+        release.send(()).unwrap();
+        probe.await;
+        settle(cx, |cx| cx.update(|cx| cx.windows().is_empty()));
+        assert_eq!(
+            on_disk(tmp.path()).java.java_path,
+            Some("/manual/bin/java".into())
+        );
+    }
+
+    #[gpui_kit::test]
+    fn java_groups_keep_alignment_and_keyboard_at_normal_and_double_scale(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        cx.update(|cx| seed_java_list(vec![java_install("/opt/j23/bin/java", 23)], cx));
+        let page = open(&app, cx);
+        assert!(element(&app, cx, "prefs-java-hint").is_none());
+        assert!(element(&app, cx, "prefs-low-memory-warning-hint").is_none());
+        assert!(
+            element(&app, cx, "prefs-args-hint").is_some(),
+            "JVM restrictions remain visible"
+        );
+        for (scale, language) in [(1., Language::En), (2., Language::ZhCn)] {
+            app.language(language);
+            cx.update(|cx| patina_app::scale::apply_scale(scale, cx));
+            cx.simulate_window_resize(
+                app.handle,
+                gpui_kit::size(px(960. * scale), px(600. * scale)),
+            );
+            cx.run_until_parked();
+            let mut left = None;
+            for id in [
+                "prefs-java-choose",
+                "prefs-min-mem",
+                "prefs-gc-details-toggle",
+                "prefs-args",
+            ] {
+                reveal(&app, cx, id);
+                let bounds = element(&app, cx, id).unwrap().bounds();
+                let column = element(&app, cx, "prefs-content").unwrap().bounds();
+                assert!(bounds.left() >= column.left() && bounds.right() <= column.right());
+                if let Some(left) = left {
+                    assert_eq!(bounds.left(), left);
+                } else {
+                    left = Some(bounds.left());
+                }
+            }
+            // Framework Buttons and Switch retain their real keyboard path.
+            pclick(&app, cx, "prefs-max-mem");
+            reveal(&app, cx, "prefs-gc-details-toggle");
+            tab_to(&app, cx, "prefs-gc-details-toggle");
+            press(&app, cx, "enter");
+            assert!(element(&app, cx, "prefs-gc-details-args").is_some());
+            press(&app, cx, "enter");
+            assert!(element(&app, cx, "prefs-gc-details-args").is_none());
+            pclick(&app, cx, "prefs-max-mem");
+            reveal(&app, cx, "prefs-low-memory-warning");
+            tab_to(&app, cx, "prefs-low-memory-warning");
+            press(&app, cx, "space");
+            saves_done(&page, cx);
+            assert_eq!(on_disk(tmp.path()).java.low_mem_warning, scale == 2.);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn global_java_choice_warning_and_gc_details_persist(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(DataDirs::new(tmp.path()).instances());
+        let inherited = store.create("Inherited", "1.21.1").unwrap();
+        let overridden = store.create("Override", "1.21.1").unwrap();
+        store
+            .update(&overridden.id, |c| {
+                c.java_override = Some(patina_core::config::JavaSettings {
+                    java_path: Some("/opt/instance/bin/java".into()),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+        let app = boot(cx, tmp.path(), AppSettings::default());
+        cx.update(|cx| {
+            seed_java_list(
+                vec![
+                    java_install("/opt/j21/bin/java", 21),
+                    java_install("/opt/j23/bin/java", 23),
+                ],
+                cx,
+            )
+        });
+        let page = open(&app, cx);
+        pclick(&app, cx, "prefs-low-memory-warning");
+        saves_done(&page, cx);
+        assert!(!on_disk(tmp.path()).java.low_mem_warning);
+        pclick_radio(&app, cx, "prefs-java-choice", 1);
+        pclick_radio(&app, cx, "prefs-gc", 2);
+        saves_done(&page, cx);
+        assert_eq!(
+            on_disk(tmp.path()).java.gc_preset,
+            GcPreset::GenerationalZgc
+        );
+        pclick(&app, cx, "prefs-gc-details-toggle");
+        assert_eq!(
+            label_of(&app, cx, "prefs-gc-details-args").as_deref(),
+            Some("-XX:+UseZGC\n-XX:+ZGenerational")
+        );
+        pclick_radio(&app, cx, "prefs-java-choice", 2);
+        saves_done(&page, cx);
+        assert_eq!(
+            label_of(&app, cx, "prefs-gc-details-args").as_deref(),
+            Some("-XX:+UseZGC")
+        );
+        let global = on_disk(tmp.path());
+        assert!(
+            !patina_core::instance::effective_java(
+                &global.java,
+                &store.load(&inherited.id).unwrap().config
+            )
+            .low_mem_warning
+        );
+        assert!(
+            patina_core::instance::effective_java(
+                &global.java,
+                &store.load(&overridden.id).unwrap().config
+            )
+            .low_mem_warning
+        );
+        assert_eq!(
+            patina_core::instance::effective_java(
+                &global.java,
+                &store.load(&inherited.id).unwrap().config
+            )
+            .java_path,
+            Some("/opt/j23/bin/java".into())
+        );
+        assert_eq!(
+            patina_core::instance::effective_java(
+                &global.java,
+                &store.load(&overridden.id).unwrap().config
+            )
+            .java_path,
+            Some("/opt/instance/bin/java".into())
+        );
+        pclick_radio(&app, cx, "prefs-java-choice", 0);
+        saves_done(&page, cx);
+        assert!(on_disk(tmp.path()).java.java_path.is_none());
+        assert!(
+            label_of(&app, cx, "prefs-gc-details-args")
+                .unwrap()
+                .contains("Java 21–22")
+        );
+        pclick_radio(&app, cx, "prefs-gc", 1);
+        saves_done(&page, cx);
+        let flags = label_of(&app, cx, "prefs-gc-details-args").unwrap();
+        assert_eq!(
+            flags
+                .lines()
+                .filter(|line| line.starts_with("-XX:"))
+                .count(),
+            18
+        );
+        assert!(flags.contains("-XX:MaxTenuringThreshold=1"));
+        pclick_radio(&app, cx, "prefs-gc", 0);
+        saves_done(&page, cx);
+        assert!(
+            !label_of(&app, cx, "prefs-gc-details-args")
+                .unwrap()
+                .contains("-XX:")
+        );
+        click(&app, cx, "rail-instances");
+        click(&app, cx, "rail-settings");
+        assert_eq!(
+            element(&app, cx, "prefs-low-memory-warning")
+                .unwrap()
+                .checked(),
+            Some(false)
+        );
     }
 
     #[gpui_kit::test]
@@ -9242,6 +9664,7 @@ mod settings_page {
     async fn global_revert_while_save_is_held_preserves_latest_intent(cx: &mut TestAppContext) {
         let tmp = tempfile::tempdir().unwrap();
         let app = boot(cx, tmp.path(), AppSettings::default());
+        cx.update(|cx| seed_java_list(vec![java_install("/opt/j21/bin/java", 21)], cx));
         let page = open(&app, cx);
         let (entered, started) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel();
@@ -9265,9 +9688,15 @@ mod settings_page {
         pclick_radio(&app, cx, "prefs-source", 0);
         pclick_radio(&app, cx, "prefs-gc", 1);
         pclick_radio(&app, cx, "prefs-gc", 0);
+        pclick_radio(&app, cx, "prefs-java-choice", 1);
+        pclick_radio(&app, cx, "prefs-java-choice", 0);
+        pclick(&app, cx, "prefs-low-memory-warning");
+        pclick(&app, cx, "prefs-low-memory-warning");
         release.send(()).unwrap();
         held.await.unwrap().unwrap();
         saves_done(&page, cx);
+        assert!(on_disk(tmp.path()).java.java_path.is_none());
+        assert!(on_disk(tmp.path()).java.low_mem_warning);
         assert_eq!(on_disk(tmp.path()).java.min_mem_mib, 512);
         assert!(on_disk(tmp.path()).java.extra_jvm_args.is_empty());
         assert_eq!(on_disk(tmp.path()).java.gc_preset, GcPreset::None);
@@ -9682,15 +10111,17 @@ mod settings_page {
         for ix in 0..4 {
             assert_ne!(pradio(&app, cx, "prefs-gc", ix).disabled(), Some(true));
         }
-        assert_eq!(
-            label_of(&app, cx, "prefs-gc-note").as_deref(),
-            Some(
-                "An instance whose Java can’t run the chosen preset launches without it, with a warning."
-            )
+        assert!(
+            element(&app, cx, "prefs-gc-note").is_none(),
+            "no compatibility note for the flag-free default"
         );
         pclick_radio(&app, cx, "prefs-gc", 2);
         saves_done(&page, cx);
         assert_eq!(java(tmp.path()).gc_preset, GcPreset::GenerationalZgc);
+        assert_eq!(
+            label_of(&app, cx, "prefs-gc-note").as_deref(),
+            Some("Unsupported Java skips this preset and shows a launch warning.")
+        );
         pclick_radio(&app, cx, "prefs-gc", 1);
         saves_done(&page, cx);
         assert_eq!(java(tmp.path()).gc_preset, GcPreset::G1Aikar);

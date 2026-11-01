@@ -13,6 +13,7 @@ pub mod fields;
 pub mod fonts;
 pub mod i18n;
 pub mod instances;
+mod java_settings;
 pub mod launch;
 pub mod layout;
 pub mod logging;

@@ -6,13 +6,14 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Sizable, WindowExt as _, h_flex, v_flex,
+    ActiveTheme, Disableable, Icon, Sizable, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -68,6 +69,9 @@ impl SettingsPage {
         let Some(java) = self.config.as_ref().map(|c| c.java.clone()) else {
             return;
         };
+        if let Some(path) = java.java_path.clone() {
+            self.probe_saved_java(path, cx);
+        }
         self.inputs_ready = true;
         if self.requested_memory.is_none() {
             set_text(&self.min_mem, &java.min_mem_mib.to_string(), window, cx);
@@ -158,6 +162,227 @@ impl SettingsPage {
         }
         self.requested_gc = Some(preset);
         self.edit(Field::Gc, window, cx, move |c| c.java.gc_preset = preset);
+    }
+
+    /// Saves a detected executable or restores automatic managed Java.
+    fn set_java(
+        &mut self,
+        path: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.java_choice_revision += 1;
+        self.java_file_pending = None;
+        self.errors.java = None;
+        self.requested_java = Some(path.clone());
+        self.edit(Field::Java, window, cx, move |c| c.java.java_path = path);
+    }
+
+    fn choose_java_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.java_choice_revision += 1;
+        let revision = self.java_choice_revision;
+        self.java_file_pending = None;
+        self.pump(window, cx);
+        cx.notify();
+        let chosen = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            if let Some(path) = paths.into_iter().next() {
+                this.update_in(cx, |this, window, cx| {
+                    if this.java_choice_revision == revision {
+                        this.use_java_file(path, window, cx).detach();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Validates a manually chosen executable through the same probe as the
+    /// instance selector. A newer choice supersedes an unfinished probe.
+    pub fn use_java_file(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Task<()> {
+        self.java_choice_revision += 1;
+        let revision = self.java_choice_revision;
+        self.java_file_pending = Some(path.clone());
+        self.errors.java = None;
+        cx.notify();
+        let probe = Core::global(cx).probe_java.clone();
+        let job = crate::core_bridge::run_blocking(cx, {
+            let path = path.clone();
+            move || probe(&path)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            this.update_in(cx, |this, window, cx| {
+                if this.java_choice_revision != revision {
+                    return;
+                }
+                this.java_file_pending = None;
+                match result {
+                    Ok(Some(install)) => {
+                        this.probed_java.insert(path.clone(), Some(install.major));
+                        this.set_java(Some(path), window, cx);
+                    }
+                    _ => {
+                        this.errors.java =
+                            Some(t!("instance_settings.java_not_java").to_string().into());
+                        this.pump(window, cx);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+    }
+
+    /// Read a persisted manual Java's version for disclosure only; never
+    /// change the chosen preset or launch compatibility policy here.
+    fn probe_saved_java(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.probed_java.contains_key(&path)
+            || self
+                .java_list
+                .read(cx)
+                .installs()
+                .is_some_and(|list| list.iter().any(|i| i.path == path))
+        {
+            return;
+        }
+        self.probed_java.insert(path.clone(), None);
+        let probe = Core::global(cx).probe_java.clone();
+        let job = crate::core_bridge::run_blocking(cx, {
+            let path = path.clone();
+            move || probe(&path).map(|i| i.major)
+        });
+        cx.spawn(async move |this, cx| {
+            let major = job.await.ok().flatten();
+            this.update(cx, |this, cx| {
+                this.probed_java.insert(path, major);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn java_major(&self, cx: &App) -> Option<u32> {
+        let path = self
+            .requested_java
+            .as_ref()
+            .or_else(|| self.config.as_ref().map(|c| &c.java.java_path))?
+            .as_ref()?;
+        self.java_list
+            .read(cx)
+            .installs()
+            .unwrap_or_default()
+            .iter()
+            .find(|i| &i.path == path)
+            .map(|i| i.major)
+            .or_else(|| self.probed_java.get(path).copied().flatten())
+    }
+
+    fn set_low_memory_warning(
+        &mut self,
+        checked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.requested_low_memory_warning = Some(checked);
+        self.edit(Field::LowMemoryWarning, window, cx, move |c| {
+            c.java.low_mem_warning = checked
+        });
+    }
+
+    fn render_java_choice(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let chosen = self
+            .requested_java
+            .as_ref()
+            .or_else(|| self.config.as_ref().map(|c| &c.java.java_path))
+            .and_then(|p| p.as_ref());
+        let current = self.java_file_pending.as_ref().or(chosen);
+        let options = crate::instances::java_options(
+            self.java_list.read(cx).installs().unwrap_or_default(),
+            current,
+        );
+        let selected = options.iter().position(|o| o.path.as_ref() == current);
+        let radios: Vec<Radio> = options
+            .iter()
+            .map(|o| Radio::new("java").label(o.label.clone()))
+            .collect();
+        let paths: Vec<_> = options.into_iter().map(|o| o.path).collect();
+        crate::java_settings::field(
+            t!("instance_settings.java").to_string(),
+            Some(IconName::Cpu),
+            cx,
+        )
+        .child(
+            RadioGroup::new("prefs-java-choice")
+                .selected_index(selected)
+                .disabled(self.config.is_none())
+                .children(radios)
+                .on_click(cx.listener(move |this, ix: &usize, window, cx| {
+                    if let Some(path) = paths.get(*ix) {
+                        this.set_java(path.clone(), window, cx);
+                    }
+                })),
+        )
+        .child(
+            h_flex().child(
+                Button::new("prefs-java-choose")
+                    .outline()
+                    .small()
+                    .label(t!("instance_settings.java_choose").to_string())
+                    .disabled(self.config.is_none())
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_java_file(window, cx))),
+            ),
+        )
+        .when(self.java_file_pending.is_some(), |f| {
+            f.child(Self::hint(
+                "prefs-java-checking",
+                t!("instance_settings.java_checking").to_string(),
+                cx,
+            ))
+        })
+        .children(Self::error(
+            "prefs-java-choice-error",
+            self.errors.java.as_ref(),
+            cx,
+        ))
+    }
+
+    fn render_low_memory_warning(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        v_flex()
+            .gap_1()
+            .child(
+                gpui_kit::component::switch::Switch::new("prefs-low-memory-warning")
+                    .label(t!("java_settings.low_memory_warning").to_string())
+                    .checked(
+                        self.requested_low_memory_warning
+                            .or_else(|| self.config.as_ref().map(|c| c.java.low_mem_warning))
+                            .unwrap_or(true),
+                    )
+                    .disabled(self.config.is_none())
+                    .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                        this.set_low_memory_warning(*checked, window, cx)
+                    })),
+            )
+            .children(Self::error(
+                "prefs-low-memory-warning-error",
+                self.errors.low_memory_warning.as_ref(),
+                cx,
+            ))
     }
 
     // --- managed runtimes ---------------------------------------------------
@@ -288,14 +513,26 @@ impl SettingsPage {
 
     pub(super) fn render_java(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         Self::section(Section::Java, cx)
-            .child(Self::hint(
-                "prefs-java-hint",
-                t!("prefs.java_hint").to_string(),
-                cx,
-            ))
-            .child(self.render_memory(cx))
-            .child(self.render_gc(cx))
-            .child(self.render_args(cx))
+            .child(self.render_java_choice(cx))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .mt_3()
+                    .child(crate::java_settings::group_heading(
+                        IconName::MemoryStick,
+                        t!("java_settings.memory").to_string(),
+                        cx,
+                    ))
+                    .child(self.render_memory(cx))
+                    .child(self.render_low_memory_warning(cx)),
+            )
+            .child(
+                v_flex()
+                    .gap_3()
+                    .mt_3()
+                    .child(self.render_gc(cx))
+                    .child(self.render_args(cx)),
+            )
             .child(self.render_runtimes(cx))
             .child(self.render_detected(cx))
     }
@@ -308,11 +545,20 @@ impl SettingsPage {
                     .gap_4()
                     .items_end()
                     .child(
-                        Self::field(t!("instance_settings.min_mem").to_string(), cx)
-                            .child(Input::new(&self.min_mem).id("prefs-min-mem").w(NUMBER_W)),
+                        crate::java_settings::field(
+                            t!("instance_settings.min_mem").to_string(),
+                            None,
+                            cx,
+                        )
+                        .child(Input::new(&self.min_mem).id("prefs-min-mem").w(NUMBER_W)),
                     )
                     .child(
-                        Self::field(t!("instance_settings.max_mem").to_string(), cx).child(
+                        crate::java_settings::field(
+                            t!("instance_settings.max_mem").to_string(),
+                            None,
+                            cx,
+                        )
+                        .child(
                             h_flex()
                                 .gap_2()
                                 .child(Input::new(&self.max_mem).id("prefs-max-mem").w(NUMBER_W))
@@ -346,28 +592,57 @@ impl SettingsPage {
             .iter()
             .map(|p| Radio::new("gc").label(p.display_name()))
             .collect();
-        Self::field(t!("instance_settings.gc").to_string(), cx)
-            .child(
-                RadioGroup::new("prefs-gc")
-                    .selected_index(preset.and_then(|p| GC_PRESETS.iter().position(|g| *g == p)))
-                    .disabled(self.config.is_none())
-                    .children(radios)
-                    .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                        if let Some(preset) = GC_PRESETS.get(*ix) {
-                            this.set_gc(*preset, window, cx);
-                        }
-                    })),
-            )
-            .child(Self::hint(
-                "prefs-gc-note",
-                t!("prefs.gc_note").to_string(),
-                cx,
-            ))
-            .children(Self::error("prefs-gc-error", self.errors.gc.as_ref(), cx))
+        crate::java_settings::field(
+            t!("instance_settings.gc").to_string(),
+            Some(IconName::SlidersHorizontal),
+            cx,
+        )
+        .child(
+            RadioGroup::new("prefs-gc")
+                .selected_index(preset.and_then(|p| GC_PRESETS.iter().position(|g| *g == p)))
+                .disabled(self.config.is_none())
+                .children(radios)
+                .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                    if let Some(preset) = GC_PRESETS.get(*ix) {
+                        this.set_gc(*preset, window, cx);
+                    }
+                })),
+        )
+        .when(
+            preset.is_some_and(|preset| preset.min_java_major() > 0),
+            |field| {
+                field.child(Self::hint(
+                    "prefs-gc-note",
+                    t!("prefs.gc_note").to_string(),
+                    cx,
+                ))
+            },
+        )
+        .children(Self::error("prefs-gc-error", self.errors.gc.as_ref(), cx))
+        .child(crate::java_settings::gc_disclosure(
+            "prefs-gc-details",
+            preset.unwrap_or_default(),
+            self.java_major(cx),
+            self.gc_details_open,
+            Button::new("prefs-gc-details-toggle")
+                .ghost()
+                .small()
+                .icon(if self.gc_details_open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .label(t!("java_settings.gc_details").to_string())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.gc_details_open = !this.gc_details_open;
+                    cx.notify();
+                })),
+            cx,
+        ))
     }
 
     fn render_args(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        Self::field(t!("instance_settings.jvm_args").to_string(), cx)
+        crate::java_settings::field(t!("instance_settings.jvm_args").to_string(), None, cx)
             .child(
                 crate::fields::tab_leaves(div().id("prefs-args").test_support())
                     .child(Textarea::new(&self.args).h(rems(5.5))),
@@ -457,7 +732,7 @@ impl SettingsPage {
             })
             .collect();
         let empty = self.runtimes.as_ref().is_some_and(Vec::is_empty);
-        Self::field(t!("prefs.runtimes").to_string(), cx)
+        crate::java_settings::field(t!("prefs.runtimes").to_string(), None, cx)
             .child(v_flex().id("prefs-runtimes").children(rows))
             .when(empty, |f| {
                 f.child(Self::hint(
@@ -499,7 +774,7 @@ impl SettingsPage {
         } else {
             None
         };
-        Self::field(t!("prefs.detected").to_string(), cx)
+        crate::java_settings::field(t!("prefs.detected").to_string(), None, cx)
             .child(v_flex().id("prefs-detected").children(rows))
             .children(status.map(|text| Self::hint("prefs-detected-status", text.to_string(), cx)))
             .child(

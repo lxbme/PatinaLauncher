@@ -38,7 +38,8 @@ pub fn account_switcher(
         .dropdown_caret(true);
     let button = match accounts.as_ref().and_then(|snapshot| snapshot.current()) {
         Some(account) => {
-            let head = super::avatar::cached_image(account, cx).is_some();
+            let head = super::offline_heads::asset_for(account).is_some()
+                || super::avatar::cached_image(account, cx).is_some();
             button.child(
                 div()
                     .id(if head {
