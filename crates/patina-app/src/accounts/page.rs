@@ -279,15 +279,22 @@ impl AccountsPage {
         let editable = self.is_editable();
         let count = self.snapshot().map(|s| s.accounts().len());
         h_flex()
+            .id("accounts-toolbar")
+            .test_support()
             .flex_none()
-            .h(STRIP_H)
+            .min_h(STRIP_H)
+            .flex_wrap()
             .px(GUTTER)
+            .py_1()
             .gap_2()
             .justify_between()
             .border_b_1()
             .border_color(theme.border)
             .child(
                 h_flex()
+                    .id("accounts-heading")
+                    .test_support()
+                    .flex_none()
                     .gap_1p5()
                     .child(
                         div()
@@ -308,6 +315,8 @@ impl AccountsPage {
             )
             .child(
                 h_flex()
+                    .min_w_0()
+                    .flex_wrap()
                     .gap_1()
                     .child(offline_entry(
                         editable && self.snapshot().is_some_and(|s| s.is_offline_allowed()),
@@ -415,6 +424,10 @@ impl AccountsPage {
             .child(avatar(account, AVATAR, cx))
             .child(
                 v_flex()
+                    .id(ElementId::Name(
+                        format!("account-identity-{}", account.id).into(),
+                    ))
+                    .test_support()
                     .flex_1()
                     .min_w_0()
                     // 1px between the two lines, as the other lists have it.
@@ -565,6 +578,7 @@ impl Render for AccountsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("accounts")
+            .test_support()
             .size_full()
             .child(self.render_header(cx))
             .when(

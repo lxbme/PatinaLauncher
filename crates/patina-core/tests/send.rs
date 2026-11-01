@@ -62,7 +62,11 @@ fn account_operations_are_send(
     assert_send(&service.set_current("id"));
     assert_send(&service.remove("id"));
     assert_send(&service.add_offline("Player"));
-    assert_send(&service.resolve_launch("id", cancel));
+    assert_send(&service.resolve_launch("id", cancel.clone()));
+    let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    assert_send(&patina_core::accounts::login::DeviceCodeLogin::start(
+        service, events, cancel,
+    ));
     assert_send(&service.launch_pending(grant, pending, None));
     #[cfg(feature = "dev-offline")]
     assert_send(&service.add_dev_offline("Player"));

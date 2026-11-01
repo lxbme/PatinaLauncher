@@ -669,7 +669,26 @@ async fn polling_timeout_only_backoff_retry_after_and_in_flight_expiry() {
             5 + delay
         );
     }
-    for reply in [Reply::Stall(false),Reply::Stall(true),Reply::Raw(b"HTTP/1.1 429 Too Many\r\nRetry-After: 18446744073709551615\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec())] { let mut code=device(); code["expires_in"]=json!(12); let server=Server::new(vec![(0,ok(code)),(1,reply)]).await; let (task,mut events,_cancel)=start(&server); waiting(&mut events).await; tokio::time::advance(Duration::from_secs(5)).await; server.wait_requests(2).await; settle().await; tokio::time::advance(Duration::from_secs(7)).await; assert_eq!(finish(task).await.unwrap_err(),AuthError::Expired); assert_eq!(server.captured().len(),2); }
+    for reply in [
+        Reply::Stall(false),
+        Reply::Stall(true),
+        Reply::Raw(
+            b"HTTP/1.1 429 Too Many\r\nRetry-After: 18446744073709551615\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ),
+    ] {
+        let mut code = device();
+        code["expires_in"] = json!(12);
+        let server = Server::new(vec![(0, ok(code)), (1, reply)]).await;
+        let (task, mut events, _cancel) = start(&server);
+        waiting(&mut events).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        server.wait_requests(2).await;
+        settle().await;
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert_eq!(finish(task).await.unwrap_err(), AuthError::Expired);
+        assert_eq!(server.captured().len(), 2);
+    }
 }
 
 #[tokio::test(start_paused = true)]

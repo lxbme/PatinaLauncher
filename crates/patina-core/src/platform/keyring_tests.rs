@@ -159,7 +159,6 @@ mod peer {
         );
         let key = state.key.lock().unwrap();
         let decoded = oo7::crypto::decrypt(&secret.2, key.as_ref().unwrap(), &secret.1).unwrap();
-        assert_eq!(decoded.as_slice(), PAYLOAD);
         *state.saved.lock().unwrap() = decoded.to_vec();
     }
     #[zbus::interface(name = "org.freedesktop.Secret.Collection")]
@@ -219,7 +218,9 @@ mod peer {
             } else {
                 oo7::crypto::generate_iv().unwrap()
             };
-            let ciphertext = oo7::crypto::encrypt(PAYLOAD, key.as_ref().unwrap(), [0; 16]).unwrap();
+            let saved = self.0.saved.lock().unwrap();
+            let ciphertext =
+                oo7::crypto::encrypt(saved.as_slice(), key.as_ref().unwrap(), [0; 16]).unwrap();
             if iv.len() != 16 {
                 return Ok(DBusSecretInner(
                     session,
@@ -228,7 +229,8 @@ mod peer {
                     oo7::ContentType::Blob,
                 ));
             }
-            let ciphertext = oo7::crypto::encrypt(PAYLOAD, key.as_ref().unwrap(), &iv).unwrap();
+            let ciphertext =
+                oo7::crypto::encrypt(saved.as_slice(), key.as_ref().unwrap(), &iv).unwrap();
             Ok(DBusSecretInner(
                 session,
                 iv,
@@ -251,6 +253,7 @@ mod peer {
                 path("/test/prompt")
             } else {
                 self.0.saved.lock().unwrap().clear();
+                *self.0.mode.lock().unwrap() = "missing";
                 path("/")
             }
         }
@@ -445,6 +448,12 @@ mod peer {
 
     #[tokio::test]
     async fn encrypted_read_write_and_delete_never_prompt() {
+        tokio::time::timeout(Duration::from_secs(5), encrypted_crud())
+            .await
+            .expect("fake peer CRUD deadline");
+    }
+
+    async fn encrypted_crud() {
         let state = Arc::new(State::default());
         *state.mode.lock().unwrap() = "create";
         let (_server, client) = connections(state.clone()).await;
@@ -464,9 +473,20 @@ mod peer {
                 .expose(),
             "SYNTHETIC_PEER_SENTINEL"
         );
-        write_connected(&client, REF, PAYLOAD).await.unwrap();
+        let rotated = br#"{"version":1,"refresh_token":"SYNTHETIC_ROTATED_SENTINEL","minecraft":null,"reauth_required":true}"#;
+        write_connected(&client, REF, rotated).await.unwrap();
+        let record = read_connected(&client, REF).await.unwrap().unwrap();
+        assert_eq!(
+            record.refresh_token().expose(),
+            "SYNTHETIC_ROTATED_SENTINEL"
+        );
+        assert!(record.reauth_required());
+        assert_eq!(*state.saved.lock().unwrap(), rotated);
+        assert_eq!(state.create_item_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.set_secret_calls.load(Ordering::SeqCst), 1);
         delete_connected(&client, REF).await.unwrap();
         assert!(state.saved.lock().unwrap().is_empty());
+        assert!(read_connected(&client, REF).await.unwrap().is_none());
         assert!(state.encrypted_sessions.load(Ordering::SeqCst) >= 3);
         assert_eq!(state.prompts.load(Ordering::SeqCst), 0);
         assert_eq!(state.unlocks.load(Ordering::SeqCst), 0);

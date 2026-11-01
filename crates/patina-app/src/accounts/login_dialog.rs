@@ -384,28 +384,31 @@ pub fn open(window: &mut Window, cx: &mut gpui_kit::App) -> Entity<LoginDialog> 
     let footer = cx.new(|cx| LoginFooter::new(dialog.clone(), cx));
     let shown = dialog.clone();
     let closing = dialog.downgrade();
-    window.open_dialog(cx, move |d, _, _| {
+    window.open_dialog(cx, move |d, window, _| {
         let title = SharedString::from(t!("accounts.login.title"));
-        d.title(
-            div()
-                .id("login-title")
-                .aria_label(title.clone())
-                .test_support()
-                .child(title),
-        )
-        .child(shown.clone())
-        .footer(footer.clone())
-        .on_close({
-            let closing = closing.clone();
-            move |_, _, cx| {
-                closing.update(cx, |d, _| d.cancel()).ok();
-            }
-        })
-        // Enter has nothing to commit: on a button it presses that button.
-        .on_ok(|_, _, cx| {
-            cx.propagate();
-            false
-        })
+        // Preserve the default width at 100%, scaling with code/actions at zoom.
+        // Dialog still owns viewport clamping and overflow scrolling.
+        d.width(rems(28.).to_pixels(window.rem_size()))
+            .title(
+                div()
+                    .id("login-title")
+                    .aria_label(title.clone())
+                    .test_support()
+                    .child(title),
+            )
+            .child(shown.clone())
+            .footer(footer.clone())
+            .on_close({
+                let closing = closing.clone();
+                move |_, _, cx| {
+                    closing.update(cx, |d, _| d.cancel()).ok();
+                }
+            })
+            // Enter has nothing to commit: on a button it presses that button.
+            .on_ok(|_, _, cx| {
+                cx.propagate();
+                false
+            })
     });
     dialog
 }

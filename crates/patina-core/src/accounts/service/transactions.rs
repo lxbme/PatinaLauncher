@@ -180,7 +180,9 @@ impl AccountService {
         }
         if !operation.state.revoked.is_empty() {
             store = self.save(operation, store).await?;
-            self.publish(&store, true);
+            // Proof was already published fail-closed. Durability alone is not
+            // another public account change.
+            self.publish(&store, false);
         }
         // Deferred deletion is retried on every explicit operation. An unavailable
         // backend never prevents a referenced account from being read or used.

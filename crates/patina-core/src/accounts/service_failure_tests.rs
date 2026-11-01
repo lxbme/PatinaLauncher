@@ -357,7 +357,11 @@ async fn failed_revocation_is_fail_closed_and_retried_without_network() {
     f.service.set_metadata_fault(WriteStage::Rename);
     assert_eq!(f.resolve().await.unwrap_err(), AuthError::CredentialWrite);
     assert!(!f.service.snapshot().await.unwrap().is_offline_allowed());
+    let before_retry = f.service.snapshot().await.unwrap();
+    let changes = f.service.changes();
     f.service.reload().await.unwrap();
+    assert_eq!(f.service.snapshot().await.unwrap(), before_retry);
+    assert!(!changes.has_changed().unwrap());
     assert!(!f.restarted().snapshot().await.unwrap().is_offline_allowed());
     assert_eq!(f.refresh_count().await, 1);
 }
@@ -569,4 +573,75 @@ async fn failed_full_session_write_retries_verified_metadata_with_the_record() {
         "Renamed"
     );
     assert_eq!(f.refresh_count().await, 1);
+}
+
+#[tokio::test]
+async fn identical_selection_and_reload_do_not_publish_changes() {
+    let f = Fixture::new().await;
+    f.seed(NOW + 3600).await;
+    let before = f.service.snapshot().await.unwrap();
+    let changes = f.service.changes();
+    f.service.set_current(ID).await.unwrap();
+    f.service.reload().await.unwrap();
+    assert_eq!(f.service.snapshot().await.unwrap(), before);
+    assert!(!changes.has_changed().unwrap());
+    assert_eq!(
+        f.restarted()
+            .snapshot()
+            .await
+            .unwrap()
+            .current()
+            .unwrap()
+            .id,
+        ID
+    );
+}
+
+#[tokio::test]
+async fn unchanged_metadata_refresh_still_notifies_credential_transition() {
+    let f = Fixture::new().await;
+    f.chain("Player_123").await;
+    f.login().await;
+    let before = f.service.snapshot().await.unwrap();
+    let reference = before.current().unwrap().token_ref.as_ref().unwrap();
+    // Expire only the cached session, keeping the clock/profile/proof identical.
+    let record = super::super::credentials::CredentialRecord::new(
+        super::super::secret::SecretString::new("ROTATED_SENTINEL".into()),
+        None,
+        false,
+    )
+    .unwrap();
+    f.keyring.write(reference, &record).unwrap();
+    let changes = f.service.changes();
+    assert!(f.resolve().await.is_ok());
+    let after = f.service.snapshot().await.unwrap();
+    assert_eq!(after.accounts(), before.accounts());
+    assert_eq!(after.current(), before.current());
+    assert!(changes.has_changed().unwrap());
+    assert_eq!(after.revision(), before.revision() + 1);
+}
+
+#[tokio::test]
+async fn first_selection_change_after_restart_notifies_without_prior_snapshot() {
+    let f = Fixture::new().await;
+    f.seed(NOW + 3600).await;
+    super::super::testing::seed_verified(
+        &f.service,
+        "Other",
+        Uuid::from_u128(2),
+        "OTHER_SECRET_SENTINEL",
+        NOW,
+        NOW + 3600,
+    )
+    .await
+    .unwrap();
+    let restarted = f.restarted();
+    let changes = restarted.changes();
+    restarted.set_current(ID).await.unwrap();
+    assert!(changes.has_changed().unwrap());
+    assert_eq!(*changes.borrow(), 1);
+    assert_eq!(
+        restarted.snapshot().await.unwrap().current().unwrap().id,
+        ID
+    );
 }

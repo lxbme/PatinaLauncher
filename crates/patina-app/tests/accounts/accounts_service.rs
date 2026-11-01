@@ -31,6 +31,14 @@ fn service_with_clock(
     server: &MockServer,
     clock: Arc<Clock>,
 ) -> Arc<AccountService> {
+    service_with_token_endpoint(data, server, clock, None)
+}
+fn service_with_token_endpoint(
+    data: DataDirs,
+    server: &MockServer,
+    clock: Arc<Clock>,
+    token_endpoint: Option<String>,
+) -> Arc<AccountService> {
     let stages = [
         AuthStage::DeviceCode,
         AuthStage::MicrosoftToken,
@@ -41,7 +49,16 @@ fn service_with_clock(
         AuthStage::Profile,
     ];
     let http = AuthHttp::for_test(std::array::from_fn(|i| {
-        (stages[i], format!("{}/{i}", server.uri()))
+        (
+            stages[i],
+            if i == 1 {
+                token_endpoint
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/1", server.uri()))
+            } else {
+                format!("{}/{i}", server.uri())
+            },
+        )
     }))
     .unwrap();
     let keyring = Arc::new(MemoryCredentials::default());
@@ -189,32 +206,73 @@ fn close_retry_discards_old_attempt(cx: &mut TestAppContext) {
     let rt = patina_app::runtime::start();
     let server = rt.block_on(MockServer::start());
     rt.block_on(chain(&server));
-    // Let each old token response arrive after dismissal; cancellation must not commit.
-    rt.block_on(Mock::given(path("/1")).and(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(150)).set_body_json(json!({"access_token":"MS_SYNTHETIC","refresh_token":"REFRESH_SYNTHETIC","expires_in":3600})))
-        .with_priority(1).mount(&server));
-    let accounts = service(DataDirs::new(tmp.path()), &server);
+    // The raw loopback responder acknowledges entry and waits for an explicit
+    // release. No elapsed-time assumption can turn precommit into postcommit.
+    let (endpoint, mut entered, responder) = rt.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/1", listener.local_addr().unwrap());
+        let (entered, requests) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let entered = entered.clone();
+                tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut request = Vec::new();
+                        let mut byte = [0];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            stream.read_exact(&mut byte).await.unwrap();
+                            request.push(byte[0]);
+                            assert!(request.len() < 8192);
+                        }
+                        let headers = String::from_utf8(request).unwrap();
+                        assert!(headers.starts_with("POST /1 HTTP/1.1\r\n"));
+                        let length: usize = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                        }).unwrap();
+                        assert!(length < 8192);
+                        // Drain the request before replying: closing a socket
+                        // with unread data can reset an otherwise valid response.
+                        let mut body = vec![0; length];
+                        stream.read_exact(&mut body).await.unwrap();
+                        assert!(String::from_utf8(body).unwrap().contains("device_code=DEVICE_SYNTHETIC"));
+                    }).await.expect("token request deadline");
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    let (finished, finish) = tokio::sync::oneshot::channel();
+                    entered.send((release, finish)).unwrap();
+                    if matches!(tokio::time::timeout(Duration::from_secs(10), released).await, Ok(Ok(()))) {
+                        let body = json!({"access_token":"MS_SYNTHETIC","refresh_token":"REFRESH_SYNTHETIC","expires_in":3600}).to_string();
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        // The cancelled client may already have closed its socket.
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    let _ = finished.send(());
+                });
+            }
+        });
+        (endpoint, requests, task)
+    });
+    let accounts = service_with_token_endpoint(
+        DataDirs::new(tmp.path()),
+        &server,
+        Arc::new(Clock::default()),
+        Some(endpoint),
+    );
     let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
         testing::core_with_accounts(rt, data, Arc::new(FakeCatalog::new()), accounts.clone())
     });
     open_page(&app, cx);
+    click(&app, cx, "accounts-add-msa");
+    wait_code(&app, cx);
     for dismissal in 0..3 {
-        let tokens_before = rt
-            .block_on(server.received_requests())
-            .unwrap()
-            .iter()
-            .filter(|r| r.url.path() == "/1")
-            .count();
-        click(&app, cx, "accounts-add-msa");
-        wait_code(&app, cx);
+        let mut barrier = None;
         settle(cx, |_| {
-            rt.block_on(server.received_requests())
-                .unwrap()
-                .iter()
-                .filter(|r| r.url.path() == "/1")
-                .count()
-                > tokens_before
+            barrier = entered.try_recv().ok();
+            barrier.is_some()
         });
+        let (release, finished) = barrier.unwrap();
         match dismissal {
             0 => click(&app, cx, "login-cancel"),
             1 => press(&app, cx, "escape"),
@@ -227,9 +285,36 @@ fn close_retry_discards_old_attempt(cx: &mut TestAppContext) {
                 .accounts()
                 .is_empty()
         );
+        click(&app, cx, "accounts-add-msa");
+        wait_code(&app, cx);
+        release.send(()).unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), finished)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(!shows(&app, cx, "login-done"));
+        assert!(
+            rt.block_on(accounts.snapshot())
+                .unwrap()
+                .accounts()
+                .is_empty()
+        );
     }
-    click(&app, cx, "accounts-add-msa");
-    wait_code(&app, cx);
+    let mut barrier = None;
+    settle(cx, |_| {
+        barrier = entered.try_recv().ok();
+        barrier.is_some()
+    });
+    let (release, finished) = barrier.unwrap();
+    release.send(()).unwrap();
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), finished)
+            .await
+            .unwrap()
+            .unwrap()
+    });
     settle(cx, |cx| shows(&app, cx, "login-done"));
     assert_eq!(
         rt.block_on(accounts.snapshot()).unwrap().accounts().len(),
@@ -247,6 +332,7 @@ fn close_retry_discards_old_attempt(cx: &mut TestAppContext) {
         1
     );
     settle(cx, |cx| title_label(&app, cx) == signed_in("Steve"));
+    responder.abort();
 }
 
 #[gpui_kit::test]
@@ -463,6 +549,51 @@ fn removed_or_expired_grant_never_spawns(cx: &mut TestAppContext) {
     assert!(run_state(&model, cx, &inst.id).is_none());
 }
 
+fn assert_contained(
+    container: gpui_kit::Bounds<gpui_kit::Pixels>,
+    child: gpui_kit::Bounds<gpui_kit::Pixels>,
+    name: &str,
+) {
+    assert!(
+        child.size.width > px(0.) && child.size.height > px(0.),
+        "empty {name}: {child:?}"
+    );
+    assert!(
+        child.left() >= container.left()
+            && child.right() <= container.right()
+            && child.top() >= container.top()
+            && child.bottom() <= container.bottom(),
+        "{name} {child:?} outside {container:?}"
+    );
+}
+fn assert_separate(a: gpui_kit::Bounds<gpui_kit::Pixels>, b: gpui_kit::Bounds<gpui_kit::Pixels>) {
+    assert!(
+        a.right() <= b.left()
+            || b.right() <= a.left()
+            || a.bottom() <= b.top()
+            || b.bottom() <= a.top(),
+        "overlap: {a:?} / {b:?}"
+    );
+}
+fn assert_dialog_geometry(app: &Booted, cx: &mut TestAppContext, ids: &[&'static str]) {
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        let dialog = window.within("dialog").find(0usize).bounds();
+        let viewport = gpui_kit::Bounds::new(Default::default(), window.viewport_size());
+        assert_contained(viewport, dialog, "dialog");
+        let mut bounds = vec![];
+        for id in ids {
+            let target = window.find(*id).bounds();
+            assert_contained(dialog, target, id);
+            for other in &bounds {
+                assert_separate(*other, target);
+            }
+            bounds.push(target);
+        }
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn login_locales_scale_and_focus_use_real_components(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
@@ -470,6 +601,24 @@ fn login_locales_scale_and_focus_use_real_components(cx: &mut TestAppContext) {
     let server = rt.block_on(MockServer::start());
     rt.block_on(chain(&server));
     let accounts = service(DataDirs::new(tmp.path()), &server);
+    rt.block_on(patina_core::accounts::testing::seed_verified(
+        &accounts,
+        "LongPlayer123456",
+        "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+        "SYNTHETIC",
+        1_800_000_000,
+        1_800_003_600,
+    ))
+    .unwrap();
+    rt.block_on(patina_core::accounts::testing::seed_verified(
+        &accounts,
+        "SecondPlayer1234",
+        "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+        "SYNTHETIC",
+        1_800_000_000,
+        1_800_003_600,
+    ))
+    .unwrap();
     let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
         testing::core_with_accounts(rt, data, Arc::new(FakeCatalog::new()), accounts)
     });
@@ -483,17 +632,68 @@ fn login_locales_scale_and_focus_use_real_components(cx: &mut TestAppContext) {
                 window.render_frame(cx);
             })
             .unwrap();
+            cx.update_window(app.handle, |_, window, cx| {
+                window.render_frame(cx);
+                let page = window.find("accounts").bounds();
+                let toolbar = window.find("accounts-toolbar").bounds();
+                assert_contained(page, toolbar, "toolbar");
+                let mut ids = vec![
+                    "accounts-heading",
+                    "accounts-add-offline",
+                    "accounts-add-msa",
+                ];
+                if cfg!(feature = "dev-offline") {
+                    ids.push("accounts-add-dev-offline");
+                }
+                let mut bounds = vec![];
+                for id in ids {
+                    let b = window.find(id).bounds();
+                    assert_contained(toolbar, b, id);
+                    for other in &bounds {
+                        assert_separate(*other, b);
+                    }
+                    bounds.push(b);
+                }
+                let id = "00000000000000000000000000000001";
+                let row = window.find(account_row_id(id)).bounds();
+                assert_contained(page, row, "account row");
+                let identity = window
+                    .find(gpui_kit::ElementId::Name(
+                        format!("account-identity-{id}").into(),
+                    ))
+                    .bounds();
+                let select = window.find(set_current_id(id)).bounds();
+                let remove = window.find(remove_id(id)).bounds();
+                for (name, b) in [
+                    ("identity", identity),
+                    ("selection", select),
+                    ("removal", remove),
+                ] {
+                    assert_contained(row, b, name);
+                }
+                assert_separate(identity, select);
+                assert_separate(select, remove);
+            })
+            .unwrap();
             tab_to(&app, cx, "accounts-add-msa");
             press(&app, cx, "enter");
             wait_code(&app, cx);
-            assert!(shows(&app, cx, "login-copy"));
-            assert!(shows(&app, cx, "login-open"));
-            assert!(shows(&app, cx, "login-cancel"));
+            assert_dialog_geometry(
+                &app,
+                cx,
+                &["login-code", "login-copy", "login-open", "login-cancel"],
+            );
             tab_to(&app, cx, "login-copy");
             press(&app, cx, "enter");
             assert_eq!(
                 cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
                 Some("ABCD-EFGH")
+            );
+            tab_to(&app, cx, "login-open");
+            press(&app, cx, "enter");
+            assert_eq!(
+                cx.opened_url().as_deref(),
+                Some("https://microsoft.com/link")
             );
             press(&app, cx, "escape");
             assert!(!shows(&app, cx, "dialog"));
@@ -501,6 +701,10 @@ fn login_locales_scale_and_focus_use_real_components(cx: &mut TestAppContext) {
                 element(&app, cx, "accounts-add-msa").unwrap().focused(),
                 Some(true)
             );
+            click(&app, cx, "accounts-add-msa");
+            settle(cx, |cx| shows(&app, cx, "login-done"));
+            assert_dialog_geometry(&app, cx, &["login-done", "login-storage", "login-close"]);
+            click(&app, cx, "login-close");
         }
     }
 }
@@ -806,4 +1010,50 @@ fn superseded_error_delivery_does_not_poison_recovered_avatar_revision(cx: &mut 
         &image,
         &cx.update(|cx| testing::cached_avatar(account, cx)).unwrap()
     ));
+}
+
+#[gpui_kit::test]
+fn login_long_error_content_is_contained_at_supported_scales(cx: &mut TestAppContext) {
+    use patina_core::accounts::login::{CancelToken, DeviceCodeLogin, LoginError, LoginEvent};
+    // Presentation-only injection: no claim of authentication or durable storage.
+    struct LongError;
+    impl DeviceCodeLogin for LongError {
+        fn start(
+            &self,
+            events: tokio::sync::mpsc::UnboundedSender<LoginEvent>,
+            _: CancelToken,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                let message = "The connection could not be completed. Check the network and try signing in again. 无法完成连接，请检查网络后重新登录。";
+                events
+                    .send(LoginEvent::Failed(LoginError::Other(message.repeat(3))))
+                    .unwrap();
+            })
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let app = boot_core(cx, tmp.path(), AppSettings::default(), |rt, data| {
+        testing::core_with_login(rt, data, Arc::new(FakeCatalog::new()), Arc::new(LongError))
+    });
+    open_page(&app, cx);
+    cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
+    for language in [Language::En, Language::ZhCn] {
+        app.language(language);
+        for scale in [0.8, 1., 2.] {
+            cx.update_window(app.handle, |_, window, cx| {
+                patina_app::scale::apply_scale(scale, cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            click(&app, cx, "accounts-add-msa");
+            settle(cx, |cx| shows(&app, cx, "login-failed"));
+            assert_dialog_geometry(
+                &app,
+                cx,
+                &["login-title", "login-failed", "login-close", "login-retry"],
+            );
+            press(&app, cx, "escape");
+            assert!(!shows(&app, cx, "dialog"));
+        }
+    }
 }

@@ -245,6 +245,9 @@ impl AccountService {
             .clone()
             .expect("loaded snapshot")
     }
+    // Explicit changes can notify even before the first snapshot, or when a
+    // credential transition changes readiness without changing metadata.
+    // No-op selection and durability-only retry must not force a revision.
     fn publish(&self, store: &AccountStore, force: bool) {
         let mut published = self.inner.snapshot.write().expect("account snapshot");
         let revision = *self.inner.changes.borrow();
@@ -299,9 +302,10 @@ impl AccountService {
                     AuthError::ReauthenticationRequired
                 });
             }
+            let changed = store.current.as_deref() != Some(&id);
             store.set_current(&id).map_err(AuthError::Account)?;
             let store = service.save(&mut operation, store).await?;
-            service.publish(&store, true);
+            service.publish(&store, changed);
             Ok(())
         })
         .await
