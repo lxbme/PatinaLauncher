@@ -541,3 +541,118 @@ async fn fallback_rotation_remains_authoritative_over_stale_keyring() {
     Fixture::resolve(&f.restart(), ID).await.unwrap();
     f.assert_requests(1).await;
 }
+
+fn skin_profile(hash: &str, name: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": ID,
+        "name": name,
+        "skins": [{"state": "ACTIVE", "url": format!("https://textures.minecraft.net/texture/{hash}")}],
+    }))
+}
+
+#[tokio::test]
+async fn invalid_optional_skin_login_commits_done_and_survives_restart() {
+    for length in [140_000, 65] {
+        let f = Fixture::new(true).await;
+        f.chain_until(
+            false,
+            "",
+            Some((6, skin_profile(&"a".repeat(length), "Player_123"))),
+        )
+        .await;
+        saved(&f.login().await);
+        f.assert_requests(0).await;
+        f.server.reset().await;
+
+        for service in [&f.service, &f.restart()] {
+            service.reload().await.unwrap();
+            let snapshot = service.snapshot().await.unwrap();
+            assert_eq!(snapshot.accounts().len(), 1);
+            let account = snapshot.current().unwrap();
+            assert_eq!(account.id, ID);
+            assert_eq!(account.username, "Player_123");
+            assert!(account.skin_hash().is_none());
+            assert_eq!(account.verification().unwrap().profile_uuid(), account.uuid);
+            assert!(snapshot.is_offline_allowed());
+            assert_eq!(
+                Fixture::resolve(service, ID)
+                    .await
+                    .unwrap()
+                    .account()
+                    .name(),
+                "Player_123"
+            );
+        }
+        let metadata = std::fs::read_to_string(f.data.root().join("accounts.toml")).unwrap();
+        assert!(!metadata.contains("skin_hash"));
+        secret_free(&metadata);
+        assert!(f.server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn invalid_optional_skin_refresh_preserves_rotation_without_trapping_recovery() {
+    let f = Fixture::new(true).await;
+    f.chain_until(
+        false,
+        "",
+        Some((6, skin_profile(&"b".repeat(64), "Player_123"))),
+    )
+    .await;
+    saved(&f.login().await);
+    let initial = f.service.snapshot().await.unwrap();
+    let initial_account = initial.current().unwrap();
+    assert_eq!(
+        initial_account.skin_hash(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+    f.assert_requests(0).await;
+    f.server.reset().await;
+
+    f.clock.0.store(NOW + 3600, Ordering::SeqCst);
+    f.chain_until(
+        true,
+        SECRETS[3],
+        Some((6, skin_profile(&"a".repeat(140_000), "UpdatedPlayer"))),
+    )
+    .await;
+    let grant = Fixture::resolve(&f.service, ID).await.unwrap();
+    assert_eq!(grant.account().name(), "UpdatedPlayer");
+    f.assert_requests(1).await;
+    f.server.reset().await;
+
+    // Recovery and ordinary retry must not retain an unsavable metadata intent.
+    // A separate service also proves the operation lock was released and the
+    // verified metadata/session cache were durably committed, not just published.
+    let restarted = f.restart();
+    for service in [&f.service, &restarted] {
+        service.reload().await.unwrap();
+        let snapshot = service.snapshot().await.unwrap();
+        let account = snapshot.current().unwrap();
+        assert_eq!(account.id, ID);
+        assert_eq!(account.uuid, initial_account.uuid);
+        assert_eq!(account.token_ref, initial_account.token_ref);
+        assert_eq!(account.username, "UpdatedPlayer");
+        assert!(account.skin_hash().is_none());
+        assert_eq!(account.verification().unwrap().verified_at(), NOW + 3600);
+        assert!(snapshot.is_offline_allowed());
+        assert_eq!(
+            Fixture::resolve(service, ID)
+                .await
+                .unwrap()
+                .account()
+                .name(),
+            "UpdatedPlayer"
+        );
+    }
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+    let metadata = std::fs::read_to_string(f.data.root().join("accounts.toml")).unwrap();
+    assert!(!metadata.contains("skin_hash"));
+    secret_free(&metadata);
+
+    // At the next expiry the real refresh request must use the durable rotation.
+    f.clock.0.store(NOW + 7200, Ordering::SeqCst);
+    f.chain(true, SECRETS[4]).await;
+    Fixture::resolve(&restarted, ID).await.unwrap();
+    f.assert_requests(1).await;
+}

@@ -441,8 +441,8 @@ impl MsaClient {
                 let hash = url
                     .strip_prefix("https://textures.minecraft.net/texture/")
                     .or_else(|| url.strip_prefix("http://textures.minecraft.net/texture/"))?;
-                (!hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-                    .then(|| hash.to_ascii_lowercase())
+                let hash = hash.to_ascii_lowercase();
+                super::skin::valid_texture_hash(&hash).then_some(hash)
             })
         });
         if self.clock.unix_seconds() < issued_at || self.clock.unix_seconds() >= expires_at {

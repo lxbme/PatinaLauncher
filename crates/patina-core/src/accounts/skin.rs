@@ -27,15 +27,18 @@ pub(super) enum SkinError {
     Decode,
 }
 
+pub(super) fn valid_texture_hash(hash: &str) -> bool {
+    !hash.is_empty()
+        && hash.len() <= 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 pub(super) fn texture_url(hash: &str) -> Option<Url> {
     // Profile parsing already discards the URL and normalizes official HTTP
     // metadata. Never accept a URL here, even from persisted metadata.
-    if hash.is_empty()
-        || hash.len() > 64
-        || !hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !valid_texture_hash(hash) {
         return None;
     }
     Url::parse(&format!("https://textures.minecraft.net/texture/{hash}")).ok()

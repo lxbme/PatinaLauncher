@@ -901,6 +901,72 @@ async fn profile_skin_metadata_preserves_official_http_and_https_hashes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn profile_skin_hash_accepts_nonempty_hex_through_64_characters() {
+    let _time = TimeGuard::new();
+    for (hash, expected) in [
+        ("A".to_owned(), "a".to_owned()),
+        ("F".repeat(63), "f".repeat(63)),
+        ("B".repeat(64), "b".repeat(64)),
+    ] {
+        for scheme in ["http", "https"] {
+            let mut script = chain();
+            let mut body = profile();
+            body["skins"][0]["url"] =
+                json!(format!("{scheme}://textures.minecraft.net/texture/{hash}"));
+            script[6].1 = ok(body);
+            let login = run(script).await.0.unwrap();
+            assert_eq!(login.profile().skin_hash(), Some(expected.as_str()));
+            assert_eq!(login.profile().username(), "Player_123");
+        }
+    }
+}
+
+async fn assert_invalid_profile_skin_hash_is_optional(hash: &str) {
+    for scheme in ["http", "https"] {
+        let mut script = chain();
+        let mut body = profile();
+        body["skins"][0]["url"] =
+            json!(format!("{scheme}://textures.minecraft.net/texture/{hash}"));
+        script[6].1 = ok(body);
+        let (result, requests, _) = run(script).await;
+        let login = result.unwrap();
+        assert!(
+            login.profile().skin_hash().is_none(),
+            "invalid optional {scheme} hash of length {} was retained",
+            hash.len()
+        );
+        assert_eq!(login.profile().username(), "Player_123");
+        assert_eq!(
+            login.profile().uuid().to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(requests.len(), 7);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn profile_skin_hash_discards_overlength_hex_without_rejecting_identity() {
+    let _time = TimeGuard::new();
+    for length in [65, 128] {
+        assert_invalid_profile_skin_hash_is_optional(&"A".repeat(length)).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn profile_skin_hash_discards_storage_oversized_hex_without_rejecting_identity() {
+    let _time = TimeGuard::new();
+    assert_invalid_profile_skin_hash_is_optional(&"a".repeat(140_000)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn profile_skin_hash_discards_empty_and_non_hex_without_rejecting_identity() {
+    let _time = TimeGuard::new();
+    for hash in ["", "g", "ab cd", "abcd/", "abcd?x", "abcd#x", "é"] {
+        assert_invalid_profile_skin_hash_is_optional(hash).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn profile_skin_metadata_ignores_untrusted_urls_without_failing_login() {
     let _time = TimeGuard::new();
     let mut urls = vec![
