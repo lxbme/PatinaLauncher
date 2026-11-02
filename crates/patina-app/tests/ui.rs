@@ -225,12 +225,35 @@ fn the_title_bar_fits_the_smallest_window(cx: &mut TestAppContext) {
     cx.simulate_window_resize(app.handle, gpui_kit::size(px(960.), px(600.)));
     cx.run_until_parked();
     for id in [
+        "title-brand-logo",
         "search",
         "title-downloads",
         "title-account",
         "title-settings",
     ] {
         assert!(inside_window(&app, cx, id), "{id} is cut off at 960×600");
+    }
+}
+
+#[gpui_kit::test]
+fn title_brand_logo_keeps_its_square_slot_when_zooming(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    for key in ["ctrl-0", "ctrl-=", "ctrl--"] {
+        cx.update_window(app.handle, |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let side = font_size(cx) * 1.25;
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let logo = window.find("title-brand-logo");
+            assert!(logo.visible());
+            assert_eq!(logo.bounds().size, gpui_kit::size(side, side));
+            assert!(logo.bounds().right() < window.find("search").bounds().left());
+            window.click("title-brand-logo", cx);
+        })
+        .unwrap();
+        assert_eq!(nav(&app, cx), Nav::Instances);
     }
 }
 

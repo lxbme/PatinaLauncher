@@ -16,19 +16,19 @@ use gpui_kit::component::separator::Separator;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, TitleBar, h_flex};
 use gpui_kit::{
     App, AppContext, ClickEvent, Context, Decorations, Div, Entity, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Rems, Render, SharedString,
-    Styled, Subscription, Task, Window, div, rems,
+    InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Rems, Render,
+    SharedString, Styled, StyledImage, Subscription, Task, TestSupportExt, Window, div, img, rems,
 };
 use rust_i18n::t;
 
 use super::{CloseWindow, Nav, ShellState};
 use crate::accounts::{account_switcher, read_accounts};
+use crate::assets::BRAND_LOGO;
 use crate::core_bridge::{AccountsChanged, Revision};
 use crate::fonts::Strong;
 use crate::instances::InstancesPage;
 use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY};
 use crate::search::GlobalSearch;
-use crate::theme::ProductColors;
 
 /// What the account button says.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -151,19 +151,12 @@ impl TitleBarView {
             .min_w_0()
             .gap_2()
             .child(
-                // Placeholder mark: a teal rounded square with a monogram.
-                div()
+                img(BRAND_LOGO)
+                    .object_fit(ObjectFit::Contain)
+                    .id("title-brand-logo")
+                    .test_support()
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(rems(1.25))
-                    .rounded(rems(0.3125))
-                    .bg(ProductColors::get(cx).signature())
-                    .text_size(rems(0.6875))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.primary_foreground)
-                    .child("P"),
+                    .size(rems(1.25)),
             )
             .child(
                 div()
