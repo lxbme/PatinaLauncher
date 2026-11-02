@@ -239,6 +239,15 @@ impl ContentService {
                 }
                 let mut activation = conditions.clone();
                 let optional = dependency.relation() == DependencyRelation::Optional;
+                // A project-only recommendation back to a validated ancestor is already
+                // satisfied by that selected version, not a new optional activation path.
+                // Explicit version constraints and required cycles still go through validation.
+                if optional
+                    && dependency.version_id().is_none()
+                    && dependency.project().is_some_and(|p| ancestors.contains(p))
+                {
+                    continue;
+                }
                 let candidate = if let Some(id) = dependency.version_id() {
                     let v = self
                         .source

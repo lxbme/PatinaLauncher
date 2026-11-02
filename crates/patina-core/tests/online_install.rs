@@ -767,3 +767,182 @@ async fn explicit_foreign_replacement_removes_only_displaced_provenance() {
         Platform::Modrinth
     );
 }
+
+// Official Modrinth 1.21.1/Fabric version responses: CmiqMBZT, XtuPOKUN,
+// SMxNOGZ6, bAo1Qhte and kzD1gN83. Preserve their complete dependency shapes;
+// only file bytes/URLs/hashes are replaced for isolated deterministic downloads.
+#[tokio::test]
+async fn sodium_extra_optional_back_reference_preserves_selection_and_shared_sodium() {
+    use serde_json::{Value, json};
+    use wiremock::matchers::method;
+
+    let server = MockServer::start().await;
+    let versions: Vec<Value> = serde_json::from_str(include_str!(
+        "fixtures/online/sodium-extra-1.21.1-fabric.json"
+    ))
+    .unwrap();
+    for mut version in versions {
+        let id = version["id"].as_str().unwrap().to_string();
+        let project = version["project_id"].as_str().unwrap().to_string();
+        let bytes = id.as_bytes();
+        serve(&server, &id, bytes).await;
+        version["files"][0]["url"] = json!(format!("{}/{id}", server.uri()));
+        version["files"][0]["size"] = json!(bytes.len());
+        version["files"][0]["hashes"] = json!({"sha1": hex::encode(Sha1::digest(bytes))});
+        for route in [
+            format!("/version/{id}"),
+            format!("/project/{project}/version"),
+        ] {
+            let body = if route.starts_with("/version/") {
+                version.clone()
+            } else {
+                json!([version])
+            };
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/project/{project}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": project, "slug": project, "title": project,
+                "description": "Fixture", "body": "Fixture", "project_type": "mod",
+                "team": "fixture", "client_side": "required", "server_side": "unsupported",
+                "donation_urls": []
+            })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/team/fixture/members"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    for (select_reese, expected) in [(false, 2), (true, 3)] {
+        let (_temp, store, _) = setup(vec![]);
+        let service = ContentService::new(
+            store.clone(),
+            Arc::new(ContentCatalogs::with_endpoints(&server.uri(), &server.uri(), None).unwrap()),
+            Arc::new(Downloader::new(reqwest::Client::new(), Mirror::official())),
+        );
+        let request = InstallRequest::new(
+            "Test",
+            VersionRef::new(project("PtjYWJkn"), "CmiqMBZT"),
+            TargetCompatibility::new(ContentKind::Mod, "1.21.1", Some(LoaderKind::Fabric)),
+        );
+        let plan = service.plan_install(request.clone()).await.unwrap();
+        assert_eq!(plan.items().len(), 5, "one entry per project");
+        assert_eq!(plan.optional_projects().len(), 3);
+        assert!(!plan.optional_projects().contains(&project("PtjYWJkn")));
+        assert!(!plan.optional_projects().contains(&project("AANobbMI")));
+        let mut choices = InstallChoices::default().with_optional(project("Bh37bMuy"));
+        choices.set_optional(project("Bh37bMuy"), select_reese);
+        for item in plan.items() {
+            let id = item.version().reference().project().id();
+            assert_eq!(item.is_optional(), !matches!(id, "PtjYWJkn" | "AANobbMI"));
+            assert_eq!(
+                item.is_selected(&choices),
+                matches!(id, "PtjYWJkn" | "AANobbMI") || (id == "Bh37bMuy" && select_reese)
+            );
+        }
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = service
+            .apply(plan, choices.clone(), rx, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.applied().len(), expected);
+        let instance = store.load("Test").unwrap();
+        let sources = load_sources(&instance.dir).unwrap();
+        assert_eq!(sources.records().len(), expected);
+        assert_eq!(
+            std::fs::read_dir(instance.game_dir().join("mods"))
+                .unwrap()
+                .count(),
+            expected
+        );
+        for record in sources.records() {
+            let bytes = std::fs::read(instance.game_dir().join(record.path())).unwrap();
+            assert_eq!(record.sha1(), hex::encode(Sha1::digest(&bytes)));
+            assert_eq!(bytes, record.version().id().as_bytes());
+        }
+        let before = server.received_requests().await.unwrap();
+        let download_count = |requests: &[wiremock::Request]| {
+            requests
+                .iter()
+                .filter(|r| r.url.path().split('/').count() == 2)
+                .count()
+        };
+        apply(&service, request, choices).await.unwrap();
+        let after = server.received_requests().await.unwrap();
+        assert_eq!(
+            download_count(&before),
+            download_count(&after),
+            "reinstall reuses verified files"
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    for (id, count) in [
+        ("CmiqMBZT", 2),
+        ("SMxNOGZ6", 2),
+        ("XtuPOKUN", 1),
+        ("bAo1Qhte", 0),
+        ("kzD1gN83", 0),
+    ] {
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == format!("/{id}"))
+                .count(),
+            count
+        );
+    }
+}
+
+#[tokio::test]
+async fn optional_project_back_reference_reuses_selected_ancestor_not_latest() {
+    let server = MockServer::start().await;
+    let old = version(&server, "main", "old", b"old").with_dependencies(vec![Dependency::new(
+        Some(project("addon")),
+        None,
+        DependencyRelation::Optional,
+    )]);
+    let addon =
+        version(&server, "addon", "addon", b"addon").with_dependencies(vec![Dependency::new(
+            Some(project("main")),
+            None,
+            DependencyRelation::Optional,
+        )]);
+    let (_temp, _store, service) = setup(vec![old, version(&server, "main", "new", b"new"), addon]);
+    let plan = service.plan_install(request("old")).await.unwrap();
+    assert_eq!(plan.items().len(), 2);
+    assert_eq!(plan.items()[0].version().reference().id(), "old");
+    assert_eq!(plan.optional_projects(), [project("addon")]);
+}
+
+#[tokio::test]
+async fn required_multi_project_cycle_and_explicit_optional_back_reference_are_rejected() {
+    let server = MockServer::start().await;
+    for (relation, explicit) in [
+        (DependencyRelation::Required, false),
+        (DependencyRelation::Optional, true),
+    ] {
+        let main =
+            version(&server, "main", "main", b"main").with_dependencies(vec![Dependency::new(
+                Some(project("dep")),
+                None,
+                DependencyRelation::Required,
+            )]);
+        let dep = version(&server, "dep", "dep", b"dep").with_dependencies(vec![Dependency::new(
+            Some(project("main")),
+            explicit.then(|| "main".into()),
+            relation,
+        )]);
+        let (_temp, _store, service) = setup(vec![main, dep]);
+        assert!(
+            matches!(service.plan_install(request("main")).await, Err(ContentError::Cycle(id)) if id == "main")
+        );
+    }
+}

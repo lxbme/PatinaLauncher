@@ -1,0 +1,272 @@
+[
+  {
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "fabric"
+    ],
+    "environment": "client_only",
+    "id": "CmiqMBZT",
+    "project_id": "PtjYWJkn",
+    "author_id": "QXAY01zS",
+    "featured": true,
+    "name": "[Fabric] mc1.21.1-0.9.5",
+    "version_number": "mc1.21.1-0.9.5+fabric",
+    "changelog": "**Full Changelog**: https://github.com/FlashyReese/sodium-extra/compare/mc1.21.1-0.9.4...mc1.21.1-0.9.5",
+    "changelog_url": null,
+    "date_published": "2026-10-25T16:34:23.573347Z",
+    "downloads": 86630,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "id": "PJ12QK2U",
+        "hashes": {
+          "sha512": "2587475562472b7e5cdc8c2b4409de498815402156524242acbad9672a0c348288b9b3328ec82b9300593d1a02eb71022704742889e5b33b755f75709cf16827",
+          "sha1": "39df00f8a5baeeeff4bf0226997e958d89fe0c93"
+        },
+        "url": "https://cdn.modrinth.com/data/PtjYWJkn/versions/CmiqMBZT/sodium-extra-fabric-0.9.5%2Bmc1.21.1.jar",
+        "filename": "sodium-extra-fabric-0.9.5+mc1.21.1.jar",
+        "primary": true,
+        "size": 492939,
+        "file_type": null
+      },
+      {
+        "id": "SASwlFHv",
+        "hashes": {
+          "sha512": "fde9893d06ec758a67bffa32340d0fff603f5f5cd2541b3674ab2ac479a505fc77321b1e0d9f9c5c47076689992d3a254e98d5fac314097f26fff18e08ffab29",
+          "sha1": "51699ce13a2a6d6cf5fecc30260832437a4e4bb2"
+        },
+        "url": "https://cdn.modrinth.com/data/PtjYWJkn/versions/CmiqMBZT/sodium-extra-fabric-0.9.5%2Bmc1.21.1-dev-shadow.jar",
+        "filename": "sodium-extra-fabric-0.9.5+mc1.21.1-dev-shadow.jar",
+        "primary": false,
+        "size": 491489,
+        "file_type": null
+      }
+    ],
+    "dependencies": [
+      {
+        "version_id": null,
+        "project_id": "EE4vxUHj",
+        "file_name": null,
+        "dependency_type": "optional"
+      },
+      {
+        "version_id": null,
+        "project_id": "Bh37bMuy",
+        "file_name": null,
+        "dependency_type": "optional"
+      },
+      {
+        "version_id": null,
+        "project_id": "YL57xq9U",
+        "file_name": null,
+        "dependency_type": "optional"
+      },
+      {
+        "version_id": null,
+        "project_id": "AANobbMI",
+        "file_name": null,
+        "dependency_type": "required"
+      }
+    ]
+  },
+  {
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "fabric"
+    ],
+    "environment": "client_only",
+    "id": "XtuPOKUN",
+    "project_id": "Bh37bMuy",
+    "author_id": "QXAY01zS",
+    "featured": true,
+    "name": "[Fabric] Reese's Sodium Options 2.2.4 - Minecraft 1.21.1",
+    "version_number": "mc1.21.1-2.2.4+fabric",
+    "changelog": "**Full Changelog**: https://github.com/FlashyReese/reeses-sodium-options/compare/mc1.21.1-2.2.3...mc1.21.1-2.2.4",
+    "changelog_url": null,
+    "date_published": "2026-09-16T00:49:27.416775Z",
+    "downloads": 516748,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "id": "4OdetAgE",
+        "hashes": {
+          "sha1": "552c80c3113ad346c3abcdf7c5c6cc3a02a5fb62",
+          "sha512": "7784880c4dedae15e3e03c6de4cfa67a9ed242006f90b764c0fa6fda8679e219ca6c9987aae76ec9b0fff6f8cc38fff86b16e2836aaa0200998c9de938617d3e"
+        },
+        "url": "https://cdn.modrinth.com/data/Bh37bMuy/versions/XtuPOKUN/reeses-sodium-options-fabric-2.2.4%2Bmc1.21.1.jar",
+        "filename": "reeses-sodium-options-fabric-2.2.4+mc1.21.1.jar",
+        "primary": true,
+        "size": 257229,
+        "file_type": null
+      },
+      {
+        "id": "51keHOSM",
+        "hashes": {
+          "sha1": "792a7b3e700c67a8dc9bdf062ccd3a431f2671a8",
+          "sha512": "b095601b29dc29bb5df690e3e2a37e592785dc1197963db01fbcef8d41f1f657b05d516e1c46a8776a2cb03e697f2fc997de4b49e53572ae57986da4256f538d"
+        },
+        "url": "https://cdn.modrinth.com/data/Bh37bMuy/versions/XtuPOKUN/reeses-sodium-options-fabric-2.2.4%2Bmc1.21.1-dev-shadow.jar",
+        "filename": "reeses-sodium-options-fabric-2.2.4+mc1.21.1-dev-shadow.jar",
+        "primary": false,
+        "size": 254684,
+        "file_type": null
+      }
+    ],
+    "dependencies": [
+      {
+        "version_id": null,
+        "project_id": "PtjYWJkn",
+        "file_name": null,
+        "dependency_type": "optional"
+      },
+      {
+        "version_id": null,
+        "project_id": "AANobbMI",
+        "file_name": null,
+        "dependency_type": "required"
+      },
+      {
+        "version_id": null,
+        "project_id": "YL57xq9U",
+        "file_name": null,
+        "dependency_type": "optional"
+      }
+    ]
+  },
+  {
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "fabric"
+    ],
+    "environment": "client_only",
+    "id": "SMxNOGZ6",
+    "project_id": "AANobbMI",
+    "author_id": "TEZXhE2U",
+    "featured": false,
+    "name": "Sodium 0.8.13 for Fabric 1.21.1",
+    "version_number": "mc1.21.1-0.8.13-fabric",
+    "changelog": "Sodium 0.8.13 fixes potential minor bugs and improves the crash log message to avoid misattribution of unrelated errors when NeoForge continues loading despite severe errors.\n\n- Clarify crash log error message when crashing due to missing mod config, which basically only happens when neoforge loads the game despite it having encountered a severe error.\n- Fix buffer overflow in Kernel32.getModuleFileName\n- Use the correct atomic operations on NativeBuffer.ALLOCATED\n- Use clearenv() to delete environment variable\n- Implement override/overlay priority in the graphics options Config API ([#3866](https://github.com/CaffeineMC/sodium/pull/3866))",
+    "changelog_url": null,
+    "date_published": "2026-08-28T20:55:02.424329Z",
+    "downloads": 2180677,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "id": "urYdYXy4",
+        "hashes": {
+          "sha512": "8614a374593698069a80ac74de8cd9c28f3928d16819a0e0d6320b538e823f7e54e8be06d5ea5a9c268beb0e02073209d1f831a02dede851588b972367680853",
+          "sha1": "003c114c85ca88ef3362e018deb6aca0c682d6a1"
+        },
+        "url": "https://cdn.modrinth.com/data/AANobbMI/versions/SMxNOGZ6/sodium-fabric-0.8.13%2Bmc1.21.1.jar",
+        "filename": "sodium-fabric-0.8.13+mc1.21.1.jar",
+        "primary": true,
+        "size": 1574609,
+        "file_type": null
+      }
+    ],
+    "dependencies": []
+  },
+  {
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "fabric"
+    ],
+    "environment": "client_only",
+    "id": "bAo1Qhte",
+    "project_id": "YL57xq9U",
+    "author_id": "DzLrfrbK",
+    "featured": false,
+    "name": "Iris 1.8.14 Beta 1 for Fabric 1.21.1",
+    "version_number": "1.8.14-beta.1+1.21.1-fabric",
+    "changelog": "Updates to Sodium 0.8, and fixes a few old bugs.",
+    "changelog_url": null,
+    "date_published": "2026-06-13T15:56:42.633700Z",
+    "downloads": 4049810,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "id": "iGKkHSZY",
+        "hashes": {
+          "sha1": "6776c0340845887477bfa463acc736ce7fcb6de5",
+          "sha512": "a7fbb629793c52f0be8b049f787cb598879239b1ad8e1de62e103c8b9efff140e3232b93ef1f14e505d262897d8cf9505b1126396429ad4056bff969c8674e52"
+        },
+        "url": "https://cdn.modrinth.com/data/YL57xq9U/versions/bAo1Qhte/iris-fabric-1.8.14-beta.1%2Bmc1.21.1.jar",
+        "filename": "iris-fabric-1.8.14-beta.1+mc1.21.1.jar",
+        "primary": true,
+        "size": 2791343,
+        "file_type": null
+      }
+    ],
+    "dependencies": [
+      {
+        "version_id": "SMxNOGZ6",
+        "project_id": "AANobbMI",
+        "file_name": null,
+        "dependency_type": "required"
+      }
+    ]
+  },
+  {
+    "game_versions": [
+      "1.21",
+      "1.21.1",
+      "1.21.2",
+      "1.21.3",
+      "1.21.4",
+      "1.21.5",
+      "1.21.6",
+      "1.21.7",
+      "1.21.8",
+      "1.21.9",
+      "1.21.10"
+    ],
+    "loaders": [
+      "fabric"
+    ],
+    "environment": "client_only",
+    "id": "kzD1gN83",
+    "project_id": "EE4vxUHj",
+    "author_id": "QXAY01zS",
+    "featured": true,
+    "name": "[Fabric] Greenlight 0.1.0 for Minecraft 1.21 - 1.21.10",
+    "version_number": "mc1.21.10-0.1.0+fabric",
+    "changelog": "**Full Changelog**: https://github.com/FlashyReese/greenlight/compare/mc26.2-0.1.0...mc1.21.10-0.1.0",
+    "changelog_url": null,
+    "date_published": "2026-07-04T09:55:12.994526Z",
+    "downloads": 25168,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "id": "2wW3Y5cN",
+        "hashes": {
+          "sha1": "7bd2553d490f479d86e664a730bb1407f6705ba3",
+          "sha512": "5338152025b398b3af544f1a0bbb6c041687a0371447ac5f89d4790f9fa068bfd2e8fa5c0009478354733d37c4ee17c5500bc5dc3daf101a36be0d5e109372e4"
+        },
+        "url": "https://cdn.modrinth.com/data/EE4vxUHj/versions/kzD1gN83/greenlight-fabric-0.1.0%2Bmc1.21.10.jar",
+        "filename": "greenlight-fabric-0.1.0+mc1.21.10.jar",
+        "primary": true,
+        "size": 27619,
+        "file_type": null
+      }
+    ],
+    "dependencies": []
+  }
+]
