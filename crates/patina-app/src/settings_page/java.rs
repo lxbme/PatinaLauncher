@@ -10,26 +10,23 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::{Radio, RadioGroup};
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Sizable, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{Disableable, Sizable, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, Context, ElementId, Entity, Focusable, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Rems, SharedString, StatefulInteractiveElement, Styled,
-    TestSupportExt, Window, div, px, rems,
+    AnyElement, App, Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Rems, SharedString, StatefulInteractiveElement, Styled, TestSupportExt, Window,
+    div, rems,
 };
 use patina_core::jvm::{GcPreset, validate_extra_jvm_args};
 use rust_i18n::t;
 
 use super::{Field, Section, SettingsPage};
 use crate::content::focus_first_button;
-use crate::core_bridge::{ConfigChanged, Core, run};
-use crate::fonts::Strong;
+use crate::core_bridge::{ConfigChanged, Core};
 use crate::instances::{GC_PRESETS, parse_memory, redetect_java};
-use crate::layout::TEXT_SECONDARY;
 
 /// Work to do in a window (a dialog's commit).
 type WindowAction = dyn Fn(&mut Window, &mut App);
@@ -165,7 +162,7 @@ impl SettingsPage {
     }
 
     /// Saves a detected executable or restores automatic managed Java.
-    fn set_java(
+    pub(super) fn set_java(
         &mut self,
         path: Option<std::path::PathBuf>,
         window: &mut Window,
@@ -222,7 +219,12 @@ impl SettingsPage {
         let probe = Core::global(cx).probe_java.clone();
         let job = crate::core_bridge::run_blocking(cx, {
             let path = path.clone();
-            move || probe(&path)
+            move || {
+                probe(&path).map(|i| {
+                    let vendor = crate::java_settings::vendor_name(&i.path);
+                    (i, vendor)
+                })
+            }
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
@@ -232,7 +234,10 @@ impl SettingsPage {
                 }
                 this.java_file_pending = None;
                 match result {
-                    Ok(Some(install)) => {
+                    Ok(Some((install, vendor))) => {
+                        this.java_list.update(cx, |list, cx| {
+                            list.remember_probe(path.clone(), install.clone(), vendor.clone(), cx)
+                        });
                         this.probed_java.insert(path.clone(), Some(install.major));
                         this.set_java(Some(path), window, cx);
                     }
@@ -264,11 +269,22 @@ impl SettingsPage {
         let probe = Core::global(cx).probe_java.clone();
         let job = crate::core_bridge::run_blocking(cx, {
             let path = path.clone();
-            move || probe(&path).map(|i| i.major)
+            move || {
+                probe(&path).map(|i| {
+                    let vendor = crate::java_settings::vendor_name(&i.path);
+                    (i, vendor)
+                })
+            }
         });
         cx.spawn(async move |this, cx| {
-            let major = job.await.ok().flatten();
+            let install = job.await.ok().flatten();
             this.update(cx, |this, cx| {
+                let major = install.as_ref().map(|(i, _)| i.major);
+                if let Some((install, vendor)) = install {
+                    this.java_list.update(cx, |list, cx| {
+                        list.remember_probe(path.clone(), install, vendor, cx)
+                    });
+                }
                 this.probed_java.insert(path, major);
                 cx.notify();
             })
@@ -288,7 +304,7 @@ impl SettingsPage {
             .installs()
             .unwrap_or_default()
             .iter()
-            .find(|i| &i.path == path)
+            .find(|i| self.java_list.read(cx).matches(Some(&i.path), Some(path)))
             .map(|i| i.major)
             .or_else(|| self.probed_java.get(path).copied().flatten())
     }
@@ -312,14 +328,13 @@ impl SettingsPage {
             .or_else(|| self.config.as_ref().map(|c| &c.java.java_path))
             .and_then(|p| p.as_ref());
         let current = self.java_file_pending.as_ref().or(chosen);
-        let options = crate::instances::java_options(
-            self.java_list.read(cx).installs().unwrap_or_default(),
-            current,
-        );
-        let selected = options.iter().position(|o| o.path.as_ref() == current);
+        let options = crate::instances::java_options(self.java_list.read(cx), current);
+        let selected = options
+            .iter()
+            .position(|o| self.java_list.read(cx).matches(o.path.as_ref(), current));
         let radios: Vec<Radio> = options
             .iter()
-            .map(|o| Radio::new("java").label(o.label.clone()))
+            .map(|o| crate::java_settings::runtime_radio(o, self.runtime_menu(o, cx), cx))
             .collect();
         let paths: Vec<_> = options.into_iter().map(|o| o.path).collect();
         crate::java_settings::field(
@@ -339,15 +354,49 @@ impl SettingsPage {
                 })),
         )
         .child(
-            h_flex().child(
-                Button::new("prefs-java-choose")
-                    .outline()
-                    .small()
-                    .label(t!("instance_settings.java_choose").to_string())
-                    .disabled(self.config.is_none())
-                    .on_click(cx.listener(|this, _, window, cx| this.choose_java_file(window, cx))),
-            ),
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Button::new("prefs-java-download")
+                        .outline()
+                        .small()
+                        .label(t!("java_download.open").to_string())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_java_download(None, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("prefs-redetect")
+                        .outline()
+                        .small()
+                        .icon(IconName::RefreshCw)
+                        .label(t!("prefs.redetect").to_string())
+                        .disabled(self.java_list.read(cx).is_loading())
+                        .loading(self.java_list.read(cx).is_loading())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reload_runtimes(cx);
+                            redetect_java(&this.java_list, cx);
+                        })),
+                )
+                .child(
+                    Button::new("prefs-java-choose")
+                        .outline()
+                        .small()
+                        .label(t!("instance_settings.java_choose").to_string())
+                        .disabled(self.config.is_none())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.choose_java_file(window, cx)),
+                        ),
+                ),
         )
+        .when(self.runtimes_locked(cx), |f| {
+            f.child(Self::hint(
+                "prefs-runtimes-busy",
+                t!("prefs.runtimes_busy").to_string(),
+                cx,
+            ))
+        })
         .when(self.java_file_pending.is_some(), |f| {
             f.child(Self::hint(
                 "prefs-java-checking",
@@ -474,16 +523,8 @@ impl SettingsPage {
         if self.runtimes_locked(cx) || !self.removing.insert(component.to_string()) {
             return;
         }
-        let root = Core::global(cx).data.runtimes();
         let key = component.to_string();
-        let removal = {
-            let key = key.clone();
-            run(cx, async move {
-                patina_core::java::ManagedRuntimes::new(root)
-                    .remove(&key)
-                    .await
-            })
-        };
+        let removal = Core::remove_mojang_runtime(cx, key.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = removal.await;
             this.update_in(cx, |this, window, cx| {
@@ -499,6 +540,7 @@ impl SettingsPage {
                     window.push_notification(Notification::error(text.to_string()), cx);
                 }
                 this.reload_runtimes(cx);
+                redetect_java(&this.java_list, cx);
                 // The status bar counts them.
                 ConfigChanged::bump(cx);
                 cx.notify();
@@ -533,8 +575,6 @@ impl SettingsPage {
                     .child(self.render_gc(cx))
                     .child(self.render_args(cx)),
             )
-            .child(self.render_runtimes(cx))
-            .child(self.render_detected(cx))
     }
 
     fn render_memory(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -659,137 +699,105 @@ impl SettingsPage {
             ))
     }
 
-    /// One two-line row: a title and a muted second line, then `action`.
-    fn list_row(
-        id: ElementId,
-        title: String,
-        detail: String,
-        action: Option<AnyElement>,
-        cx: &App,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        h_flex()
-            .id(id)
-            .test_support()
-            .aria_label(SharedString::from(title.clone()))
-            .w_full()
-            .gap_2()
-            .py_1p5()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    // 1px between the two lines, as the other lists have it.
-                    .gap(px(1.))
-                    .child(
-                        div()
-                            .text_color(theme.foreground)
-                            .strong(FontWeight::MEDIUM, cx)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(TEXT_SECONDARY)
-                            .text_color(theme.muted_foreground)
-                            .child(detail),
-                    ),
-            )
-            .children(action)
-            .into_any_element()
-    }
-
-    fn render_runtimes(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let locked = self.runtimes_locked(cx);
-        let rows: Vec<AnyElement> = (self.runtimes.iter().flatten())
-            .map(|(component, version)| {
-                let removing = self.removing.contains(component);
-                let delete = {
-                    let key = component.clone();
-                    Button::new(runtime_delete_id(component))
+    fn runtime_menu(
+        &self,
+        option: &crate::java_settings::JavaOption,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::java_settings::JavaSource;
+        let this = cx.weak_entity();
+        match &option.source {
+            JavaSource::Vendor(id) => {
+                let release = self
+                    .distributions
+                    .iter()
+                    .find(|i| i.release().id() == *id)?
+                    .release()
+                    .clone();
+                let id = id.clone();
+                let removing = self.removing.contains(&id);
+                let saving = self.is_saving();
+                Some(
+                    Button::new(SharedString::from(format!("java-actions-{id}")))
                         .ghost()
                         .small()
-                        .label(t!("prefs.runtime_delete").to_string())
-                        .loading(removing)
-                        .disabled(locked || removing)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.confirm_delete_runtime(&key, window, cx)
-                        }))
-                };
-                Self::list_row(
-                    runtime_row_id(component),
-                    component.clone(),
-                    version.clone(),
-                    Some(delete.into_any_element()),
-                    cx,
+                        .icon(IconName::Ellipsis)
+                        .accessibility_label(t!("java_list.actions").to_string())
+                        .tooltip(t!("java_list.actions").to_string())
+                        .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                            let update = this.clone();
+                            let delete = this.clone();
+                            let release = release.clone();
+                            let id = id.clone();
+                            let menu = if saving {
+                                menu.label(t!("java_list.saving").to_string())
+                            } else {
+                                menu
+                            };
+                            menu.item(
+                                PopupMenuItem::new(t!("java_download.check_update").to_string())
+                                    .on_click(move |_, window, cx| {
+                                        update
+                                            .update(cx, |this, cx| {
+                                                this.open_java_download(
+                                                    Some(release.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(t!("prefs.runtime_delete").to_string())
+                                    .icon(IconName::Trash)
+                                    .disabled(removing || saving)
+                                    .on_click(move |_, window, cx| {
+                                        delete
+                                            .update(cx, |this, cx| {
+                                                this.confirm_delete_distribution(
+                                                    id.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                        })
+                        .into_any_element(),
                 )
-                .into_any_element()
-            })
-            .collect();
-        let empty = self.runtimes.as_ref().is_some_and(Vec::is_empty);
-        crate::java_settings::field(t!("prefs.runtimes").to_string(), None, cx)
-            .child(v_flex().id("prefs-runtimes").children(rows))
-            .when(empty, |f| {
-                f.child(Self::hint(
-                    "prefs-runtimes-empty",
-                    t!("prefs.runtimes_empty").to_string(),
-                    cx,
-                ))
-            })
-            .when(locked && !empty, |f| {
-                f.child(Self::hint(
-                    "prefs-runtimes-busy",
-                    t!("prefs.runtimes_busy").to_string(),
-                    cx,
-                ))
-            })
-    }
-
-    fn render_detected(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let list = self.java_list.read(cx);
-        let loading = list.is_loading();
-        let installs = list.installs().map(<[_]>::to_vec);
-        let rows: Vec<AnyElement> = (installs.iter().flatten())
-            .map(|install| {
-                let title = t!(
-                    "prefs.java_row",
-                    major = install.major,
-                    version = install.version
-                )
-                .to_string();
-                let id = ElementId::Name(format!("prefs-java-{}", install.path.display()).into());
-                Self::list_row(id, title, install.path.display().to_string(), None, cx)
-                    .into_any_element()
-            })
-            .collect();
-        let status = if loading {
-            Some(t!("prefs.detecting"))
-        } else if installs.as_ref().is_some_and(Vec::is_empty) {
-            Some(t!("prefs.detected_empty"))
-        } else {
-            None
-        };
-        crate::java_settings::field(t!("prefs.detected").to_string(), None, cx)
-            .child(v_flex().id("prefs-detected").children(rows))
-            .children(status.map(|text| Self::hint("prefs-detected-status", text.to_string(), cx)))
-            .child(
-                h_flex().child(
-                    Button::new("prefs-redetect")
-                        .outline()
+            }
+            JavaSource::Mojang(component) => {
+                let component = component.clone();
+                let locked = self.runtimes_locked(cx) || self.is_saving();
+                let removing = self.removing.contains(&component);
+                Some(
+                    Button::new(runtime_delete_id(&component))
+                        .ghost()
                         .small()
-                        .icon(Icon::new(IconName::RefreshCw))
-                        .label(t!("prefs.redetect").to_string())
-                        .loading(loading)
-                        .disabled(loading)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            redetect_java(&this.java_list, cx);
-                        })),
-                ),
-            )
+                        .icon(IconName::Ellipsis)
+                        .accessibility_label(t!("java_list.actions").to_string())
+                        .tooltip(t!("java_list.actions").to_string())
+                        .disabled(locked || removing)
+                        .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                            let this = this.clone();
+                            let component = component.clone();
+                            menu.item(
+                                PopupMenuItem::new(t!("prefs.runtime_delete").to_string())
+                                    .icon(IconName::Trash)
+                                    .on_click(move |_, window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.confirm_delete_runtime(&component, window, cx)
+                                        })
+                                        .ok();
+                                    }),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        }
     }
 }

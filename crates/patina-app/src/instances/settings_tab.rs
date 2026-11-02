@@ -111,18 +111,58 @@ fn gc_selectable(preset: GcPreset, major: Option<u32>) -> bool {
 
 // --- the detected Java installs, shared by the session ---------------------
 
-/// The Java installs found on this machine (`Core.detect_java`): looked
-/// for once per session, in the background, when a form or the settings
-/// page first shows them, and again on request ([`redetect_java`]).
+/// The session's Java selector union and read-only system classification,
+/// built from detection plus verified owned markers on the blocking pool.
+/// Forms share this inventory and refresh it through [`redetect_java`].
 pub struct JavaList {
+    /// Selector union; ownership is not inferred from membership in this list.
     installs: Option<Vec<JavaInstall>>,
+    system_installs: Option<Vec<JavaInstall>>,
+    presentation: HashMap<PathBuf, crate::java_settings::JavaOption>,
+    aliases: HashMap<PathBuf, PathBuf>,
     loading: bool,
+    refresh_pending: bool,
 }
 
 impl JavaList {
     /// The installs found, once looked for.
     pub fn installs(&self) -> Option<&[JavaInstall]> {
         self.installs.as_deref()
+    }
+
+    /// Read-only detected installs, excluding canonical aliases of owned JDKs.
+    pub(crate) fn system_installs(&self) -> Option<&[JavaInstall]> {
+        self.system_installs.as_deref()
+    }
+
+    pub(crate) fn canonical_path<'a>(&'a self, path: &'a PathBuf) -> &'a PathBuf {
+        self.aliases.get(path).unwrap_or(path)
+    }
+    pub(crate) fn matches(&self, a: Option<&PathBuf>, b: Option<&PathBuf>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => self.canonical_path(a) == self.canonical_path(b),
+            _ => false,
+        }
+    }
+    pub(crate) fn remember_probe(
+        &mut self,
+        path: PathBuf,
+        install: JavaInstall,
+        vendor: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.aliases.insert(path, install.path.clone());
+        self.presentation
+            .entry(install.path.clone())
+            .or_insert_with(|| crate::java_settings::JavaOption {
+                path: Some(install.path),
+                vendor,
+                version: install.version,
+                source: crate::java_settings::JavaSource::Manual,
+                selectable: true,
+            });
+        cx.notify();
     }
 
     /// Whether a look is under way.
@@ -142,7 +182,11 @@ pub(crate) fn java_list(cx: &mut App) -> Entity<JavaList> {
     }
     let list = cx.new(|_| JavaList {
         installs: None,
+        system_installs: None,
+        presentation: HashMap::new(),
+        aliases: HashMap::new(),
         loading: false,
+        refresh_pending: false,
     });
     cx.set_global(JavaListGlobal(list.clone()));
     list
@@ -152,24 +196,27 @@ pub(crate) fn java_list(cx: &mut App) -> Entity<JavaList> {
 pub fn seed_java_list(installs: Vec<JavaInstall>, cx: &mut App) {
     let list = java_list(cx);
     list.update(cx, |list, cx| {
+        list.system_installs = Some(installs.clone());
         list.installs = Some(installs);
         list.loading = false;
+        list.refresh_pending = false;
         cx.notify();
     });
 }
 
 /// Starts looking for Java installs unless that was done or is under way.
 pub(crate) fn detect_java(list: &Entity<JavaList>, cx: &mut App) {
-    if list.read(cx).installs.is_some() {
+    if list.read(cx).installs.is_some() || list.read(cx).loading {
         return;
     }
     redetect_java(list, cx);
 }
 
-/// Looks for the Java installs again (the list shown meanwhile stays),
-/// unless a look is under way.
+/// Refreshes Java discovery. A refresh requested during an existing scan is
+/// coalesced and repeated afterward, never lost on download/delete completion.
 pub(crate) fn redetect_java(list: &Entity<JavaList>, cx: &mut App) {
     if list.read(cx).loading {
+        list.update(cx, |list, _| list.refresh_pending = true);
         return;
     }
     list.update(cx, |list, cx| {
@@ -177,19 +224,125 @@ pub(crate) fn redetect_java(list: &Entity<JavaList>, cx: &mut App) {
         cx.notify();
     });
     let detect = Core::global(cx).detect_java.clone();
-    let job = run_blocking(cx, move || detect());
+    let managed = Core::global(cx).java_distributions.clone();
+    let mojang = patina_core::java::ManagedRuntimes::new(Core::global(cx).data.runtimes());
+    let job = run_blocking(cx, move || {
+        use crate::java_settings::{JavaOption, JavaSource};
+        let found = detect();
+        let owned = managed.list()?;
+        let mut presentation = HashMap::new();
+        let mut aliases = HashMap::new();
+        for install in &found {
+            aliases.insert(
+                install.path.clone(),
+                install
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| install.path.clone()),
+            );
+        }
+        let mut managed_installs = Vec::new();
+        for owned in owned {
+            let java = owned.java().clone();
+            let release = owned.release();
+            presentation.insert(
+                java.path.clone(),
+                JavaOption {
+                    path: Some(java.path.clone()),
+                    vendor: Some(release.vendor().name().into()),
+                    version: release.version().into(),
+                    source: JavaSource::Vendor(release.id()),
+                    selectable: true,
+                },
+            );
+            managed_installs.push(java);
+        }
+        for (component, version) in mojang.list_installed() {
+            let path = mojang.java_bin(&component);
+            let probed = patina_core::java::probe(&path);
+            let selectable = probed.is_some();
+            let java = probed.unwrap_or_else(|| JavaInstall {
+                path: path.clone(),
+                major: patina_core::java::parse_major(&version).unwrap_or(0),
+                version: version.clone(),
+                is_64bit: true,
+            });
+            aliases.insert(path, java.path.clone());
+            if !presentation.contains_key(&java.path) {
+                presentation.insert(
+                    java.path.clone(),
+                    JavaOption {
+                        path: Some(java.path.clone()),
+                        vendor: Some("Mojang".into()),
+                        version,
+                        source: JavaSource::Mojang(component),
+                        selectable,
+                    },
+                );
+                managed_installs.push(java);
+            }
+        }
+        let system_installs = found
+            .into_iter()
+            .filter_map(|mut java| {
+                java.path = aliases.get(&java.path).cloned().unwrap_or(java.path);
+                if presentation.contains_key(&java.path) {
+                    return None;
+                }
+                let vendor = crate::java_settings::vendor_name(&java.path);
+                presentation.insert(
+                    java.path.clone(),
+                    JavaOption {
+                        path: Some(java.path.clone()),
+                        vendor,
+                        version: java.version.clone(),
+                        source: JavaSource::System,
+                        selectable: true,
+                    },
+                );
+                Some(java)
+            })
+            .collect::<Vec<_>>();
+        let mut installs = system_installs.clone();
+        installs.extend(managed_installs);
+        let mut seen = HashSet::new();
+        installs.retain(|i| seen.insert(i.path.clone()));
+        installs.sort_by(|a, b| b.major.cmp(&a.major).then_with(|| a.path.cmp(&b.path)));
+        Ok::<_, patina_core::java::distributions::DistributionError>((
+            installs,
+            system_installs,
+            presentation,
+            aliases,
+        ))
+    });
     let list = list.clone();
     cx.spawn(async move |cx| {
-        let found = job.await.ok();
-        list.update(cx, |list, cx| {
+        let found = job.await.ok().and_then(|result| {
+            result
+                .inspect_err(|error| tracing::warn!(%error,"Java inventory refresh failed"))
+                .ok()
+        });
+        let repeat = list.update(cx, |list, cx| {
             list.loading = false;
-            // A failed look keeps what was found before.
-            if let Some(found) = found {
-                list.installs = Some(found);
+            // Keep both classifications coherent on a failed owned-store read.
+            if let Some((installs, system_installs, presentation, aliases)) = found {
+                list.installs = Some(installs);
+                list.system_installs = Some(system_installs);
+                list.presentation.retain(|_, option| {
+                    matches!(option.source, crate::java_settings::JavaSource::Manual)
+                });
+                list.presentation.extend(presentation);
+                list.aliases.extend(aliases);
             }
             list.installs.get_or_insert_with(Vec::new);
+            list.system_installs.get_or_insert_with(Vec::new);
+            let repeat = std::mem::take(&mut list.refresh_pending);
             cx.notify();
+            repeat
         });
+        if repeat {
+            cx.update(|cx| redetect_java(&list, cx));
+        }
     })
     .detach();
 }
@@ -737,14 +890,25 @@ impl SettingsForm {
         let probe = Core::global(cx).probe_java.clone();
         let job = run_blocking(cx, {
             let path = path.clone();
-            move || probe(&path).map(|install| install.major)
+            move || {
+                probe(&path).map(|i| {
+                    let vendor = crate::java_settings::vendor_name(&i.path);
+                    (i, vendor)
+                })
+            }
         });
         let task = cx.spawn_in(window, async move |this, cx| {
-            let major = job.await.ok().flatten();
+            let install = job.await.ok().flatten();
             this.update_in(cx, |this, window, cx| {
                 if this.java_choice_revision != choice {
                     this.probe_started.remove(&path);
                     return;
+                }
+                let major = install.as_ref().map(|(i, _)| i.major);
+                if let Some((install, vendor)) = install {
+                    this.java_list.update(cx, |list, cx| {
+                        list.remember_probe(path.clone(), install, vendor, cx)
+                    });
                 }
                 this.probed.insert(path, major);
                 this.revalidate_gc(window, cx);
@@ -758,7 +922,10 @@ impl SettingsForm {
     fn detected_major(&self, path: &PathBuf, cx: &App) -> Option<u32> {
         let list = self.java_list.read(cx);
         let installs = list.installs.as_deref().unwrap_or_default();
-        installs.iter().find(|i| &i.path == path).map(|i| i.major)
+        installs
+            .iter()
+            .find(|i| list.matches(Some(&i.path), Some(path)))
+            .map(|i| i.major)
     }
 
     /// The Java major the instance will run on, when known: the chosen
@@ -1064,7 +1231,12 @@ impl SettingsForm {
         let probe = Core::global(cx).probe_java.clone();
         let job = run_blocking(cx, {
             let path = path.clone();
-            move || probe(&path)
+            move || {
+                probe(&path).map(|i| {
+                    let vendor = crate::java_settings::vendor_name(&i.path);
+                    (i, vendor)
+                })
+            }
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
@@ -1074,7 +1246,10 @@ impl SettingsForm {
                 }
                 this.java_file_pending = None;
                 match result {
-                    Ok(Some(install)) => {
+                    Ok(Some((install, vendor))) => {
+                        this.java_list.update(cx, |list, cx| {
+                            list.remember_probe(path.clone(), install.clone(), vendor.clone(), cx)
+                        });
                         this.probed.insert(path.clone(), Some(install.major));
                         this.set_java(Some(path), Some(install.major), window, cx);
                     }
@@ -1383,38 +1558,56 @@ fn choice_of(instance: &Instance) -> IconChoice {
 
 // --- drawing ------------------------------------------------------------------
 
-/// One entry of the Java choice.
-pub(crate) struct JavaOption {
-    /// `None`: the managed runtime.
-    pub(crate) path: Option<PathBuf>,
-    pub(crate) label: String,
-}
-
-pub(crate) fn java_options(installs: &[JavaInstall], current: Option<&PathBuf>) -> Vec<JavaOption> {
+pub(crate) fn java_options(
+    list: &JavaList,
+    current: Option<&PathBuf>,
+) -> Vec<crate::java_settings::JavaOption> {
+    use crate::java_settings::{JavaOption, JavaSource};
     let mut options = vec![JavaOption {
         path: None,
-        label: t!("instance_settings.java_auto").to_string(),
+        vendor: None,
+        version: String::new(),
+        source: JavaSource::Automatic,
+        selectable: true,
     }];
-    options.extend(installs.iter().map(|install| {
-        JavaOption {
-            path: Some(install.path.clone()),
-            label: t!(
-                "instance_settings.java_option",
-                major = install.major,
-                version = install.version,
-                path = install.path.display()
-            )
-            .to_string(),
-        }
+    options.extend(list.installs().unwrap_or_default().iter().map(|install| {
+        list.presentation
+            .get(&install.path)
+            .cloned()
+            .unwrap_or_else(|| JavaOption {
+                path: Some(install.path.clone()),
+                vendor: None,
+                version: install.version.clone(),
+                source: if list
+                    .system_installs()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|i| i.path == install.path)
+                {
+                    JavaSource::System
+                } else {
+                    JavaSource::Manual
+                },
+                selectable: true,
+            })
     }));
-    // A saved or chosen file the detection did not list.
     if let Some(path) = current
-        && !installs.iter().any(|i| &i.path == path)
+        && !options
+            .iter()
+            .any(|o| list.matches(o.path.as_ref(), Some(path)))
     {
-        options.push(JavaOption {
-            path: Some(path.clone()),
-            label: path.display().to_string(),
-        });
+        options.push(
+            list.presentation
+                .get(list.canonical_path(path))
+                .cloned()
+                .unwrap_or_else(|| JavaOption {
+                    path: Some(path.clone()),
+                    vendor: None,
+                    version: String::new(),
+                    source: JavaSource::Manual,
+                    selectable: true,
+                }),
+        );
     }
     options
 }
@@ -1587,15 +1780,14 @@ impl SettingsForm {
     ) -> impl IntoElement + use<> {
         let chosen = self.requested_java.as_ref().unwrap_or(&java.java_path);
         let current = self.java_file_pending.as_ref().or(chosen.as_ref());
-        let options = java_options(
-            self.java_list.read(cx).installs().unwrap_or_default(),
-            current,
-        );
-        let selected = options.iter().position(|o| o.path.as_ref() == current);
+        let options = java_options(self.java_list.read(cx), current);
+        let selected = options
+            .iter()
+            .position(|o| self.java_list.read(cx).matches(o.path.as_ref(), current));
         let detecting = self.java_list.read(cx).installs.is_none();
         let radios: Vec<Radio> = options
             .iter()
-            .map(|o| Radio::new("java").label(o.label.clone()))
+            .map(|o| crate::java_settings::runtime_radio(o, None, cx))
             .collect();
         let paths: Vec<Option<PathBuf>> = options.into_iter().map(|o| o.path).collect();
         crate::java_settings::field(
@@ -1962,6 +2154,54 @@ mod tests {
     use crate::core_bridge::testing::{self, FakeCatalog};
     use gpui_kit::TestAppContext;
     use patina_core::paths::DataDirs;
+
+    #[gpui_kit::test]
+    fn java_refresh_requested_during_scan_is_not_dropped(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = crate::runtime::start();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = testing::core(
+            rt.handle().clone(),
+            DataDirs::new(tmp.path()),
+            Arc::new(FakeCatalog::new()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let wait_release = Mutex::new(wait_release);
+        core.detect_java = Arc::new(move || {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                started.send(()).unwrap();
+                wait_release.lock().unwrap().recv().unwrap();
+            }
+            Vec::new()
+        });
+        cx.executor().allow_parking();
+        let list = cx.update(|cx| {
+            cx.set_global(core);
+            let list = java_list(cx);
+            redetect_java(&list, cx);
+            list
+        });
+        wait_started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        cx.update(|cx| redetect_java(&list, cx));
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if calls.load(Ordering::SeqCst) >= 2 && !list.read_with(cx, |l, _| l.is_loading()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "download/delete refresh must be retried after the current scan completes"
+        );
+    }
 
     struct Host {
         model: Entity<InstancesModel>,

@@ -25,6 +25,7 @@ mod appearance;
 mod behavior;
 mod download;
 mod java;
+mod java_download;
 
 pub use about::{LICENSE, REPO_URL};
 pub use appearance::scale_step_id;
@@ -229,6 +230,7 @@ pub struct SettingsPage {
     java_list: Entity<JavaList>,
     /// The installed managed runtimes (component, version), once listed.
     runtimes: Option<Vec<(String, String)>>,
+    distributions: Vec<patina_core::java::distributions::InstalledDistribution>,
     runtimes_rev: Revision,
     runtimes_task: Task<()>,
     /// Runtimes being deleted.
@@ -312,6 +314,7 @@ impl SettingsPage {
             args,
             java_list,
             runtimes: None,
+            distributions: Vec::new(),
             runtimes_rev: Revision::default(),
             runtimes_task: Task::ready(()),
             removing: HashSet::new(),
@@ -462,16 +465,30 @@ impl SettingsPage {
     fn reload_runtimes(&mut self, cx: &mut Context<Self>) {
         let id = self.runtimes_rev.start();
         let root = Core::global(cx).data.runtimes();
+        let managed = Core::global(cx).java_distributions.clone();
         let list = crate::core_bridge::run_blocking(cx, move || {
-            patina_core::java::ManagedRuntimes::new(root).list_installed()
+            (
+                patina_core::java::ManagedRuntimes::new(root).list_installed(),
+                managed.list(),
+            )
         });
         self.runtimes_task = cx.spawn(async move |this, cx| {
             let list = list.await;
             this.update(cx, |this, cx| {
                 if this.runtimes_rev.is_current(id) {
                     // A failed read keeps what was shown.
-                    if let Ok(list) = list {
+                    if let Ok((list, distributions)) = list {
+                        let mojang_changed = this
+                            .runtimes
+                            .as_ref()
+                            .map_or(!list.is_empty(), |previous| previous != &list);
                         this.runtimes = Some(list);
+                        if mojang_changed {
+                            crate::instances::redetect_java(&this.java_list, cx);
+                        }
+                        if let Ok(distributions) = distributions {
+                            this.distributions = distributions;
+                        }
                     }
                     cx.notify();
                 }

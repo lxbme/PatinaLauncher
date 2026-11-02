@@ -153,7 +153,7 @@ pub struct ManagedRuntimes {
 type ComponentLock = Arc<tokio::sync::Mutex<()>>;
 type LockMap = HashMap<(PathBuf, String), Weak<tokio::sync::Mutex<()>>>;
 
-fn component_lock(root: &Path, component: &str) -> ComponentLock {
+pub(crate) fn component_lock(root: &Path, component: &str) -> ComponentLock {
     static LOCKS: OnceLock<StdMutex<LockMap>> = OnceLock::new();
     let key = (
         crate::fsutil::path_key(root).unwrap_or_else(|_| root.to_path_buf()),
@@ -325,6 +325,18 @@ impl ManagedRuntimes {
             .collect();
         out.sort();
         out
+    }
+
+    /// Explicit global/instance selectors share vendor runtime reference guards.
+    pub async fn remove_unreferenced(
+        &self,
+        component: &str,
+        global: &crate::config::JavaSettings,
+        instances: &crate::instance::InstanceStore,
+    ) -> Result<(), super::distributions::DistributionError> {
+        let _references =
+            super::distributions::reference_guards(&self.java_bin(component), global, instances)?;
+        self.remove(component).await.map_err(Into::into)
     }
 
     pub async fn remove(&self, component: &str) -> io::Result<()> {

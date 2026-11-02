@@ -221,8 +221,10 @@ impl StatusBar {
         let id = self.revision.start();
         let config = Core::read_config(cx);
         let runtimes = Core::global(cx).data.runtimes();
+        let distributions = Core::global(cx).java_distributions.clone();
         let runtimes = run_blocking(cx, move || {
             ManagedRuntimes::new(runtimes).list_installed().len()
+                + distributions.list().map_or(0, |list| list.len())
         });
         self.quick = cx.spawn(async move |this, cx| {
             let source = config

@@ -434,6 +434,13 @@ pub fn is_stop_request(status: &std::process::ExitStatus) -> bool {
     }
 }
 
+/// Actual executable of a verified running process, independent of current settings.
+pub fn process_executable(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

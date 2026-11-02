@@ -120,6 +120,9 @@ pub struct Core {
     /// them), injectable for UI tests; an offline test core finds none.
     pub detect_java: DetectJava,
     pub probe_java: ProbeJava,
+    pub java_catalog: patina_core::java::catalog::JavaCatalog,
+    pub java_distributions: patina_core::java::distributions::DistributionStore,
+    pub java_downloader: Arc<patina_core::download::Downloader>,
     config: Arc<RwLock<LoadedConfig>>,
     launcher: Arc<StdRwLock<Arc<Launcher>>>,
     accounts: Arc<AccountService>,
@@ -335,7 +338,18 @@ impl Core {
                 Mirror::official(),
             )),
         ));
+        let java_client = current(&launcher).downloader.client().clone();
+        let java_catalog = patina_core::java::catalog::JavaCatalog::new(java_client.clone());
+        let java_distributions =
+            patina_core::java::distributions::DistributionStore::new(data.java_distributions());
+        let java_downloader = Arc::new(patina_core::download::Downloader::new(
+            java_client,
+            Mirror::official(),
+        ));
         let core = Core {
+            java_catalog,
+            java_distributions,
+            java_downloader,
             rt,
             store,
             data,
@@ -358,6 +372,51 @@ impl Core {
         };
         core.load();
         Ok(core)
+    }
+
+    /// Holds the persisted global selection stable until deletion completes.
+    pub fn remove_java_distribution(
+        cx: &mut App,
+        id: String,
+    ) -> Task<
+        Result<Result<(), patina_core::java::distributions::DistributionError>, super::BridgeError>,
+    > {
+        let core = Self::global(cx).clone();
+        run(cx, async move {
+            let config = core.config.read().await;
+            if config.load_error.is_some() {
+                return Err(
+                    patina_core::java::distributions::DistributionError::Invalid(
+                        t!("java_download.config_unreadable").to_string(),
+                    ),
+                );
+            }
+            core.java_distributions
+                .remove(&id, &config.config.java, &core.store)
+                .await
+        })
+    }
+
+    pub fn remove_mojang_runtime(
+        cx: &mut App,
+        component: String,
+    ) -> Task<
+        Result<Result<(), patina_core::java::distributions::DistributionError>, super::BridgeError>,
+    > {
+        let core = Self::global(cx).clone();
+        run(cx, async move {
+            let config = core.config.read().await;
+            if config.load_error.is_some() {
+                return Err(
+                    patina_core::java::distributions::DistributionError::Invalid(
+                        t!("java_download.config_unreadable").to_string(),
+                    ),
+                );
+            }
+            patina_core::java::ManagedRuntimes::new(core.data.runtimes())
+                .remove_unreferenced(&component, &config.config.java, &core.store)
+                .await
+        })
     }
 
     pub fn global(cx: &App) -> &Core {

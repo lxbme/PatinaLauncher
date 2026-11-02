@@ -7,3 +7,7 @@ pub use detect::{
 pub use runtime::{
     InstallPlan, ManagedRuntimes, RUNTIME_INDEX_URL, RuntimeError, RuntimeManifest, plan_install,
 };
+
+pub mod catalog;
+
+pub mod distributions;

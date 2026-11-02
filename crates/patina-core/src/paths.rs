@@ -71,6 +71,10 @@ impl DataDirs {
     pub fn runtimes(&self) -> PathBuf {
         self.root.join("runtimes")
     }
+    /// Explicitly downloaded vendor JDKs; never Mojang components.
+    pub fn java_distributions(&self) -> PathBuf {
+        self.root.join("java-distributions")
+    }
     pub fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
     }

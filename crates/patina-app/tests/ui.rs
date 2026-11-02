@@ -3520,6 +3520,21 @@ fn reattach_on_startup_restores_running_state(cx: &mut TestAppContext) {
     // On the earlier runtime, which outlives the app (declared before it).
     let games = StopGames::new(earlier.handle());
     games.add(killer);
+    // The asynchronous fixture is ready only when the existing verified
+    // record/process predicate agrees; this is not a weaker launch assertion.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while running_game(&inst).is_none() {
+        if std::time::Instant::now() >= deadline {
+            let record = patina_core::launch::running::read_record(&inst);
+            let process = record
+                .as_ref()
+                .and_then(|r| patina_core::platform::proc_info(r.pid));
+            panic!(
+                "synthetic game never reached verified running readiness: record={record:?}, process={process:?}"
+            );
+        }
+        std::thread::yield_now();
+    }
     assert!(running_game(&inst).is_some());
 
     // A new start of the app finds it after the first list load.
@@ -9136,7 +9151,7 @@ mod settings_page {
             cx.run_until_parked();
             let mut left = None;
             for id in [
-                "prefs-java-choose",
+                "prefs-java-download",
                 "prefs-min-mem",
                 "prefs-gc-details-toggle",
                 "prefs-args",
@@ -9581,6 +9596,8 @@ mod settings_page {
         });
         let model = instances_model(&app, cx);
         pclick(&app, cx, runtime_delete_id("java-runtime-gamma"));
+        press(&app, cx, "down");
+        press(&app, cx, "enter");
         cx.update_window(app.handle, |_, window, cx| {
             window.render_frame(cx);
             window.within("dialog").click("prefs-runtime-ok", cx);
@@ -9616,11 +9633,13 @@ mod settings_page {
         assert!(pshows(&app, cx, runtime_row_id("java-runtime-gamma")));
         assert_eq!(
             label_of(&app, cx, runtime_row_id("java-runtime-delta")).as_deref(),
-            Some("java-runtime-delta")
+            Some("Mojang 21.0.3")
         );
 
         // Asks first, with the keyboard on 取消: a reflexive Enter keeps it.
         pclick(&app, cx, runtime_delete_id("java-runtime-gamma"));
+        press(&app, cx, "down");
+        press(&app, cx, "enter");
         assert!(shows(&app, cx, "dialog"));
         assert_eq!(
             dialog_label(&app, cx, "prefs-runtime-delete-title"),
@@ -9638,6 +9657,8 @@ mod settings_page {
 
         // 删除 deletes it; the list and the status bar follow.
         pclick(&app, cx, runtime_delete_id("java-runtime-gamma"));
+        press(&app, cx, "down");
+        press(&app, cx, "enter");
         dialog_click(&app, cx, "prefs-runtime-ok");
         settle(cx, |cx| {
             page.read_with(cx, |p, _| p.runtimes().is_some_and(|r| r.len() == 1))
@@ -10246,3 +10267,48 @@ mod settings_page {
 
 #[path = "content/origin.rs"]
 mod content_origin;
+
+#[gpui_kit::test]
+fn java_download_dialog_opens_with_real_selectors_and_escape_restores_settings(
+    cx: &mut TestAppContext,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = boot(cx, tmp.path(), AppSettings::default());
+    activate(&app, cx);
+    click(&app, cx, "rail-settings");
+    let page = cx.update(|cx| app.root.read(cx).settings().clone());
+    settle(cx, |cx| page.read_with(cx, |p, _| p.config().is_some()));
+    cx.update_window(app.handle, |_, window, cx| {
+        page.update(cx, |p, cx| {
+            p.scroll_to(patina_app::settings_page::Section::Java, cx)
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    for _ in 0..80 {
+        if element(&app, cx, "prefs-java-download").and_then(|e| e.focused()) == Some(true) {
+            break;
+        }
+        press(&app, cx, "tab");
+    }
+    assert_eq!(
+        element(&app, cx, "prefs-java-download").unwrap().focused(),
+        Some(true)
+    );
+    press(&app, cx, "enter");
+    assert!(element(&app, cx, "java-download-vendor").is_some());
+    assert!(element(&app, cx, "java-download-major").is_some());
+    assert!(element(&app, cx, "java-download-build").is_some());
+    assert!(element(&app, cx, "java-download-install").is_some_and(|e| e.disabled() == Some(true)));
+    press(&app, cx, "escape");
+    cx.run_until_parked();
+    assert!(element(&app, cx, "java-download-vendor").is_none());
+    assert_eq!(
+        element(&app, cx, "prefs-java-download").unwrap().focused(),
+        Some(true)
+    );
+}
+
+#[path = "settings/java_download.rs"]
+mod java_download;
