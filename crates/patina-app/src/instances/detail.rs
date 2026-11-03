@@ -616,12 +616,12 @@ impl DetailView {
             Some(t) => t!("instances.played", when = time_ago(t, now_secs())).to_string(),
             None => t!("instances.played_never").to_string(),
         };
-        let teal = ProductColors::get(cx).signature();
+        let colors = ProductColors::get(cx);
         let launch = ButtonCustomVariant::new(cx)
-            .color(teal)
+            .color(colors.signature())
             .foreground(theme.primary_foreground)
-            .hover(teal.opacity(0.9))
-            .active(teal.opacity(0.8));
+            .hover(colors.signature_hover())
+            .active(colors.signature_active());
         h_flex()
             .flex_none()
             .px(GUTTER)
@@ -729,7 +729,7 @@ impl DetailView {
                     .custom(launch)
                     // A custom variant's resting fill is drawn at 20 %
                     // opacity by gpui-component; set it solid.
-                    .bg(teal)
+                    .bg(colors.signature())
                     // Instance styles also override the component's disabled
                     // style: replace the teal fill, not just the label color.
                     .when(busy, |button| {

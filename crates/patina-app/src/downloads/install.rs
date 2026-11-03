@@ -2,6 +2,7 @@
 use crate::core_bridge::{Core, run};
 use crate::instances::InstancesModel;
 use crate::launch::{OpError, OpKind, OpState};
+use crate::theme::ProductColors;
 use futures::FutureExt;
 use gpui_kit::base::Link;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -362,6 +363,7 @@ impl Render for ContentInstallView {
             cx.theme().link,
             cx.theme().border,
         );
+        let (focus_background, focus_foreground) = ProductColors::get(cx).link_focus();
         let mut body = v_flex()
             .id("content-install-body")
             .gap_3()
@@ -500,7 +502,9 @@ impl Render for ContentInstallView {
                             )))
                             .href(page)
                             .text_color(link)
-                            .focus_visible(move |s| s.bg(border))
+                            .focus_visible(move |s| {
+                                s.bg(focus_background).text_color(focus_foreground)
+                            })
                             .open_with(|url, _, _, cx| {
                                 if url.starts_with("https://") || url.starts_with("http://") {
                                     cx.open_url(url);

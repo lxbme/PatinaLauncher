@@ -468,7 +468,6 @@ prefs:
   theme: "Theme"
   theme_dark: "Dark"
   theme_light: "Light"
-  theme_light_later: "A light theme is coming in a later version."
   download: "Downloads"
   source: "Preferred download source"
   source_hint: "When a download fails on the chosen source, Patina tries the other one."

@@ -9,7 +9,7 @@ use rust_i18n::t;
 use super::{Section, SettingsPage};
 use crate::i18n::{Language, apply_language};
 use crate::scale::{UI_SCALES, applied_scale, max_scale, set_scale};
-use crate::settings::SettingsStore;
+use crate::settings::{SettingsStore, ThemePreference};
 
 /// The languages offered, with the key of their name (each named in
 /// itself).
@@ -81,24 +81,21 @@ impl SettingsPage {
         )
     }
 
-    /// Dark only: light comes later.
+    /// Manual appearance switches immediately and uses the shared save queue.
     fn render_theme(cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        Self::field(t!("prefs.theme").to_string(), cx)
-            .child(
-                RadioGroup::horizontal("prefs-theme")
-                    .selected_index(Some(0))
-                    .child(Radio::new("dark").label(t!("prefs.theme_dark").to_string()))
-                    .child(
-                        Radio::new("light")
-                            .label(t!("prefs.theme_light").to_string())
-                            .disabled(true),
-                    ),
-            )
-            .child(Self::hint(
-                "prefs-theme-hint",
-                t!("prefs.theme_light_later").to_string(),
-                cx,
-            ))
+        let themes = [ThemePreference::Dark, ThemePreference::Light];
+        let now = SettingsStore::get(cx).theme;
+        Self::field(t!("prefs.theme").to_string(), cx).child(
+            RadioGroup::horizontal("prefs-theme")
+                .selected_index(themes.iter().position(|theme| *theme == now))
+                .child(Radio::new("dark").label(t!("prefs.theme_dark").to_string()))
+                .child(Radio::new("light").label(t!("prefs.theme_light").to_string()))
+                .on_click(move |ix: &usize, window, cx| {
+                    if let Some(theme) = themes.get(*ix) {
+                        crate::theme::set_theme(*theme, window, cx);
+                    }
+                }),
+        )
     }
 }
 

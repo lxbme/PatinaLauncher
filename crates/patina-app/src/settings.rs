@@ -36,6 +36,15 @@ pub enum AfterLaunch {
     Close,
 }
 
+/// Manual appearance choice; existing configurations keep Patina's Dark look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    Dark,
+    Light,
+}
+
 /// Fields are public to read and edit (through `SettingsStore::update`);
 /// build one from `AppSettings::default()`, as fields may be added.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +57,7 @@ pub struct AppSettings {
     /// A missing value (first run) follows `$LANG`.
     pub language: Language,
     pub after_launch: AfterLaunch,
+    pub theme: ThemePreference,
 }
 
 impl Default for AppSettings {
@@ -56,6 +66,7 @@ impl Default for AppSettings {
             ui_scale: DEFAULT_SCALE,
             language: system_language(),
             after_launch: AfterLaunch::default(),
+            theme: ThemePreference::default(),
         }
     }
 }
@@ -256,11 +267,40 @@ impl SettingsStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn saved_light_theme_round_trips_and_old_configs_default_dark() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        fs::write(
+            &file,
+            "ui_scale = 1.25\nlanguage = \"en\"\nafter_launch = \"minimize\"\ntheme = \"light\"\n",
+        )
+        .unwrap();
+        let light = load(dir.path());
+        save(dir.path(), &light).unwrap();
+        let saved: toml::Value = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("theme").and_then(toml::Value::as_str),
+            Some("light")
+        );
+        assert_eq!(light.ui_scale, 1.25);
+        assert_eq!(light.language, Language::En);
+        assert_eq!(light.after_launch, AfterLaunch::Minimize);
+        fs::write(&file, "ui_scale = 1.1\nlanguage = \"en\"\n").unwrap();
+        save(dir.path(), &load(dir.path())).unwrap();
+        let saved: toml::Value = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("theme").and_then(toml::Value::as_str),
+            Some("dark")
+        );
+    }
+
     fn custom() -> AppSettings {
         AppSettings {
             ui_scale: 1.1,
             language: Language::En,
             after_launch: AfterLaunch::Minimize,
+            theme: ThemePreference::Dark,
         }
     }
 

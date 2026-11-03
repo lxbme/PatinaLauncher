@@ -140,12 +140,35 @@ fn app_boots_headless(cx: &mut TestAppContext) {
         .unwrap();
     cx.update(|cx| {
         let t = Theme::global(cx);
-        assert!(t.mode.is_dark(), "Patina has a dark theme only");
+        assert!(t.mode.is_dark(), "old/default configurations keep Dark");
         // Patina's tokens, not the stock dark theme's.
         assert_eq!(t.background, theme::background());
         assert_eq!(t.progress_bar, ProductColors::get(cx).signature());
         assert_eq!(cx.windows().len(), 1);
     });
+}
+
+#[gpui_kit::test]
+fn saved_light_theme_is_applied_before_first_frame(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("gui.toml"),
+        "theme = \"light\"\nui_scale = 1.25\nlanguage = \"en\"\n",
+    )
+    .unwrap();
+    let app = boot(cx, tmp.path(), settings::load(tmp.path()));
+    cx.update(|cx| {
+        assert!(
+            !Theme::global(cx).mode.is_dark(),
+            "saved Light before rendering"
+        );
+        assert_eq!(Theme::global(cx).font_size, px(20.));
+    });
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.rem_size(), px(20.));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -9316,6 +9339,78 @@ mod settings_page {
                 .unwrap()
                 .checked(),
             Some(false)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn theme_switch_restores_dark_preserves_zoom_and_pending_settings(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut start = AppSettings::default();
+        start.ui_scale = 1.25;
+        start.after_launch = settings::AfterLaunch::Minimize;
+        let app = boot(cx, tmp.path(), start);
+        let page = open(&app, cx);
+        let dark = cx.update(|cx| Theme::global(cx).clone());
+        let product = cx.update(|cx| *ProductColors::get(cx));
+        // Exercise a real mode reload that carries font settings, not just
+        // today's stock config (whose missing sizes happen to preserve zoom).
+        cx.update(|cx| {
+            Theme::update(cx, |theme| {
+                let mut light = (*theme.light_theme).clone();
+                light.font_size = Some(16.);
+                light.mono_font_size = Some(13.);
+                theme.light_theme = Rc::new(light);
+            })
+        });
+        // An unsaved core-setting input must survive appearance changes.
+        replace(&app, cx, "prefs-args", "-Dtheme-pending=true");
+        pclick_radio(&app, cx, "prefs-theme", 1);
+        cx.update(|cx| {
+            assert!(
+                !Theme::global(cx).mode.is_dark(),
+                "Light option must be enabled"
+            );
+            assert_eq!(Theme::global(cx).font_size, dark.font_size);
+            assert_eq!(Theme::global(cx).mono_font_size, dark.mono_font_size);
+            assert_eq!(Theme::global(cx).font_family, dark.font_family);
+            assert_eq!(patina_app::scale::applied_scale(cx), 1.25);
+        });
+        assert_eq!(
+            page.read_with(cx, |p, cx| p.args_input().read(cx).value().to_string()),
+            "-Dtheme-pending=true"
+        );
+        pclick_radio(&app, cx, "prefs-language", 1);
+        cx.update(|cx| SettingsStore::flush(cx));
+        let saved = std::fs::read_to_string(tmp.path().join("gui.toml")).unwrap();
+        assert!(saved.contains("theme = \"light\""));
+        assert_eq!(settings::load(tmp.path()).language, Language::En);
+        assert_eq!(
+            settings::load(tmp.path()).after_launch,
+            settings::AfterLaunch::Minimize
+        );
+        pclick_radio(&app, cx, "prefs-theme", 0);
+        cx.update(|cx| {
+            let restored = Theme::global(cx);
+            assert!(restored.mode.is_dark());
+            assert_eq!(restored.colors, dark.colors);
+            assert_eq!(restored.tokens, dark.tokens);
+            assert_eq!(*ProductColors::get(cx), product);
+            assert_eq!(restored.font_size, dark.font_size);
+        });
+        // Radios preserve the textarea's focus; switching must not commit it.
+        assert_eq!(on_disk(tmp.path()).java.extra_jvm_args, "");
+        pclick(&app, cx, "prefs-args");
+        leave(&app, cx);
+        saves_done(&page, cx);
+        assert_eq!(
+            on_disk(tmp.path()).java.extra_jvm_args,
+            "-Dtheme-pending=true"
+        );
+        cx.update(|cx| SettingsStore::flush(cx));
+        assert!(
+            std::fs::read_to_string(tmp.path().join("gui.toml"))
+                .unwrap()
+                .contains("theme = \"dark\"")
         );
     }
 

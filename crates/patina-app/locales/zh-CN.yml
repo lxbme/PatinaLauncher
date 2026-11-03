@@ -468,7 +468,6 @@ prefs:
   theme: "主题"
   theme_dark: "深色"
   theme_light: "浅色"
-  theme_light_later: "浅色主题将在后续版本提供。"
   download: "下载"
   source: "优先使用的下载源"
   source_hint: "所选的源下载失败时，会自动改用另一个源。"

@@ -2,6 +2,7 @@
 use super::{Detail, DownloadsPage};
 use crate::fonts::Strong;
 use crate::layout::{GUTTER, STRIP_H, TEXT_PRIMARY, TEXT_ROW, TEXT_SECONDARY, scroll_y};
+use crate::theme::ProductColors;
 use gpui_kit::base::Link;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
@@ -22,6 +23,7 @@ impl DownloadsPage {
             cx.theme().muted_foreground,
             cx.theme().link,
         );
+        let (focus_background, focus_foreground) = ProductColors::get(cx).link_focus();
         let model = self.model.read(cx);
         let instance = model.target().and_then(|id| {
             self.instances
@@ -98,7 +100,9 @@ impl DownloadsPage {
                     .child(
                         div().id("downloads-project-page").test_support().child(
                             Link::new("downloads-project-link")
-                                .focus_visible(move |s| s.bg(border))
+                                .focus_visible(move |s| {
+                                    s.bg(focus_background).text_color(focus_foreground)
+                                })
                                 .href(project.url().to_string())
                                 .text_color(link)
                                 .open_with(|url, _, _, cx| {
@@ -114,7 +118,7 @@ impl DownloadsPage {
                         Link::new(gpui_kit::SharedString::from(format!(
                             "downloads-support:{url}"
                         )))
-                        .focus_visible(move |s| s.bg(border))
+                        .focus_visible(move |s| s.bg(focus_background).text_color(focus_foreground))
                         .href(url.clone())
                         .text_color(link)
                         .open_with(|url, _, _, cx| {
