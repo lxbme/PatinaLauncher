@@ -341,6 +341,17 @@ fn outer_install_only_confirms_then_inner_install_shows_progress_and_local_conte
     });
     click(&app, cx, "downloads-install");
     settle(cx, |cx| shows(&app, cx, "content-root:file"));
+    cx.update_window(app.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("content-install-identity").visible());
+        assert!(window.find("content-install-metadata").visible());
+        assert!(window.find("content-install-footer").visible());
+        assert!(
+            window.find("content-install-identity").bounds().top()
+                < window.find("content-root:file").bounds().top()
+        );
+    })
+    .unwrap();
     assert!(
         network
             .block_on(server.received_requests())

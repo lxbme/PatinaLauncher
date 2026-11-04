@@ -23,6 +23,7 @@ lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std", 
 md-5 = "0.11.0"
 # CurseForge's whitespace-normalized file fingerprint (MurmurHash2, seed 1).
 murmur2 = "0.1.0"
+percent-encoding = "2.3.2"
 quick-xml = "0.42.0"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "form", "json"] }

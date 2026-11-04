@@ -1584,6 +1584,7 @@ fn items(phase: Phase, done: u64, total: u64) -> TaskProgress {
         done,
         total,
         unit: Unit::Items,
+        activity: None,
     }
 }
 
@@ -1607,6 +1608,8 @@ fn progress_follows_its_instance(cx: &mut TestAppContext) {
             done: 3 * MIB,
             total: 10 * MIB,
             unit: Unit::Bytes,
+
+            activity: None,
         })
         .unwrap();
     settle(cx, |cx| {
@@ -8638,6 +8641,19 @@ token_ref = "00000000-0000-0000-0000-000000000002"
         settle(cx, |cx| shows(&app, cx, "login-waiting"));
         assert_eq!(login.started(), 1);
         assert_eq!(login.cancelled(), 0);
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let outside = gpui_kit::point(px(8.), px(200.));
+            window.pointer_down(outside, MouseButton::Left, cx);
+            window.pointer_up(outside, MouseButton::Left, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            shows(&app, cx, "dialog"),
+            "outside click must not dismiss login"
+        );
+        assert_eq!(login.cancelled(), 0);
         click(&app, cx, "login-cancel");
         assert!(!shows(&app, cx, "dialog"));
         settle(cx, |_| login.cancelled() == 1);
@@ -8656,6 +8672,15 @@ token_ref = "00000000-0000-0000-0000-000000000002"
         press(&app, cx, "enter");
         assert!(shows(&app, cx, "dialog"));
         assert_eq!(login.cancelled(), 2);
+        cx.update_window(app.handle, |_, window, cx| {
+            window.render_frame(cx);
+            let close = window.within("dialog").find("close").bounds().center();
+            window.pointer_down(close, MouseButton::Left, cx);
+            window.pointer_up(close, MouseButton::Left, cx);
+        })
+        .unwrap();
+        settle(cx, |_| login.cancelled() == 3);
+        assert!(!shows(&app, cx, "dialog"));
         assert!(!tmp.path().join("accounts.toml").exists(), "nothing saved");
     }
 
@@ -10430,3 +10455,6 @@ fn java_download_dialog_opens_with_real_selectors_and_escape_restores_settings(
 
 #[path = "settings/java_download.rs"]
 mod java_download;
+
+#[path = "modpacks/ui.rs"]
+mod modpacks;

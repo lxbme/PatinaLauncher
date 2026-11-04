@@ -33,13 +33,20 @@ impl DownloadsPage {
                 .find(|i| i.id == id)
                 .map(|i| i.config.name.clone())
         });
-        let installable = model.install_request().is_some()
-            && model
-                .target()
-                .is_some_and(|id| !self.instances.read(cx).is_busy(id, cx));
-        let label = match &instance {
-            Some(name) => t!("downloads.detail.confirm_to", instance = name).to_string(),
-            None => t!("downloads.detail.choose_instance").to_string(),
+        let pack = model.kind() == ContentKind::Modpack && model.platform() == Platform::Modrinth;
+        let pack_version = pack.then(|| model.selected_version()).flatten().cloned();
+        let installable = pack_version.is_some()
+            || model.install_request().is_some()
+                && model
+                    .target()
+                    .is_some_and(|id| !self.instances.read(cx).is_busy(id, cx));
+        let label = if pack {
+            t!("modpacks.install_preview").to_string()
+        } else {
+            match &instance {
+                Some(name) => t!("downloads.detail.confirm_to", instance = name).to_string(),
+                None => t!("downloads.detail.choose_instance").to_string(),
+            }
         };
         let reason = if model.kind() == ContentKind::Modpack {
             "downloads.detail.modpack_later"
@@ -219,8 +226,16 @@ impl DownloadsPage {
                             .min_w(rems(0.))
                             .disabled(!installable)
                             .label(label)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(request) = this.model.read(cx).install_request() {
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(version) = pack_version.clone() {
+                                    crate::modpacks::open_online(
+                                        this.instances.clone(),
+                                        version,
+                                        window,
+                                        cx,
+                                    );
+                                } else if let Some(request) = this.model.read(cx).install_request()
+                                {
                                     super::install::open_install(
                                         this.instances.clone(),
                                         request,

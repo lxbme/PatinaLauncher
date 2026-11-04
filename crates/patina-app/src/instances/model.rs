@@ -3,7 +3,7 @@
 //! games, logs) is the [`InstanceActivity`] it owns; the model delegates
 //! to it, so callers keep one handle.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -73,6 +73,7 @@ pub struct InstancesModel {
     /// list from other changes.
     generation: u64,
     selected: Option<String>,
+    pack_blocked: HashMap<String, SharedString>,
     activity: Entity<InstanceActivity>,
     /// Broken entries being deleted, so a second request is ignored.
     deleting: HashSet<String>,
@@ -119,6 +120,7 @@ impl InstancesModel {
             error: None,
             generation: 0,
             selected: None,
+            pack_blocked: HashMap::new(),
             activity,
             deleting: HashSet::new(),
             revision: Revision::default(),
@@ -135,6 +137,11 @@ impl InstancesModel {
     /// operations and their progress.
     pub fn activity(&self) -> &Entity<InstanceActivity> {
         &self.activity
+    }
+
+    /// Cached core readiness, refreshed off the UI thread alongside the instance list.
+    pub fn pack_blocked_reason(&self, id: &str) -> Option<&SharedString> {
+        self.pack_blocked.get(id)
     }
 
     /// The listed instances, most recently played first.
@@ -360,6 +367,9 @@ impl InstancesModel {
     /// A busy instance ([`InstancesModel::is_busy`]) refuses. See
     /// [`InstanceActivity::launch`].
     pub fn launch(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        if self.pack_blocked.contains_key(id) {
+            return false;
+        }
         self.activity.update(cx, |a, cx| a.launch(id, cx))
     }
 
@@ -467,7 +477,18 @@ impl InstancesModel {
                     .collect(),
                 _ => Vec::new(),
             };
-            (outcome, running)
+            let blocked = outcome
+                .as_ref()
+                .ok()
+                .into_iter()
+                .flat_map(|o| o.instances.iter())
+                .filter_map(|i| {
+                    patina_core::modpack::ensure_ready(&i.dir)
+                        .err()
+                        .map(|e| (i.id.clone(), SharedString::from(e.to_string())))
+                })
+                .collect::<HashMap<_, _>>();
+            (outcome, running, blocked)
         });
         self.refreshing = true;
         // Replacing the task drops the previous refresh.
@@ -477,10 +498,12 @@ impl InstancesModel {
                 if !this.revision.is_current(id) {
                     return;
                 }
-                let result =
-                    result.map(|(outcome, running)| outcome.map(|outcome| (outcome, running)));
+                let result = result.map(|(outcome, running, blocked)| {
+                    outcome.map(|outcome| (outcome, running, blocked))
+                });
                 match result {
-                    Ok(Ok((outcome, running))) => {
+                    Ok(Ok((outcome, running, blocked))) => {
+                        this.pack_blocked = blocked;
                         this.apply(outcome);
                         let list = this.outcome.clone();
                         this.activity

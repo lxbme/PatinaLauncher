@@ -504,7 +504,7 @@ impl Render for JavaDownload {
                     .child(e.clone())
             }))
             .children(self.running.then(|| {
-                let p = self.progress;
+                let p = self.progress.as_ref();
                 v_flex()
                     .gap_2()
                     .child(div().child(p.map_or_else(

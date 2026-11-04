@@ -148,6 +148,7 @@ pub(super) async fn project(
             .filter_map(|k| data["links"][k].as_str().map(str::to_owned))
             .collect(),
         client_supported: true,
+        icon_url: None,
     })
 }
 async fn project_downloads(api: &ApiClient, project: &str) -> Result<(String, bool), OnlineError> {

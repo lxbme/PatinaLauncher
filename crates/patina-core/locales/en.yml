@@ -148,6 +148,7 @@ errors:
       network: "network error: %{error}"
       io: "could not write the file: %{error}"
       no_attempt: "no download source was tried"
+      limit: "download exceeds the safe byte limit"
   runtime:
     unavailable: "Component %{component} is unavailable: this platform has no official Java runtime; please set the Java path manually in the settings"
     invalid_component: "Invalid runtime component name: %{component}"
@@ -188,11 +189,22 @@ notices:
   loader:
     mods_may_be_incompatible: "The mod loader was changed; installed mods may not work with the new loader"
 progress:
+  file:
+    checking: Checking
+    connecting: Connecting
+    downloading: Downloading
+    retrying: Retrying
   phase:
+    prepare_game_files: Preparing game files
+    extract_natives: Extracting native libraries
+    prepare_game_directory: Preparing game directory
     fetch_metadata: "Fetching version info"
     download_runtime: "Downloading Java runtime"
     download_asset_index: "Downloading asset index"
     download_content: "Downloading content"
+    download_pack_archive: "Downloading modpack archive"
+    inspect_pack_archive: "Inspecting modpack archive"
+    verify_pack_files: "Verifying pack files"
     check_game_files: "Checking game files"
     download_installer: "Downloading installer"
     download_libraries: "Downloading libraries"
@@ -260,3 +272,20 @@ java_distribution:
     missing_releases: "The official available release list is missing"
     temurin_pagination: "The Temurin release list exceeded its page limit"
     missing_package_id: "The official package identity is missing"
+modpack:
+  invalid: "The Modrinth pack is invalid or damaged."
+  unsafe_path: "Unsafe or ambiguous pack path: %{path}"
+  unsupported: "This pack format or loader is not supported."
+  limit: "The pack exceeds the safe archive limits."
+  io: "Couldn’t access pack files: %{error}"
+  invalid_state: "The pack history is damaged. Install the pack as a new instance."
+  not_ready: "This pack is incomplete. Retry installation or recover it before launching."
+  cancelled: "Pack operation cancelled."
+  verification: "A pack file failed integrity verification."
+  name_conflict: "An instance already uses this name. Choose a different name."
+  collision: "A protected file or directory conflicts with the pack: %{path}"
+  stale_plan: "Files changed since the preview. Preview the update again."
+  no_baseline: "This instance has no pack history. Install the pack as a new instance."
+  source_changed: "Choose a version of the same pack, or install a new instance."
+  recovery: "Recovery could not finish. Don’t launch this instance. Backups: %{path}. %{error}"
+  file_download: "Couldn’t download pack file %{path}: %{error}"

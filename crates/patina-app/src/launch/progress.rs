@@ -13,6 +13,7 @@ pub struct ProgressView {
     /// The step; described in the current language when drawn
     /// ([`ProgressView::step`]), so it follows a language switch.
     pub phase: Phase,
+    pub activity: Option<std::sync::Arc<patina_core::download::TransferSnapshot>>,
     /// The bar's fill in `0.0..=1.0`; `None` when the total is unknown
     /// (an indeterminate bar).
     pub fraction: Option<f32>,
@@ -34,6 +35,7 @@ pub fn view_of(p: &TaskProgress) -> ProgressView {
     if p.total == 0 {
         return ProgressView {
             phase: p.phase,
+            activity: p.activity.clone(),
             fraction: None,
             amount: None,
         };
@@ -50,6 +52,7 @@ pub fn view_of(p: &TaskProgress) -> ProgressView {
     };
     ProgressView {
         phase: p.phase,
+        activity: p.activity.clone(),
         fraction: Some(fraction),
         amount: Some(amount),
     }
@@ -73,7 +76,7 @@ impl ProgressTracker {
                 ..Self::default()
             };
         }
-        let mut p = *p;
+        let mut p = p.clone();
         p.done = p.done.max(self.done);
         self.done = p.done;
         let mut view = view_of(&p);
@@ -95,6 +98,7 @@ mod tests {
             done,
             total,
             unit,
+            activity: None,
         }
     }
 

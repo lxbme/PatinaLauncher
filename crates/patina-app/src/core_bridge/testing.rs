@@ -597,3 +597,19 @@ pub(super) fn account_snapshot_delivery(
     }
     None
 }
+
+/// Real resource/catalog services with the existing isolated, unavailable account adapter.
+/// Native acceptance can exercise public downloads without opening the system credential store.
+pub fn network_core_without_credentials(rt: Handle, data: DataDirs) -> Core {
+    let accounts = Arc::new(isolated_accounts(data.clone()).expect("isolated account service"));
+    Core::start(
+        rt,
+        data,
+        Fakes {
+            accounts: Some(accounts),
+            ..Fakes::default()
+        },
+        Startup::SpeedTest,
+    )
+    .expect("network acceptance core starts")
+}

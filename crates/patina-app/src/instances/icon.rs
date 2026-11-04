@@ -170,7 +170,7 @@ pub fn instance_icon(src: &IconSource, size: Rems, cx: &App) -> AnyElement {
             .flex_none()
             .size(size)
             .rounded(radius)
-            .object_fit(ObjectFit::Cover)
+            .object_fit(ObjectFit::Contain)
             .into_any_element(),
         IconSource::Letter { ch, tint } => {
             let color = ProductColors::get(cx).tint(*tint);

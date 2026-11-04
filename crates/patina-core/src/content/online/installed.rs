@@ -107,3 +107,34 @@ pub(super) fn effective_record(root: &Path, record: &SourceRecord) -> SourceReco
     }
     record
 }
+
+/// Registers only verified manifest files; this never resolves dependencies or fetches metadata.
+pub(crate) fn record_pack_files(
+    dir: &Path,
+    records: Vec<(VersionRef, ContentKind, String, String)>,
+    replaced: &[String],
+) -> Result<(), ContentError> {
+    let mut sources = load_sources(dir)?;
+    sources
+        .records
+        .retain(|r| !replaced.contains(&r.path) && dir.join("minecraft").join(&r.path).is_file());
+    let mut projects = std::collections::HashSet::new();
+    for (version, kind, path, sha1) in records {
+        if !valid_content_path(kind, &path)
+            || sha1.len() != 40
+            || !projects.insert(version.project().clone())
+        {
+            return Err(ContentError::InvalidSources);
+        }
+        sources
+            .records
+            .retain(|r| r.version.project() != version.project() && r.path != path);
+        sources.records.push(SourceRecord {
+            version,
+            kind,
+            path,
+            sha1,
+        });
+    }
+    save_sources(dir, &sources)
+}

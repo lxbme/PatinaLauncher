@@ -124,6 +124,7 @@ pub(super) async fn project(
             .filter_map(|v| v["url"].as_str().map(str::to_owned))
             .collect(),
         client_supported: client_supported(&data),
+        icon_url: data["icon_url"].as_str().map(str::to_owned),
     })
 }
 pub(super) async fn versions(
@@ -157,6 +158,29 @@ pub(super) async fn versions(
     if versions.iter().any(|v| v.reference().project() != &project) {
         return Err(OnlineError::InvalidResponse);
     }
+    Ok(versions)
+}
+pub(super) async fn pack_versions(
+    api: ApiClient,
+    project: ProjectRef,
+) -> Result<Vec<ContentVersion>, OnlineError> {
+    let metadata = self::project(api.clone(), project.clone()).await?;
+    if metadata.kind() != ContentKind::Modpack || !metadata.is_client_supported() {
+        return Err(OnlineError::InvalidResponse);
+    }
+    let data = api
+        .get(&["project", project.id(), "version"], vec![])
+        .await?;
+    let mut versions = data
+        .as_array()
+        .ok_or(OnlineError::InvalidResponse)?
+        .iter()
+        .map(parse_version)
+        .collect::<Result<Vec<_>, _>>()?;
+    if versions.iter().any(|v| v.reference().project() != &project) {
+        return Err(OnlineError::InvalidResponse);
+    }
+    versions.sort_by_key(|v| std::cmp::Reverse(v.published()));
     Ok(versions)
 }
 pub(super) async fn version(api: ApiClient, id: &str) -> Result<ContentVersion, OnlineError> {

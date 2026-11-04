@@ -145,6 +145,7 @@ struct RawConfig {
     last_played: Option<u64>,
     /// Cosmetic: an unparseable value is dropped on load, not an error.
     icon: Option<String>,
+    icon_generation: u64,
     window: Option<WindowSize>,
 }
 
@@ -160,6 +161,8 @@ pub struct InstanceConfig {
     /// Unix seconds.
     pub last_played: Option<u64>,
     pub icon: Option<InstanceIcon>,
+    /// Explicit icon choices, including clearing, prevent late automatic artwork.
+    pub icon_generation: u64,
     /// `None` leaves the window size to the game.
     pub window: Option<WindowSize>,
 }
@@ -183,6 +186,7 @@ impl InstanceConfig {
                 }
                 icon
             }),
+            icon_generation: raw.icon_generation,
             window: raw.window,
         };
         cfg.validate()?;
@@ -489,6 +493,7 @@ impl InstanceStore {
                 created_at: now_secs(),
                 last_played: None,
                 icon: None,
+                icon_generation: 0,
                 window: None,
             },
         };
@@ -576,24 +581,57 @@ impl InstanceStore {
     }
 
     pub fn set_builtin_icon(&self, id: &str, name: &str) -> Result<Instance, InstanceError> {
-        let icon = InstanceIcon::Builtin(name.to_string());
-        let inst = self.update(id, |config| config.icon = Some(icon))?;
-        remove_icon_file(&inst.dir)?;
-        Ok(inst)
+        self.write_icon(
+            id,
+            Some(InstanceIcon::Builtin(name.to_string())),
+            None,
+            false,
+        )
     }
 
-    /// Crops `src` (png, jpeg or webp, at most 8 MiB) to a centered square,
-    /// scales it to 128x128 and stores it as the instance's `icon.png`.
+    /// Crops a user-selected raster to the existing square custom-icon format.
     pub fn set_custom_icon(&self, id: &str, src: &Path) -> Result<Instance, InstanceError> {
-        let dir = self.load(id)?.dir;
+        self.load(id)?;
         let png = render_icon(src)?;
-        write_atomic(&dir.join(ICON_FILE), &png)?;
-        self.update(id, |config| config.icon = Some(InstanceIcon::Custom))
+        self.write_icon(id, Some(InstanceIcon::Custom), Some(&png), false)
     }
 
     pub fn clear_icon(&self, id: &str) -> Result<Instance, InstanceError> {
-        let inst = self.update(id, |config| config.icon = None)?;
-        remove_icon_file(&inst.dir)?;
+        self.write_icon(id, None, None, false)
+    }
+
+    pub(crate) fn set_project_icon_if_unset(
+        &self,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<Instance, InstanceError> {
+        validate_project_icon(bytes)?;
+        self.write_icon(id, Some(InstanceIcon::Custom), Some(bytes), true)
+    }
+
+    fn write_icon(
+        &self,
+        id: &str,
+        icon: Option<InstanceIcon>,
+        bytes: Option<&[u8]>,
+        automatic: bool,
+    ) -> Result<Instance, InstanceError> {
+        let dir = self.load(id)?.dir;
+        let _lock = lock_config(&dir)?;
+        let mut inst = self.read(id)?;
+        if automatic && (inst.config.icon.is_some() || inst.config.icon_generation != 0) {
+            return Ok(inst);
+        }
+        if let Some(bytes) = bytes {
+            write_atomic(&dir.join(ICON_FILE), bytes)?;
+        } else {
+            remove_icon_file(&dir)?;
+        }
+        inst.config.icon = icon;
+        if !automatic {
+            inst.config.icon_generation = inst.config.icon_generation.saturating_add(1);
+        }
+        self.save(&inst)?;
         Ok(inst)
     }
 
@@ -650,7 +688,7 @@ impl InstanceStore {
 /// [`InstanceStore::update`]), waiting while someone else holds it: every
 /// holder only reads, changes and writes one small file. Released when the
 /// returned file is dropped.
-fn lock_config(dir: &Path) -> Result<std::fs::File, InstanceError> {
+pub(crate) fn lock_config(dir: &Path) -> Result<std::fs::File, InstanceError> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -666,6 +704,30 @@ fn remove_icon_file(dir: &Path) -> Result<(), InstanceError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+fn validate_project_icon(bytes: &[u8]) -> Result<(), InstanceError> {
+    let bad = || {
+        InstanceError::InvalidIcon(rust_i18n::t!("errors.instance.icon_reason.decode").to_string())
+    };
+    if bytes.len() > 1024 * 1024 {
+        return Err(bad());
+    }
+    let format = image::guess_format(bytes).map_err(|_| bad())?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
+    ) {
+        return Err(bad());
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(|_| bad())?;
+    Ok(())
 }
 
 fn render_icon(src: &Path) -> Result<Vec<u8>, InstanceError> {
@@ -1413,5 +1475,57 @@ mod tests {
             Err(InstanceError::NotBroken(_))
         ));
         assert!(good.dir.is_dir());
+    }
+}
+
+#[cfg(test)]
+mod project_icon_tests {
+    use super::*;
+    fn logo() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(40, 20)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+    #[test]
+    fn late_project_artwork_never_overwrites_custom_or_explicit_default() {
+        let root = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(root.path());
+        let i = store.create("Icon", "1.20.1").unwrap();
+        store.set_builtin_icon(&i.id, "sword").unwrap();
+        store.set_project_icon_if_unset(&i.id, &logo()).unwrap();
+        assert_eq!(
+            store.load(&i.id).unwrap().config.icon,
+            Some(InstanceIcon::Builtin("sword".into()))
+        );
+        store.clear_icon(&i.id).unwrap();
+        store.set_project_icon_if_unset(&i.id, &logo()).unwrap();
+        assert!(store.load(&i.id).unwrap().config.icon.is_none());
+        assert!(!i.dir.join(ICON_FILE).exists());
+        let custom = root.path().join("custom.png");
+        std::fs::write(&custom, logo()).unwrap();
+        store.set_custom_icon(&i.id, &custom).unwrap();
+        let before = std::fs::read(i.dir.join(ICON_FILE)).unwrap();
+        store.set_project_icon_if_unset(&i.id, &logo()).unwrap();
+        assert_eq!(std::fs::read(i.dir.join(ICON_FILE)).unwrap(), before);
+    }
+    #[test]
+    fn project_artwork_rejects_bad_or_oversize_decodes_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = InstanceStore::new(root.path());
+        let i = store.create("Icon", "1.20.1").unwrap();
+        assert!(store.set_project_icon_if_unset(&i.id, b"invalid").is_err());
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2049, 1)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            store
+                .set_project_icon_if_unset(&i.id, &out.into_inner())
+                .is_err()
+        );
+        assert!(store.load(&i.id).unwrap().config.icon.is_none());
+        assert!(!i.dir.join(ICON_FILE).exists());
     }
 }

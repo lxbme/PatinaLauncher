@@ -604,7 +604,7 @@ impl Render for VersionsTab {
 
 /// What a version change ended with.
 enum Changed {
-    Done(OpOutcome),
+    Done(Box<OpOutcome>),
     /// The loader does not support the new Minecraft version.
     Incompatible {
         mc: String,
@@ -655,7 +655,7 @@ fn start(
 fn done(
     future: BoxFuture<'static, Result<OpOutcome, LoaderError>>,
 ) -> BoxFuture<'static, Result<Changed, LoaderError>> {
-    async move { future.await.map(Changed::Done) }.boxed()
+    async move { future.await.map(|outcome| Changed::Done(Box::new(outcome))) }.boxed()
 }
 
 /// Installs `version` of loader `kind` into `id`; `replace` allows
@@ -709,7 +709,7 @@ fn change_mc(
                     .set_mc_version(target, mc.clone(), action, progress)
                     .await
                 {
-                    Ok(outcome) => Ok(Changed::Done(outcome)),
+                    Ok(outcome) => Ok(Changed::Done(Box::new(outcome))),
                     // Only asked when nothing was decided yet.
                     Err(LoaderError::Incompatible {
                         kind,

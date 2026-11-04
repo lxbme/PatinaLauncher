@@ -376,3 +376,39 @@ async fn curseforge_project_details_keep_author_and_original_links() {
     );
     assert_eq!(project.support_urls(), ["https://example.org/issues"]);
 }
+
+#[tokio::test]
+async fn modpack_versions_keep_cross_minecraft_candidates_without_cf_fallback() {
+    let server = MockServer::start().await;
+    get(&server,"/project/p",json!({"id":"p","slug":"pack","title":"Pack","description":"Pack","body":"Pack","project_type":"modpack","team":"t","client_side":"required","donation_urls":[]})).await;
+    get(&server, "/team/t/members", json!([])).await;
+    let mut next = mr_version("next", "release");
+    next["game_versions"] = json!(["1.20.1"]);
+    get(
+        &server,
+        "/project/p/version",
+        json!([mr_version("current", "release"), next]),
+    )
+    .await;
+    let catalogs =
+        ContentCatalogs::with_endpoints(&server.uri(), &format!("{}/cf", server.uri()), None)
+            .unwrap();
+    let versions = catalogs
+        .pack_versions(ProjectRef::new(Platform::Modrinth, "p"))
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 2);
+    assert!(versions.iter().any(|v| v.game_versions() == ["1.20.1"]));
+    assert!(
+        catalogs
+            .pack_versions(ProjectRef::new(Platform::CurseForge, "p"))
+            .await
+            .is_err()
+    );
+    for request in server.received_requests().await.unwrap() {
+        assert!(!request.url.path().starts_with("/cf"));
+        if request.url.path().ends_with("/version") {
+            assert!(request.url.query().is_none());
+        }
+    }
+}

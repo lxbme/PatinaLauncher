@@ -16,7 +16,12 @@ pub enum Phase {
     /// Verifying the game's files (client jar, assets) and downloading only
     /// the missing or damaged ones; on an installed game, mostly checking.
     DownloadGameFiles,
+    ExtractNatives,
+    PrepareGameDirectory,
     DownloadContent,
+    DownloadPackArchive,
+    InspectPackArchive,
+    VerifyPackFiles,
     DownloadInstaller,
     DownloadLibraries,
     RunProcessor,
@@ -32,8 +37,13 @@ impl Phase {
             Phase::FetchMetadata => t!("progress.phase.fetch_metadata"),
             Phase::DownloadRuntime => t!("progress.phase.download_runtime"),
             Phase::DownloadAssetIndex => t!("progress.phase.download_asset_index"),
-            Phase::DownloadGameFiles => t!("progress.phase.check_game_files"),
+            Phase::DownloadGameFiles => t!("progress.phase.prepare_game_files"),
+            Phase::ExtractNatives => t!("progress.phase.extract_natives"),
+            Phase::PrepareGameDirectory => t!("progress.phase.prepare_game_directory"),
             Phase::DownloadContent => t!("progress.phase.download_content"),
+            Phase::DownloadPackArchive => t!("progress.phase.download_pack_archive"),
+            Phase::InspectPackArchive => t!("progress.phase.inspect_pack_archive"),
+            Phase::VerifyPackFiles => t!("progress.phase.verify_pack_files"),
             Phase::DownloadInstaller => t!("progress.phase.download_installer"),
             Phase::DownloadLibraries => t!("progress.phase.download_libraries"),
             Phase::RunProcessor => t!("progress.phase.run_processor"),
@@ -51,12 +61,13 @@ pub enum Unit {
     Bytes,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskProgress {
     pub phase: Phase,
     pub done: u64,
     pub total: u64,
     pub unit: Unit,
+    pub activity: Option<std::sync::Arc<crate::download::TransferSnapshot>>,
 }
 
 /// Receives progress; `None` discards it.
@@ -69,6 +80,7 @@ pub(crate) fn report(sink: &ProgressSink, phase: Phase, done: u64, total: u64, u
             done,
             total,
             unit,
+            activity: None,
         });
     }
 }
@@ -103,6 +115,7 @@ impl Forwarder {
             done,
             total,
             unit: self.unit,
+            activity: None,
         })
     }
 
@@ -139,14 +152,53 @@ pub(crate) async fn run_downloads(
     unit: Unit,
     extra_items: u64,
 ) -> Result<(), DownloadError> {
+    run_downloads_inner(
+        dl,
+        jobs.into_iter().map(|job| (job, Vec::new())).collect(),
+        sink,
+        phase,
+        unit,
+        extra_items,
+        None,
+    )
+    .await
+}
+
+/// Same shared scheduler/progress path, with author candidates and hard actual-byte bounds.
+pub(crate) async fn run_bounded_downloads(
+    dl: &Downloader,
+    jobs: Vec<(DownloadJob, Vec<String>)>,
+    sink: &ProgressSink,
+    phase: Phase,
+    limits: (u64, u64),
+) -> Result<(), DownloadError> {
+    run_downloads_inner(dl, jobs, sink, phase, Unit::Bytes, 0, Some(limits)).await
+}
+
+async fn run_downloads_inner(
+    dl: &Downloader,
+    jobs: Vec<(DownloadJob, Vec<String>)>,
+    sink: &ProgressSink,
+    phase: Phase,
+    unit: Unit,
+    extra_items: u64,
+    limits: Option<(u64, u64)>,
+) -> Result<(), DownloadError> {
     let Some(out) = sink else {
-        return dl.run(jobs, None).await;
+        return match limits {
+            Some(limits) => dl.run_bounded_candidates(jobs, None, limits).await,
+            None => {
+                dl.run(jobs.into_iter().map(|(job, _)| job).collect(), None)
+                    .await
+            }
+        };
     };
     let initial_total = match unit {
         Unit::Items => jobs.len() as u64 + extra_items,
         Unit::Bytes => {
             let mut seen = std::collections::HashSet::new();
             jobs.iter()
+                .map(|(job, _)| job)
                 .filter(|j| match dest_key(&j.dest) {
                     Ok(k) => seen.insert(k),
                     Err(_) => true,
@@ -158,19 +210,49 @@ pub(crate) async fn run_downloads(
     let mut fwd = Forwarder::new(phase, unit, initial_total, extra_items);
     report(sink, phase, 0, initial_total, unit);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
-    let run = dl.run(jobs, Some(tx));
+    let (activity_tx, mut activity_rx) = tokio::sync::watch::channel(std::sync::Arc::new(
+        crate::download::TransferSnapshot::default(),
+    ));
+    let run = dl.run_observed(jobs, Some(tx), limits, activity_tx);
+    let mut last_sent = None;
+    let mut send = |t: TaskProgress| {
+        if last_sent.as_ref() != Some(&t) {
+            let _ = out.send(t.clone());
+            last_sent = Some(t);
+        }
+    };
     let forward = async {
-        while let Some(p) = rx.recv().await {
-            if let Some(t) = fwd.tick(p) {
-                let _ = out.send(t);
+        let mut summary_open = true;
+        let mut activity_open = true;
+        while summary_open || activity_open {
+            tokio::select! {
+                p=rx.recv(), if summary_open => {
+                    if let Some(p)=p {
+                        if let Some(mut t)=fwd.tick(p) { t.activity=Some(activity_rx.borrow().clone()); send(t); }
+                    } else { summary_open=false; }
+                }
+                change=activity_rx.changed(), if activity_open => {
+                    if change.is_err(){activity_open=false;} else {
+                        send(TaskProgress{phase,done:fwd.last.0,total:fwd.last.1,unit,activity:Some(activity_rx.borrow_and_update().clone())});
+                    }
+                }
             }
         }
     };
     let (res, ()) = tokio::join!(run, forward);
+    // A fresh empty snapshot also clears any last coalesced row on success/failure.
+    send(TaskProgress {
+        phase,
+        done: fwd.last.0,
+        total: fwd.last.1,
+        unit,
+        activity: Some(activity_rx.borrow().clone()),
+    });
     if res.is_ok()
-        && let Some(t) = fwd.finish()
+        && let Some(mut t) = fwd.finish()
     {
-        let _ = out.send(t);
+        t.activity = Some(activity_rx.borrow().clone());
+        send(t);
     }
     res
 }
@@ -185,12 +267,12 @@ mod tests {
         let _g = locale_lock();
         set_language(Language::ZhCn);
         assert_eq!(Phase::FetchMetadata.display_name(), "正在获取版本信息");
-        assert_eq!(Phase::DownloadGameFiles.display_name(), "正在检查游戏文件");
+        assert_eq!(Phase::DownloadGameFiles.display_name(), "正在准备游戏文件");
         assert_eq!(Phase::DownloadContent.display_name(), "正在下载内容");
         set_language(Language::En);
         assert_eq!(
             Phase::DownloadGameFiles.display_name(),
-            "Checking game files"
+            "Preparing game files"
         );
         assert_eq!(Phase::FetchMetadata.display_name(), "Fetching version info");
         assert_eq!(Phase::Launching.display_name(), "Launching game");
@@ -248,6 +330,72 @@ mod tests {
 
     mod run {
         use super::*;
+
+        #[tokio::test]
+        async fn file_activity_keeps_parallel_identity_and_excludes_cached_bytes_from_network() {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut jobs = Vec::new();
+            for name in ["alpha", "beta"] {
+                Mock::given(path(format!("/{name}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(b"hello")
+                            .set_delay(Duration::from_millis(200)),
+                    )
+                    .mount(&server)
+                    .await;
+                jobs.push(DownloadJob {
+                    url: format!("{}/{name}", server.uri()),
+                    dest: dir.path().join(name),
+                    sha1: Some(hex::encode(Sha1::digest(b"hello"))),
+                    size: None,
+                });
+            }
+            let dl =
+                Downloader::new(reqwest::Client::new(), Mirror::official()).with_concurrency(2);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            run_downloads(
+                &dl,
+                jobs.clone(),
+                &Some(tx),
+                Phase::DownloadContent,
+                Unit::Items,
+                0,
+            )
+            .await
+            .unwrap();
+            let ticks = collect(rx);
+            let snapshots: Vec<_> = ticks.iter().filter_map(|p| p.activity.as_deref()).collect();
+            assert!(
+                snapshots.iter().any(|s| s.files.len() == 2),
+                "both parallel files need independent activity"
+            );
+            let parallel = snapshots.iter().find(|s| s.files.len() == 2).unwrap();
+            assert_ne!(parallel.files[0].id, parallel.files[1].id);
+            assert!(
+                snapshots
+                    .iter()
+                    .any(|s| s.files.iter().any(|f| f.total_bytes.is_none()))
+            );
+            let last = snapshots.last().unwrap();
+            assert!(last.files.is_empty(), "completed rows must be removed");
+            assert_eq!(last.network_bytes, 10);
+            assert_eq!(last.bytes_per_second, 0);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            run_downloads(&dl, jobs, &Some(tx), Phase::DownloadContent, Unit::Items, 0)
+                .await
+                .unwrap();
+            let cached = collect(rx);
+            assert!(
+                cached
+                    .iter()
+                    .filter_map(|p| p.activity.as_ref())
+                    .all(|s| s.network_bytes == 0 && s.bytes_per_second == 0)
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+
         use crate::download::Mirror;
         use sha1::{Digest, Sha1};
         use std::time::Duration;
@@ -367,8 +515,125 @@ mod tests {
             )
             .await
             .unwrap();
-            let last = *collect(rx).last().unwrap();
+            let last = collect(rx).last().unwrap().clone();
             assert!(last.done > 0 && last.done == last.total, "{last:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod activity_lifecycle_tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    #[tokio::test]
+    async fn aborting_observed_run_removes_all_active_rows() {
+        let server = MockServer::start().await;
+        Mock::given(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"slow")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let job = DownloadJob {
+            url: format!("{}/slow", server.uri()),
+            dest: dir.path().join("slow"),
+            sha1: None,
+            size: None,
+        };
+        let (tx, mut rx) =
+            tokio::sync::watch::channel(Arc::new(crate::download::TransferSnapshot::default()));
+        let run = tokio::spawn(async move {
+            Downloader::new(reqwest::Client::new(), crate::download::Mirror::official())
+                .run_observed(vec![(job, vec![])], None, None, tx)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.borrow().files.is_empty() {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        assert!(
+            rx.borrow().files.is_empty(),
+            "aborted run cannot leave a ghost row"
+        );
+        assert_eq!(rx.borrow().bytes_per_second, 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod observed_retry_tests {
+    use super::*;
+    use crate::download::{FileActivityState, Mirror};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    #[tokio::test]
+    async fn retry_snapshot_keeps_one_file_and_never_counts_cache_as_network() {
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        Mock::given(path("/retry"))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"hello")
+                }
+            })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dl = Downloader::new(reqwest::Client::new(), Mirror::official())
+            .with_retry(2, Duration::from_millis(150));
+        run_downloads(
+            &dl,
+            vec![DownloadJob {
+                url: format!("{}/retry", server.uri()),
+                dest: dir.path().join("retry"),
+                sha1: None,
+                size: None,
+            }],
+            &Some(tx),
+            Phase::DownloadContent,
+            Unit::Bytes,
+            0,
+        )
+        .await
+        .unwrap();
+        let mut retry = false;
+        let mut ids = std::collections::HashSet::new();
+        let mut last = None;
+        while let Ok(p) = rx.try_recv() {
+            if let Some(snapshot) = p.activity {
+                for file in &snapshot.files {
+                    ids.insert(file.id.clone());
+                    if file.state == FileActivityState::Retrying {
+                        retry = true;
+                        assert_eq!(file.done_bytes, 0);
+                    }
+                }
+                last = Some(snapshot);
+            }
+        }
+        assert!(retry);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(last.as_ref().unwrap().network_bytes, 5);
+        assert!(last.unwrap().files.is_empty());
     }
 }

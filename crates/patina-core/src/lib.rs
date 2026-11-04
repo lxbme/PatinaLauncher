@@ -18,6 +18,7 @@ pub mod launch;
 pub mod loader;
 pub mod locks;
 pub mod meta;
+pub mod modpack;
 pub mod paths;
 pub mod platform;
 pub mod prepare;

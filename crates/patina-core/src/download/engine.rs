@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 
 use super::Mirror;
+use super::activity::{ActivityTracker, FileActivityState, FileGuard, TransferSnapshot};
 use crate::fsutil::{path_key, unique_part_path};
 
 #[derive(Clone, Debug)]
@@ -70,6 +71,8 @@ pub enum FailReason {
     Io(String),
     /// No candidate URL was tried.
     NoAttempt,
+    /// A bounded run exceeded its per-file or aggregate actual-byte budget.
+    Limit,
 }
 
 impl std::fmt::Display for FailReason {
@@ -91,6 +94,7 @@ impl std::fmt::Display for FailReason {
             FailReason::Network(e) => t!("errors.download.reason.network", error = e),
             FailReason::Io(e) => t!("errors.download.reason.io", error = e),
             FailReason::NoAttempt => t!("errors.download.reason.no_attempt"),
+            FailReason::Limit => t!("errors.download.reason.limit"),
         };
         f.write_str(&s)
     }
@@ -101,6 +105,7 @@ impl std::fmt::Display for FailReason {
 /// statuses rank with 5xx.
 fn rank(r: &FailReason) -> u8 {
     match r {
+        FailReason::Limit => 8,
         FailReason::HashMismatch { .. } => 7,
         FailReason::SizeMismatch { .. } => 6,
         FailReason::Http(s) if (400..500).contains(s) => 5,
@@ -154,7 +159,7 @@ pub fn sha1_file(path: &Path) -> io::Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -225,15 +230,20 @@ fn signed(n: u64) -> i64 {
 
 /// The progress of one [`Downloader::run`].
 struct RunProgress {
-    tx: tokio::sync::mpsc::UnboundedSender<Progress>,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
     state: Mutex<(Progress, Option<Instant>)>,
+    limits: Option<(u64, u64)>,
+    received: AtomicU64,
+    activity: Option<ActivityTracker>,
 }
 
 impl RunProgress {
     fn new(
-        tx: tokio::sync::mpsc::UnboundedSender<Progress>,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
         total: usize,
         bytes_total: u64,
+        limits: Option<(u64, u64)>,
+        activity: Option<tokio::sync::watch::Sender<Arc<TransferSnapshot>>>,
     ) -> Self {
         let p = Progress {
             done: 0,
@@ -244,7 +254,25 @@ impl RunProgress {
         Self {
             tx,
             state: Mutex::new((p, None)),
+            limits,
+            received: AtomicU64::new(0),
+            activity: activity.map(ActivityTracker::new),
         }
+    }
+
+    // Failed attempts remain charged: a bounded run cannot consume unbounded retry bytes.
+    fn receive(&self, file_received: u64, bytes: u64) -> Result<(), FailReason> {
+        if let Some((file, total)) = self.limits {
+            if file_received > file {
+                return Err(FailReason::Limit);
+            }
+            self.received
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    old.checked_add(bytes).filter(|next| *next <= total)
+                })
+                .map_err(|_| FailReason::Limit)?;
+        }
+        Ok(())
     }
 
     /// Adds `delta` bytes received (negative: rolled back after a failed
@@ -254,7 +282,9 @@ impl RunProgress {
         s.0.bytes_done = s.0.bytes_done.saturating_add_signed(delta);
         if s.1.is_none_or(|t| t.elapsed() >= BYTE_PROGRESS_INTERVAL) {
             s.1 = Some(Instant::now());
-            let _ = self.tx.send(s.0);
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(s.0);
+            }
         }
     }
 
@@ -264,7 +294,9 @@ impl RunProgress {
         s.0.done += files;
         s.0.bytes_done = s.0.bytes_done.saturating_add_signed(delta);
         s.1 = Some(Instant::now());
-        let _ = self.tx.send(s.0);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(s.0);
+        }
     }
 }
 
@@ -358,6 +390,15 @@ impl Downloader {
         self
     }
 
+    /// Copy scheduling/retry settings without changing the caller's HTTP or source policy.
+    pub(crate) fn with_transfer_settings(mut self, source: &Self) -> Self {
+        self.concurrency = source.concurrency;
+        self.attempts = source.attempts;
+        self.base_delay = source.base_delay;
+        self.throughput_window = source.throughput_window;
+        self
+    }
+
     pub fn mirror(&self) -> &Mirror {
         &self.mirror
     }
@@ -400,6 +441,42 @@ impl Downloader {
         jobs: Vec<DownloadJob>,
         progress: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
     ) -> Result<(), DownloadError> {
+        self.run_inner(
+            jobs.into_iter().map(|job| (job, Vec::new())).collect(),
+            progress,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Uses only the supplied, caller-validated candidates; never expands them through mirrors.
+    pub(crate) async fn run_bounded_candidates(
+        &self,
+        jobs: Vec<(DownloadJob, Vec<String>)>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
+        limits: (u64, u64),
+    ) -> Result<(), DownloadError> {
+        self.run_inner(jobs, progress, Some(limits), None).await
+    }
+
+    pub(crate) async fn run_observed(
+        &self,
+        jobs: Vec<(DownloadJob, Vec<String>)>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
+        limits: Option<(u64, u64)>,
+        activity: tokio::sync::watch::Sender<Arc<TransferSnapshot>>,
+    ) -> Result<(), DownloadError> {
+        self.run_inner(jobs, progress, limits, Some(activity)).await
+    }
+
+    async fn run_inner(
+        &self,
+        jobs: Vec<(DownloadJob, Vec<String>)>,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<Progress>>,
+        limits: Option<(u64, u64)>,
+        activity: Option<tokio::sync::watch::Sender<Arc<TransferSnapshot>>>,
+    ) -> Result<(), DownloadError> {
         let total = jobs.len();
         if total == 0 {
             return Ok(());
@@ -409,30 +486,38 @@ impl Downloader {
         // sha1, are dropped) and credit each duplicate when its
         // representative finishes.
         let mut index: HashMap<PathBuf, usize> = HashMap::new();
-        let mut unique: Vec<(DownloadJob, PathBuf, usize)> = Vec::new();
-        for job in jobs {
+        let mut unique: Vec<(DownloadJob, PathBuf, usize, Vec<String>)> = Vec::new();
+        for (job, alternatives) in jobs {
             let key = dest_key(&job.dest)?;
             match index.get(&key) {
                 Some(&i) => unique[i].2 += 1,
                 None => {
                     index.insert(key.clone(), unique.len());
-                    unique.push((job, key, 1));
+                    unique.push((job, key, 1, alternatives));
                 }
             }
         }
         let bytes_total = unique.iter().filter_map(|(j, ..)| j.size).sum();
-        let tracker = progress.map(|tx| RunProgress::new(tx, total, bytes_total));
+        let tracker = (progress.is_some() || limits.is_some() || activity.is_some())
+            .then(|| RunProgress::new(progress, total, bytes_total, limits, activity));
         let tracker = tracker.as_ref();
         let mut results = futures::stream::iter(unique)
-            .map(|(job, key, weight)| async move {
-                let credit = self.run_job(&job, key, tracker).await?;
+            .map(|(job, key, weight, alternatives)| async move {
+                let credit = self.run_job(&job, &alternatives, key, tracker).await?;
                 Ok::<_, DownloadError>((weight, credit))
             })
             .buffer_unordered(self.concurrency);
         // Returning early on the first error drops the stream and cancels the rest.
-        while let Some((weight, credit)) = results.try_next().await? {
-            if let Some(t) = tracker {
-                t.finish(weight, credit);
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                result = results.try_next() => {
+                    let Some((weight, credit)) = result? else { break };
+                    if let Some(t) = tracker { t.finish(weight, credit); }
+                }
+                _ = heartbeat.tick(), if tracker.is_some_and(|t| t.activity.is_some()) => {
+                    if let Some(activity) = tracker.and_then(|t|t.activity.as_ref()) { activity.heartbeat(); }
+                }
             }
         }
         Ok(())
@@ -453,23 +538,48 @@ impl Downloader {
     async fn run_job(
         &self,
         job: &DownloadJob,
+        alternatives: &[String],
         key: PathBuf,
         progress: Option<&RunProgress>,
     ) -> Result<i64, DownloadError> {
-        let _lock = lock_dest(key).await;
+        let _lock = lock_dest(key.clone()).await;
+        let activity = progress
+            .and_then(|p| p.activity.as_ref())
+            .map(|p| p.file(job, key));
+        if let Some((max, _)) = progress.and_then(|p| p.limits)
+            && tokio::fs::metadata(&job.dest)
+                .await
+                .is_ok_and(|m| m.len() > max)
+        {
+            return Err(DownloadError::Failed {
+                url: job.url.clone(),
+                reason: FailReason::Limit,
+            });
+        }
         if Self::existing_ok(job).await {
+            if let Some(progress) = progress {
+                let len = tokio::fs::metadata(&job.dest).await?.len();
+                progress
+                    .receive(len, len)
+                    .map_err(|reason| DownloadError::Failed {
+                        url: job.url.clone(),
+                        reason,
+                    })?;
+            }
             return Ok(job.size.map_or(0, signed));
         }
         if let Some(parent) = job.dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let got = self
-            .fetch(
+            .fetch_candidates(
                 &job.url,
+                alternatives,
                 job.sha1.as_deref(),
                 job.size,
                 Some(&job.dest),
                 progress,
+                activity.as_ref(),
             )
             .await?;
         if let Some(mut part) = got.part {
@@ -519,13 +629,44 @@ impl Downloader {
         dest: Option<&Path>,
         progress: Option<&RunProgress>,
     ) -> Result<Fetched, DownloadError> {
+        self.fetch_candidates(url, &[], sha1, size, dest, progress, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_candidates(
+        &self,
+        url: &str,
+        alternatives: &[String],
+        sha1: Option<&str>,
+        size: Option<u64>,
+        dest: Option<&Path>,
+        progress: Option<&RunProgress>,
+        activity: Option<&FileGuard<'_>>,
+    ) -> Result<Fetched, DownloadError> {
         let mut reason = FailReason::NoAttempt;
-        let candidates = self.candidates(url);
+        let restricted = progress.is_some_and(|p| p.limits.is_some());
+        let mut candidates = Vec::new();
+        for source in std::iter::once(url).chain(alternatives.iter().map(String::as_str)) {
+            let expanded = if restricted {
+                vec![source.to_string()]
+            } else {
+                self.candidates(source)
+            };
+            for candidate in expanded {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
         let last = candidates.len().saturating_sub(1);
         for (i, cand) in candidates.iter().enumerate() {
             for n in 1..=self.attempts {
                 let cutoff = i < last || n < self.attempts;
-                match self.attempt(cand, sha1, size, dest, progress, cutoff).await {
+                match self
+                    .attempt(cand, sha1, size, dest, progress, cutoff, activity)
+                    .await
+                {
                     Ok(got) => {
                         if i > 0 {
                             self.record_fallback(url, cand);
@@ -533,6 +674,12 @@ impl Downloader {
                         return Ok(got);
                     }
                     Err(e) => {
+                        if matches!(e, FailReason::Http(429) | FailReason::Limit) {
+                            return Err(DownloadError::Failed {
+                                url: url.to_string(),
+                                reason: e,
+                            });
+                        }
                         // Wrong content will not change on retry; a crawling
                         // source is left for the next candidate, if any.
                         let final_for_candidate = match e {
@@ -545,6 +692,9 @@ impl Downloader {
                         }
                         if final_for_candidate {
                             break;
+                        }
+                        if let Some(a) = activity {
+                            a.state(FileActivityState::Retrying, size);
                         }
                         if n < self.attempts {
                             tokio::time::sleep(self.base_delay * n).await;
@@ -582,6 +732,7 @@ impl Downloader {
     /// (removed when the attempt fails) or kept in memory. Bytes it credited
     /// to `progress` are taken back when it fails. `cutoff` enables the
     /// minimum-throughput check.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
         url: &str,
@@ -590,6 +741,7 @@ impl Downloader {
         dest: Option<&Path>,
         progress: Option<&RunProgress>,
         cutoff: bool,
+        activity: Option<&FileGuard<'_>>,
     ) -> Result<Fetched, FailReason> {
         let part = dest.map(PartFile::new);
         let window = if cutoff {
@@ -607,6 +759,7 @@ impl Downloader {
                 progress,
                 window,
                 &mut received,
+                activity,
             )
             .await;
         match r {
@@ -632,13 +785,28 @@ impl Downloader {
         progress: Option<&RunProgress>,
         window: Duration,
         received: &mut u64,
+        activity: Option<&FileGuard<'_>>,
     ) -> Result<(Vec<u8>, u64), FailReason> {
         let net = |e: reqwest::Error| FailReason::Network(e.to_string());
         let io = |e: std::io::Error| FailReason::Io(e.to_string());
+        if let Some(a) = activity {
+            a.state(FileActivityState::Connecting, size);
+        }
         let resp = self.client.get(url).send().await.map_err(net)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FailReason::Http(status.as_u16()));
+        }
+        if let Some((max, _)) = progress.and_then(|p| p.limits)
+            && resp.content_length().is_some_and(|n| n > max)
+        {
+            return Err(FailReason::Limit);
+        }
+        if let Some(a) = activity {
+            a.state(
+                FileActivityState::Downloading,
+                resp.content_length().or(size),
+            );
         }
         let mut file = match part {
             Some(p) => Some(tokio::fs::File::create(p).await.map_err(io)?),
@@ -660,10 +828,17 @@ impl Downloader {
             };
             let Some(chunk) = chunk else { break };
             let chunk = chunk.map_err(net)?;
-            *received += chunk.len() as u64;
+            let next = received
+                .checked_add(chunk.len() as u64)
+                .ok_or(FailReason::Limit)?;
             if let Some(p) = progress {
+                p.receive(next, chunk.len() as u64)?;
                 p.bytes(signed(chunk.len() as u64));
             }
+            if let Some(a) = activity {
+                a.bytes(next, chunk.len() as u64);
+            }
+            *received = next;
             hasher.update(&chunk);
             match file.as_mut() {
                 Some(f) => f.write_all(&chunk).await.map_err(io)?,
@@ -1357,5 +1532,125 @@ mod tests {
             dest_key(Path::new("/x/y/../z")).unwrap(),
             path_key(Path::new("/x/z")).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    #[tokio::test]
+    async fn bounded_candidates_never_add_mirror_or_original_fallbacks() {
+        let server = MockServer::start().await;
+        for (route, status) in [("/author", 404), ("/mirror", 200), ("/fallback", 200)] {
+            Mock::given(path(route))
+                .respond_with(ResponseTemplate::new(status).set_body_bytes(b"hello"))
+                .mount(&server)
+                .await;
+        }
+        let author = format!("{}/author", server.uri());
+        let downloader = Downloader::new(
+            reqwest::Client::new(),
+            Mirror {
+                id: "test-primary".into(),
+                rules: vec![(author.clone(), format!("{}/mirror", server.uri()))],
+            },
+        )
+        .with_fallback(Some(Mirror {
+            id: "test-fallback".into(),
+            rules: vec![(author.clone(), format!("{}/fallback", server.uri()))],
+        }))
+        .with_retry(1, Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let job = DownloadJob {
+            url: author,
+            dest: dir.path().join("file"),
+            sha1: Some(hex::encode(Sha1::digest(b"hello"))),
+            size: Some(5),
+        };
+        let result = downloader
+            .run_bounded_candidates(vec![(job, vec![])], None, (8, 8))
+            .await;
+        assert!(
+            result.is_err(),
+            "bounded author candidates must not be expanded through a mirror"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/author");
+        assert!(!dir.path().join("file").exists());
+    }
+
+    #[tokio::test]
+    async fn bounded_run_rejects_actual_bytes_above_file_cap_and_removes_parts() {
+        let server = MockServer::start().await;
+        Mock::given(path("/file"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello"))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file");
+        let downloader = Downloader::new(reqwest::Client::new(), Mirror::official());
+        let job = DownloadJob {
+            url: format!("{}/file", server.uri()),
+            dest: dest.clone(),
+            sha1: Some(hex::encode(Sha1::digest(b"hello"))),
+            size: Some(1),
+        };
+        let error = downloader
+            .run_bounded_candidates(vec![(job, vec![])], None, (4, 8))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DownloadError::Failed {
+                reason: FailReason::Limit,
+                ..
+            }
+        ));
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn concurrent_bounded_run_enforces_shared_actual_byte_cap() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut jobs = vec![];
+        for (ix, body) in [b"hello", b"world"].into_iter().enumerate() {
+            let route = format!("/{ix}");
+            Mock::given(path(route.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+            jobs.push((
+                DownloadJob {
+                    url: format!("{}{route}", server.uri()),
+                    dest: dir.path().join(ix.to_string()),
+                    sha1: Some(hex::encode(Sha1::digest(body))),
+                    size: Some(1),
+                },
+                vec![],
+            ));
+        }
+        let downloader =
+            Downloader::new(reqwest::Client::new(), Mirror::official()).with_concurrency(2);
+        let error = downloader
+            .run_bounded_candidates(jobs, None, (8, 8))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DownloadError::Failed {
+                reason: FailReason::Limit,
+                ..
+            }
+        ));
+        let mut bytes = 0;
+        for file in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            assert!(!file.file_name().to_string_lossy().ends_with(".part"));
+            bytes += file.metadata().unwrap().len();
+        }
+        assert!(bytes <= 8);
     }
 }

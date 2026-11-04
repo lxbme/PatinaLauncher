@@ -389,6 +389,7 @@ pub fn open(window: &mut Window, cx: &mut gpui_kit::App) -> Entity<LoginDialog> 
         // Preserve the default width at 100%, scaling with code/actions at zoom.
         // Dialog still owns viewport clamping and overflow scrolling.
         d.width(rems(28.).to_pixels(window.rem_size()))
+            .overlay_closable(false)
             .title(
                 div()
                     .id("login-title")

@@ -455,6 +455,18 @@ impl Core {
         run(cx, async move { config.read().await.config.clone() })
     }
 
+    /// One immutable settings snapshot for a pack preview/application.
+    pub fn pack_service(
+        cx: &mut App,
+    ) -> Task<Result<patina_core::modpack::PackService, BridgeError>> {
+        let core = Core::global(cx);
+        let config = core.config.clone();
+        let launcher = core.launcher();
+        run(cx, async move {
+            patina_core::modpack::PackService::new(launcher, config.read().await.config.clone())
+        })
+    }
+
     /// Why `config.toml` is not what is in memory, if it is not.
     pub fn config_load_error(
         cx: &mut App,

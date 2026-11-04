@@ -278,7 +278,16 @@ impl Render for AddInstanceFooter {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.form.read(cx).request(cx).is_some();
         let form = self.form.clone();
+        let import_model = self.form.read(cx).model.clone();
         DialogFooter::new()
+            .child(
+                Button::new("add-instance-import-pack")
+                    .label(t!("modpacks.choose_local").to_string())
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        crate::modpacks::open_local(import_model.clone(), window, cx);
+                    }),
+            )
             .child(
                 Button::new("add-instance-cancel")
                     .label(t!("add_instance.cancel").to_string())

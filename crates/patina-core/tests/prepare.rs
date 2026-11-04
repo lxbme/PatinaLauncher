@@ -258,7 +258,10 @@ async fn prepare_reports_phases_in_order() {
         [
             Phase::FetchMetadata,
             Phase::DownloadAssetIndex,
-            Phase::DownloadGameFiles
+            Phase::DownloadGameFiles,
+            Phase::PrepareGameDirectory,
+            Phase::ExtractNatives,
+            Phase::PrepareGameDirectory
         ]
     );
 }
@@ -313,7 +316,10 @@ async fn prepare_reports_runtime_phase_when_not_installed() {
             Phase::FetchMetadata,
             Phase::DownloadRuntime,
             Phase::DownloadAssetIndex,
-            Phase::DownloadGameFiles
+            Phase::DownloadGameFiles,
+            Phase::PrepareGameDirectory,
+            Phase::ExtractNatives,
+            Phase::PrepareGameDirectory
         ]
     );
 }

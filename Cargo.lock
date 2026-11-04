@@ -5423,6 +5423,7 @@ dependencies = [
  "md-5 0.11.0",
  "murmur2",
  "oo7",
+ "percent-encoding",
  "quick-xml 0.42.0",
  "regex",
  "reqwest",

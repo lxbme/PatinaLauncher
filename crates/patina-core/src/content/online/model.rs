@@ -101,6 +101,7 @@ pub struct ContentProject {
     pub(super) url: String,
     pub(super) support_urls: Vec<String>,
     pub(super) client_supported: bool,
+    pub(super) icon_url: Option<String>,
 }
 impl ContentProject {
     pub fn new(
@@ -118,7 +119,15 @@ impl ContentProject {
             url: url.into(),
             support_urls: vec![],
             client_supported: true,
+            icon_url: None,
         }
+    }
+    pub fn with_icon_url(mut self, url: Option<String>) -> Self {
+        self.icon_url = url;
+        self
+    }
+    pub fn icon_url(&self) -> Option<&str> {
+        self.icon_url.as_deref()
     }
     pub fn with_description(mut self, value: impl Into<String>) -> Self {
         self.description = value.into();

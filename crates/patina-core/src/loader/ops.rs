@@ -271,7 +271,7 @@ fn component_uid(kind: LoaderKind) -> ComponentUid {
 /// A version that is already completely installed (another instance uses
 /// it) is reused as it is: no installer is fetched or run and no shared file
 /// is rewritten, unless `force`, which always reinstalls. Touches no instance.
-async fn install_version(
+pub(crate) async fn install_version(
     launcher: &Launcher,
     v: &LoaderVersion,
     vanilla: &VersionJson,
@@ -1357,6 +1357,8 @@ mod tests {
             done,
             total: 1,
             unit: Unit::Items,
+
+            activity: None,
         };
         assert_eq!(events[..2], [meta(0), meta(1)], "{events:?}");
 

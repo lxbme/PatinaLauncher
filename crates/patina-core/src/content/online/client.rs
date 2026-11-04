@@ -191,6 +191,18 @@ impl ContentSource for ContentCatalogs {
             Ok(versions)
         })
     }
+    fn pack_versions(
+        &self,
+        project: ProjectRef,
+    ) -> BoxFuture<'static, Result<Vec<ContentVersion>, OnlineError>> {
+        let api = self.api(project.platform());
+        Box::pin(async move {
+            if project.platform() != Platform::Modrinth {
+                return Err(OnlineError::Unavailable);
+            }
+            super::modrinth::pack_versions(api, project).await
+        })
+    }
     fn version(
         &self,
         platform: Platform,

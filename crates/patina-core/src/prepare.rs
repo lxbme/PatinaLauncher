@@ -96,6 +96,8 @@ impl JsonSource {
 pub enum PrepareError {
     #[error("{}", rust_i18n::t!("errors.prepare.unknown_version", version = .0))]
     UnknownVersion(String),
+    #[error("{0}")]
+    PackNotReady(String),
     #[error("{}", rust_i18n::t!("errors.prepare.java_too_old", required = .required, found = .found))]
     JavaTooOld { required: u32, found: u32 },
     #[error("{}", rust_i18n::t!("errors.prepare.java_not_found", path = .0.display()))]
@@ -167,6 +169,18 @@ fn json_as(what: JsonSource) -> impl FnOnce(serde_json::Error) -> PrepareError {
 pub struct Prepared {
     pub command: LaunchCommand,
     pub warnings: Vec<PrepareWarning>,
+}
+
+struct PreparedResources {
+    data: DataDirs,
+    game_dir: PathBuf,
+    natives_dir: PathBuf,
+    version: VersionJson,
+    java: JavaInstall,
+    classpath: Vec<PathBuf>,
+    layout: crate::resolve::AssetLayout,
+    logging_config: Option<PathBuf>,
+    env: RuleEnv,
 }
 
 pub struct Launcher {
@@ -395,25 +409,32 @@ impl Launcher {
         }
     }
 
-    pub async fn prepare(
+    /// Downloads and verifies game/loader resources without constructing a launch identity
+    /// or command. Used by pack installation; does not mark a pending pack ready.
+    pub async fn prepare_resources(
         &self,
         inst: &Instance,
         global: &GlobalConfig,
-        account: &LaunchAccount,
         progress: ProgressSink,
-    ) -> Result<Prepared, PrepareError> {
+    ) -> Result<(), PrepareError> {
+        self.resources(inst, global, progress).await.map(drop)
+    }
+
+    async fn resources(
+        &self,
+        inst: &Instance,
+        global: &GlobalConfig,
+        progress: ProgressSink,
+    ) -> Result<PreparedResources, PrepareError> {
         // The game runs with cwd = game dir, so every path must be absolute.
         let data =
             DataDirs::new(std::path::absolute(self.data.root()).map_err(io_at(&self.data.root()))?);
         let game_dir = std::path::absolute(inst.game_dir()).map_err(io_at(&inst.game_dir()))?;
         let natives_dir =
             std::path::absolute(inst.natives_dir()).map_err(io_at(&inst.natives_dir()))?;
-        let mut warnings = Vec::new();
 
         // 1. Settings and version metadata.
         let js = effective_java(&global.java, &inst.config);
-        validate_extra_jvm_args(&js.extra_jvm_args)?;
-        let extra_jvm_args = split_args(&js.extra_jvm_args);
         // The client jar is keyed on the requested id, the same id
         // `ensure_version` caches the JSON under (may differ from `version.id`).
         let jar_id = inst.config.mc_version();
@@ -428,39 +449,6 @@ impl Launcher {
         let java = self
             .select_java(js.java_path.as_deref(), &version, &progress)
             .await?;
-
-        // 3. Memory.
-        let max = match (js.max_mem_mib, platform::total_memory_mib()) {
-            (Some(m), _) => m,
-            (None, Some(total)) => js.effective_max_mem(total),
-            (None, None) => UNKNOWN_TOTAL_MAX_MEM_MIB,
-        };
-        let max_mem_mib = clamp_for_arch(max, java.is_64bit);
-        let min_mem_mib = js.min_mem_mib.min(max_mem_mib);
-        if js.low_mem_warning
-            && let Some(available) = platform::available_memory_mib()
-            && let MemoryCheck::Low {
-                requested_mib,
-                available_mib,
-            } = check_available_memory(min_mem_mib, max_mem_mib, available)
-        {
-            warnings.push(PrepareWarning::LowMemory {
-                requested_mib,
-                available_mib,
-            });
-        }
-
-        // 4. GC arguments.
-        let gc_args = if js.gc_preset.is_compatible(java.major) {
-            js.gc_preset.args(java.major)
-        } else {
-            let w = PrepareWarning::GcPresetIgnored {
-                preset: js.gc_preset,
-                java_major: java.major,
-            };
-            warnings.push(w);
-            Vec::new()
-        };
 
         // 5. Downloads. The asset index must be on disk before its objects are known.
         let assets_dir = data.assets();
@@ -525,6 +513,8 @@ impl Launcher {
             0,
         )
         .await?;
+        let post_started = std::time::Instant::now();
+        report(&progress, Phase::PrepareGameDirectory, 0, 1, Unit::Items);
         let vanilla_jar = self.client_jar_job(jar_id, &version)?.dest;
         let client_jar = if inst.config.loader().is_some() {
             let (versions, id) = (data.versions(), version.id.clone());
@@ -539,12 +529,25 @@ impl Launcher {
             vanilla_jar
         };
 
+        tracing::info!(
+            elapsed_ms = post_started.elapsed().as_millis(),
+            "loader client JAR preparation complete"
+        );
         // 6. Natives, legacy asset layout, game directory.
+        report(&progress, Phase::ExtractNatives, 0, 1, Unit::Items);
+        let native_started = std::time::Instant::now();
         let natives = libs.natives;
         let dest = natives_dir.clone();
         tokio::task::spawn_blocking(move || extract_natives(&natives, &dest))
             .await?
             .map_err(io_at(&natives_dir))?;
+        tracing::info!(
+            elapsed_ms = native_started.elapsed().as_millis(),
+            "native extraction complete"
+        );
+        report(&progress, Phase::ExtractNatives, 1, 1, Unit::Items);
+        report(&progress, Phase::PrepareGameDirectory, 0, 1, Unit::Items);
+        let layout_started = std::time::Instant::now();
         let layout = asset_layout(&index, &ai.id, &assets_dir, &game_dir);
         let (index_owned, assets, lay) = (index.clone(), assets_dir.clone(), layout.clone());
         tokio::task::spawn_blocking(move || materialize_legacy(&index_owned, &assets, &lay))
@@ -552,9 +555,84 @@ impl Launcher {
             .map_err(io_at(&assets_dir))?;
         std::fs::create_dir_all(&game_dir).map_err(io_at(&game_dir))?;
 
-        // 7. Command line.
+        tracing::info!(
+            elapsed_ms = layout_started.elapsed().as_millis(),
+            "game directory and legacy assets preparation complete"
+        );
+        report(&progress, Phase::PrepareGameDirectory, 1, 1, Unit::Items);
         let mut classpath = libs.classpath;
         classpath.push(client_jar);
+        Ok(PreparedResources {
+            data,
+            game_dir,
+            natives_dir,
+            version,
+            java,
+            classpath,
+            layout,
+            logging_config,
+            env,
+        })
+    }
+
+    pub async fn prepare(
+        &self,
+        inst: &Instance,
+        global: &GlobalConfig,
+        account: &LaunchAccount,
+        progress: ProgressSink,
+    ) -> Result<Prepared, PrepareError> {
+        crate::modpack::ensure_ready(&inst.dir)
+            .map_err(|e| PrepareError::PackNotReady(e.to_string()))?;
+        let js = effective_java(&global.java, &inst.config);
+        validate_extra_jvm_args(&js.extra_jvm_args)?;
+        let extra_jvm_args = split_args(&js.extra_jvm_args);
+        let PreparedResources {
+            data,
+            game_dir,
+            natives_dir,
+            version,
+            java,
+            classpath,
+            layout,
+            logging_config,
+            env,
+        } = self.resources(inst, global, progress).await?;
+        let mut warnings = Vec::new();
+        // 3. Memory.
+        let max = match (js.max_mem_mib, platform::total_memory_mib()) {
+            (Some(m), _) => m,
+            (None, Some(total)) => js.effective_max_mem(total),
+            (None, None) => UNKNOWN_TOTAL_MAX_MEM_MIB,
+        };
+        let max_mem_mib = clamp_for_arch(max, java.is_64bit);
+        let min_mem_mib = js.min_mem_mib.min(max_mem_mib);
+        if js.low_mem_warning
+            && let Some(available) = platform::available_memory_mib()
+            && let MemoryCheck::Low {
+                requested_mib,
+                available_mib,
+            } = check_available_memory(min_mem_mib, max_mem_mib, available)
+        {
+            warnings.push(PrepareWarning::LowMemory {
+                requested_mib,
+                available_mib,
+            });
+        }
+
+        // 4. GC arguments.
+        let gc_args = if js.gc_preset.is_compatible(java.major) {
+            js.gc_preset.args(java.major)
+        } else {
+            let w = PrepareWarning::GcPresetIgnored {
+                preset: js.gc_preset,
+                java_major: java.major,
+            };
+            warnings.push(w);
+            Vec::new()
+        };
+
+        // 7. Command line.
         let command = build_command(&LaunchSpec {
             version: &version,
             data: &data,

@@ -672,6 +672,17 @@ impl DetailView {
             )
             .map(|d| {
                 let model = self.model.read(cx);
+                if let Some(reason) = model.pack_blocked_reason(&instance.id) {
+                    return d.child(
+                        div()
+                            .id("modpack-not-ready")
+                            .test_support()
+                            .max_w(rems(24.))
+                            .text_size(TEXT_SECONDARY)
+                            .text_color(theme.warning)
+                            .child(reason.clone()),
+                    );
+                }
                 match (
                     model.op(&instance.id, cx),
                     model.run_state(&instance.id, cx),
@@ -718,7 +729,8 @@ impl DetailView {
             })
             .child({
                 let model = self.model.read(cx);
-                let busy = model.is_busy(&instance.id, cx);
+                let busy = model.is_busy(&instance.id, cx)
+                    || model.pack_blocked_reason(&instance.id).is_some();
                 let starting =
                     matches!(model.run_state(&instance.id, cx), Some(RunState::Starting));
                 let (model, id) = (self.model.clone(), instance.id.clone());
@@ -787,7 +799,25 @@ impl DetailView {
                     Some(reason) => menu.label(reason.clone()).separator(),
                     None => menu,
                 };
+                let update_owner = this.clone();
+                let update_id = id.clone();
                 menu.item(
+                    PopupMenuItem::new(t!("modpacks.update_menu").to_string())
+                        .disabled(disabled)
+                        .on_click(move |_, window, cx| {
+                            update_owner
+                                .update(cx, |view, cx| {
+                                    crate::modpacks::open_update(
+                                        view.model.clone(),
+                                        update_id.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        }),
+                )
+                .item(
                     PopupMenuItem::new(t!("instance_settings.delete").to_string())
                         .icon(gpui_kit::assets::IconName::Trash)
                         .disabled(disabled)

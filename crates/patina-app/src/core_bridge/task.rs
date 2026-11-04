@@ -269,6 +269,7 @@ mod tests {
             done,
             total: 1000,
             unit: Unit::Items,
+            activity: None,
         }
     }
 
@@ -301,7 +302,7 @@ mod tests {
         cx.executor().advance_clock(PROGRESS_MIN_GAP);
         cx.run_until_parked();
 
-        let (count, last) = probe.read_with(cx, |p, _| (p.updates, p.last));
+        let (count, last) = probe.read_with(cx, |p, _| (p.updates, p.last.clone()));
         assert!((2..=10).contains(&count), "{count} updates");
         assert_eq!(last, Some(progress(1000)), "the last value is delivered");
     }

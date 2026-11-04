@@ -1,3 +1,5 @@
+mod activity;
+pub use activity::{FileActivity, FileActivityState, TransferSnapshot};
 pub mod engine;
 pub mod mirror;
 pub mod speedtest;

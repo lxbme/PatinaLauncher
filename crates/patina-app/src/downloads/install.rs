@@ -1,5 +1,6 @@
 //! Shared install confirmation/waiting surface; operations use the existing instance activity.
 use crate::core_bridge::{Core, run};
+use crate::installation;
 use crate::instances::InstancesModel;
 use crate::launch::{OpError, OpKind, OpState};
 use crate::theme::ProductColors;
@@ -7,7 +8,8 @@ use futures::FutureExt;
 use gpui_kit::base::Link;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::{ActiveTheme, Disableable, WindowExt, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, WindowExt, v_flex};
+use gpui_kit::component::{dialog::DialogFooter, label::Label, progress::Progress};
 use gpui_kit::{
     App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TestSupportExt, Window,
@@ -22,6 +24,7 @@ pub struct ContentInstallView {
     instance: String,
     plan: Option<ContentInstallPlan>,
     pending: std::collections::VecDeque<InstallRequest>,
+    request: Option<InstallRequest>,
     choices: InstallChoices,
     error: Option<SharedString>,
     running: bool,
@@ -72,6 +75,7 @@ pub fn open_installs(
         view.total = requests.len();
         view.pending = requests.into();
         if let Some(request) = view.pending.pop_front() {
+            view.current = 1;
             view.plan(request, cx);
         }
     });
@@ -96,6 +100,7 @@ impl ContentInstallView {
             instance: String::new(),
             plan: None,
             pending: Default::default(),
+            request: None,
             choices: InstallChoices::default(),
             error: None,
             running: false,
@@ -111,7 +116,7 @@ impl ContentInstallView {
         }
     }
     fn plan(&mut self, request: InstallRequest, cx: &mut Context<Self>) {
-        self.current += 1;
+        self.request = Some(request.clone());
         self.root_selected = true;
         self.plan = None;
         self.choices = InstallChoices::default();
@@ -139,6 +144,14 @@ impl ContentInstallView {
             })
             .ok();
         });
+    }
+    fn retry_plan(&mut self, cx: &mut Context<Self>) {
+        if self.running || self.validating {
+            return;
+        }
+        if let Some(request) = self.request.clone() {
+            self.plan(request, cx);
+        }
     }
     fn is_ready(&self) -> bool {
         self.root_selected
@@ -203,6 +216,7 @@ impl ContentInstallView {
                     done.update(cx, |this, cx| {
                         this.running = false;
                         if let Some(request) = this.pending.pop_front() {
+                            this.current += 1;
                             this.plan(request, cx);
                         } else {
                             this.done = true;
@@ -357,38 +371,152 @@ fn dependency_rows(plan: &ContentInstallPlan) -> Vec<DependencyRow<'_>> {
 }
 
 impl Render for ContentInstallView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (muted, link, border) = (
-            cx.theme().muted_foreground,
-            cx.theme().link,
-            cx.theme().border,
-        );
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
         let (focus_background, focus_foreground) = ProductColors::get(cx).link_focus();
+        let max_body = (f32::from(window.viewport_size().height) / f32::from(window.rem_size())
+            - 12.)
+            .clamp(10., 26.);
         let mut body = v_flex()
             .id("content-install-body")
-            .gap_3()
-            .max_h(rems(28.))
+            .test_support()
+            .gap_4()
+            .min_w_0()
+            .max_h(rems(max_body))
             .overflow_y_scroll();
         if let Some(plan) = &self.plan {
-            body =
-                body.child(div().child(
-                    t!("downloads.detail.install_to", instance = &self.instance).to_string(),
+            if let Some(root) = plan
+                .items()
+                .iter()
+                .find(|item| item.version().reference() == plan.root())
+            {
+                body = body.child(installation::identity(
+                    "content-install-identity",
+                    root.title().to_string(),
+                    root.version().name().to_string(),
+                    cx,
                 ));
+            }
+            let target = self
+                .instances
+                .read(cx)
+                .instances()
+                .iter()
+                .find(|instance| instance.id == self.instance);
+            let name = target.map_or_else(
+                || self.instance.clone(),
+                |instance| instance.config.name.clone(),
+            );
+            let mut metadata = v_flex()
+                .id("content-install-metadata")
+                .test_support()
+                .gap_2()
+                .child(installation::metadata(
+                    t!("installation.target").to_string(),
+                    name,
+                    cx,
+                ));
+            if let Some(target) = target {
+                let loader = target.config.loader().map_or_else(
+                    || t!("instances.vanilla").to_string(),
+                    |(kind, component)| format!("{} {}", kind.display_name(), component.version),
+                );
+                metadata = metadata.child(installation::metadata(
+                    t!("installation.game").to_string(),
+                    format!("Minecraft {} · {loader}", target.config.mc_version()),
+                    cx,
+                ));
+            }
+            let selected: Vec<_> = plan
+                .items()
+                .iter()
+                .filter(|item| self.root_selected && item.is_selected(&self.choices))
+                .collect();
+            metadata = metadata.child(installation::metadata(
+                t!("installation.files").to_string(),
+                installation::files(
+                    selected.len(),
+                    selected.iter().map(|item| item.file().size()).sum(),
+                ),
+                cx,
+            ));
+            body = body.child(metadata);
             if self.total > 1 {
                 body = body.child(
-                    t!(
-                        "downloads.install.batch_item",
-                        current = self.current,
-                        total = self.total
+                    Label::new(
+                        t!(
+                            "downloads.install.batch_item",
+                            current = self.current,
+                            total = self.total
+                        )
+                        .to_string(),
                     )
-                    .to_string(),
+                    .text_sm()
+                    .text_color(muted),
                 );
             }
-            let rows = dependency_rows(plan);
-            if rows.len() > 1 {
-                body = body.child(t!("downloads.install.required_link").to_string());
+        }
+        if let Some(error) = &self.error {
+            body = body.child(installation::failure(
+                "content-install-error",
+                error.clone(),
+            ));
+        }
+        if self.running {
+            let progress = self
+                .instances
+                .read(cx)
+                .op(&self.instance, cx)
+                .and_then(|op| match op {
+                    OpState::Running { progress, .. } => progress.as_ref(),
+                    _ => None,
+                });
+            let mut status = v_flex()
+                .gap_2()
+                .child(
+                    Label::new(progress.map_or_else(
+                        || t!("downloads.install.installing").to_string(),
+                        |p| p.step(),
+                    ))
+                    .text_sm(),
+                )
+                .child(
+                    Progress::new("content-install-progress")
+                        .loading(progress.and_then(|p| p.fraction).is_none())
+                        .value(progress.and_then(|p| p.fraction).unwrap_or(0.) * 100.),
+                );
+            if let Some(amount) = progress.and_then(|p| p.amount.clone()) {
+                status = status.child(Label::new(amount).text_sm().text_color(muted));
             }
-            for row in rows {
+            body = body.child(status).children(installation::activity(
+                progress.and_then(|p| p.activity.as_deref()),
+                |file| {
+                    self.plan
+                        .as_ref()
+                        .and_then(|plan| {
+                            plan.items().iter().find_map(|item| {
+                                item.version()
+                                    .files()
+                                    .iter()
+                                    .any(|f| f.name() == file.name)
+                                    .then(|| format!("{} · {}", item.title(), file.name))
+                            })
+                        })
+                        .unwrap_or_else(|| file.name.clone())
+                },
+                window,
+                cx,
+            ));
+        } else if self.done {
+            body = body.child(
+                div()
+                    .id("content-install-done")
+                    .test_support()
+                    .child(Label::new(t!("downloads.install.done").to_string()).text_sm()),
+            );
+        } else if let Some(plan) = &self.plan {
+            let mut files = v_flex().gap_1();
+            for row in dependency_rows(plan) {
                 let item = row.item;
                 let reference = item.version().reference();
                 let root = reference == plan.root();
@@ -408,33 +536,45 @@ impl Render for ContentInstallView {
                 } else {
                     format!("content-required:{}", reference.id())
                 });
-                let title = format!("{} · {}", item.title(), item.version().name());
+                let title = if root {
+                    item.file().name().to_string()
+                } else {
+                    format!("{} · {}", item.title(), item.version().name())
+                };
                 let label = if root || row.optional {
                     title
                 } else {
                     t!("downloads.install.required", project = title).to_string()
                 };
-                let locked = self.running
-                    || self.done
-                    || self.validating
-                    || (!root && (!row.optional || !parent_selected));
-                body = body.child(
-                    div().pl(rems(row.depth as f32)).child(
+                let locked = self.validating || (!root && (!row.optional || !parent_selected));
+                files = files.child(
+                    div().py_1().pl(rems(row.depth as f32)).child(
                         Checkbox::new(id)
                             .checked(checked)
                             .disabled(locked)
                             .label(label)
-                            .on_change(cx.listener(move |this, value, _, cx| {
+                            .on_change(cx.listener(move |view, value, _, cx| {
                                 if root {
-                                    this.root_selected = *value;
+                                    view.root_selected = *value
                                 } else {
-                                    this.choices.set_optional(project.clone(), *value);
+                                    view.choices.set_optional(project.clone(), *value)
                                 }
                                 cx.notify();
                             })),
                     ),
                 );
             }
+            body = body.child(
+                v_flex()
+                    .gap_2()
+                    .child(installation::section_label(
+                        t!("installation.selection").to_string(),
+                        cx,
+                    ))
+                    .child(files),
+            );
+            let mut conflicts = v_flex().gap_2();
+            let mut has_conflicts = false;
             for conflict in plan.conflicts().iter().filter(|c| {
                 self.root_selected
                     && plan.items().iter().any(|i| {
@@ -442,6 +582,7 @@ impl Render for ContentInstallView {
                             && i.is_selected(&self.choices)
                     })
             }) {
+                has_conflicts = true;
                 let conflict = conflict.clone();
                 let enable = *conflict.reason() == ConflictReason::DisabledRequired;
                 let checked = if enable {
@@ -449,13 +590,13 @@ impl Render for ContentInstallView {
                 } else {
                     self.choices.is_replacement_allowed(conflict.path())
                 };
-                body = body.child(
+                conflicts = conflicts.child(
                     Checkbox::new(SharedString::from(format!(
                         "content-conflict:{}",
                         conflict.path()
                     )))
                     .checked(checked)
-                    .disabled(self.running || self.done)
+                    .disabled(self.validating)
                     .label(
                         t!(
                             if enable {
@@ -467,54 +608,71 @@ impl Render for ContentInstallView {
                         )
                         .to_string(),
                     )
-                    .on_change(cx.listener(move |this, value, _, cx| {
+                    .on_change(cx.listener(move |view, value, _, cx| {
                         if enable {
-                            this.choices
-                                .set_enabled_dependency(conflict.project().clone(), *value);
+                            view.choices
+                                .set_enabled_dependency(conflict.project().clone(), *value)
                         } else {
-                            this.choices
-                                .set_replacement(conflict.path().to_string(), *value);
+                            view.choices
+                                .set_replacement(conflict.path().to_string(), *value)
                         }
                         cx.notify();
                     })),
                 );
             }
-            for item in plan
-                .restricted_files()
-                .into_iter()
-                .filter(|i| self.root_selected && i.is_selected(&self.choices))
-            {
-                let version = item.version().reference().clone();
-                let selected = self.choices.manual_file(&version).is_some();
-                let id = SharedString::from(format!("content-manual-file:{}", version.id()));
-                let page = item.file().page_url().to_string();
+            if has_conflicts {
                 body = body.child(
                     v_flex()
                         .gap_2()
-                        .border_t_1()
-                        .border_color(border)
-                        .pt_3()
-                        .child(item.file().name().to_string())
-                        .child(
-                            Link::new(SharedString::from(format!(
-                                "content-official-page:{}",
-                                version.id()
-                            )))
-                            .href(page)
-                            .text_color(link)
-                            .focus_visible(move |s| {
-                                s.bg(focus_background).text_color(focus_foreground)
-                            })
-                            .open_with(|url, _, _, cx| {
-                                if url.starts_with("https://") || url.starts_with("http://") {
-                                    cx.open_url(url);
-                                }
-                            })
-                            .child(t!("downloads.detail.project_page").to_string()),
-                        )
-                        .child(
-                            Button::new(id)
-                                .disabled(self.running || self.validating)
+                        .child(installation::section_label(
+                            t!("installation.permissions").to_string(),
+                            cx,
+                        ))
+                        .child(conflicts),
+                );
+            }
+            let restricted: Vec<_> = plan
+                .restricted_files()
+                .into_iter()
+                .filter(|item| self.root_selected && item.is_selected(&self.choices))
+                .collect();
+            if !restricted.is_empty() {
+                let mut manual = v_flex().gap_3().child(installation::section_label(
+                    t!("installation.required_download").to_string(),
+                    cx,
+                ));
+                for item in restricted {
+                    let version = item.version().reference().clone();
+                    let selected = self.choices.manual_file(&version).is_some();
+                    let page = item.file().page_url().to_string();
+                    manual = manual.child(
+                        v_flex()
+                            .gap_2()
+                            .child(Label::new(item.file().name().to_string()).text_sm())
+                            .child(
+                                Link::new(SharedString::from(format!(
+                                    "content-official-page:{}",
+                                    version.id()
+                                )))
+                                .href(page)
+                                .text_color(cx.theme().link)
+                                .focus_visible(move |s| {
+                                    s.bg(focus_background).text_color(focus_foreground)
+                                })
+                                .open_with(|url, _, _, cx| {
+                                    if url.starts_with("https://") || url.starts_with("http://") {
+                                        cx.open_url(url);
+                                    }
+                                })
+                                .child(t!("downloads.detail.project_page").to_string()),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "content-manual-file:{}",
+                                    version.id()
+                                )))
+                                .outline()
+                                .disabled(self.validating)
                                 .label(
                                     t!(if selected {
                                         "downloads.install.file_verified"
@@ -523,87 +681,77 @@ impl Render for ContentInstallView {
                                     })
                                     .to_string(),
                                 )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.choose_manual(version.clone(), window, cx)
-                                })),
-                        ),
-                );
+                                .on_click(cx.listener(
+                                    move |view, _, window, cx| {
+                                        view.choose_manual(version.clone(), window, cx)
+                                    },
+                                )),
+                            ),
+                    );
+                }
+                body = body.child(manual);
             }
         } else if self.error.is_none() {
-            body = body.child(t!("downloads.install.planning").to_string());
-        }
-        if let Some(error) = &self.error {
             body = body.child(
-                div()
-                    .id("content-install-error")
-                    .test_support()
-                    .child(error.clone()),
-            );
-        }
-        if self.running {
-            let progress = self
-                .instances
-                .read(cx)
-                .op(&self.instance, cx)
-                .and_then(|op| match op {
-                    OpState::Running { progress, .. } => progress.as_ref(),
-                    _ => None,
-                });
-            body = body
-                .child(
-                    gpui_kit::component::progress::Progress::new("content-install-progress")
-                        .loading(progress.and_then(|p| p.fraction).is_none())
-                        .value(progress.and_then(|p| p.fraction).unwrap_or(0.) * 100.),
-                )
-                .child(div().text_color(muted).child(progress.map_or_else(
-                    || t!("downloads.install.installing").to_string(),
-                    |p| p.step(),
-                )));
-        }
-        if self.done {
-            body = body.child(
-                div()
-                    .id("content-install-done")
-                    .test_support()
-                    .child(t!("downloads.install.done").to_string()),
+                v_flex()
+                    .gap_2()
+                    .child(Label::new(t!("downloads.install.planning").to_string()).text_sm())
+                    .child(Progress::new("content-install-planning").loading(true)),
             );
         }
         let ready = self.is_ready();
-        v_flex().gap_4().child(body).child(
-            h_flex()
-                .gap_2()
-                .justify_end()
-                .child(
-                    Button::new("content-install-cancel")
+        let mut footer = DialogFooter::new()
+            .gap_2()
+            .flex_none()
+            .pt_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("content-install-cancel")
+                    .label(
+                        t!(if self.done {
+                            "downloads.install.close"
+                        } else {
+                            "downloads.install.cancel"
+                        })
+                        .to_string(),
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        let _ = view.cancel.send(true);
+                        window.close_dialog(cx);
+                    })),
+            );
+        if !self.running && !self.done {
+            if self.plan.is_some() {
+                footer = footer.child(
+                    Button::new("content-install-continue")
+                        .primary()
+                        .disabled(!ready)
                         .label(
-                            t!(if self.done {
-                                "downloads.install.close"
+                            t!(if self.error.is_some() {
+                                "downloads.install.retry"
                             } else {
-                                "downloads.install.cancel"
+                                "downloads.install.continue"
                             })
                             .to_string(),
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let _ = this.cancel.send(true);
-                            window.close_dialog(cx);
-                        })),
-                )
-                .children(
-                    (!self.running && !self.done && self.plan.is_some()).then(|| {
-                        Button::new("content-install-continue")
-                            .primary()
-                            .disabled(!ready)
-                            .label(
-                                t!(if self.error.is_some() {
-                                    "downloads.install.retry"
-                                } else {
-                                    "downloads.install.continue"
-                                })
-                                .to_string(),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.apply(cx)))
-                    }),
-                ),
+                        .on_click(cx.listener(|view, _, _, cx| view.apply(cx))),
+                );
+            } else if self.error.is_some() {
+                footer = footer.child(
+                    Button::new("content-install-retry-plan")
+                        .primary()
+                        .label(t!("downloads.install.retry").to_string())
+                        .on_click(cx.listener(|view, _, _, cx| view.retry_plan(cx))),
+                );
+            }
+        }
+        v_flex().text_sm().gap_4().min_w_0().child(body).child(
+            div()
+                .id("content-install-footer")
+                .test_support()
+                .flex_none()
+                .child(footer),
         )
     }
 }

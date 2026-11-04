@@ -545,6 +545,7 @@ impl DownloadsModel {
             )
         });
         let kind = self.kind;
+        let preview_channels = self.preview_channels;
         let source = Core::global(cx).content_source.clone();
         cx.notify();
         self.detail_task = cx.spawn(async move |this, cx| {
@@ -555,7 +556,15 @@ impl DownloadsModel {
                         return Err(OnlineError::InvalidResponse);
                     }
                     let versions = if project.is_client_supported() {
-                        if let Some(target) = target {
+                        if kind == ContentKind::Modpack
+                            && reference.platform() == Platform::Modrinth
+                        {
+                            let mut versions = source.pack_versions(reference).await?;
+                            if !preview_channels {
+                                versions.retain(|v| v.channel() == ReleaseChannel::Release);
+                            }
+                            versions
+                        } else if let Some(target) = target {
                             if target.kind() != ContentKind::Mod || target.loader().is_some() {
                                 source.versions(reference, target).await?
                             } else {

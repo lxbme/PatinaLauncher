@@ -7,6 +7,7 @@ mod model;
 mod plan;
 mod service;
 mod updates;
+pub(crate) use installed::record_pack_files;
 pub use installed::{ContentSources, SourceRecord, load_sources};
 pub use plan::*;
 pub use service::{ContentError, ContentService};
@@ -104,6 +105,13 @@ pub trait ContentSource: Send + Sync {
         &self,
         _project: ProjectRef,
         _target: TargetCompatibility,
+    ) -> BoxFuture<'static, Result<Vec<ContentVersion>, OnlineError>> {
+        Box::pin(async { Err(OnlineError::Unavailable) })
+    }
+    /// Pack versions are not filtered against the current instance's components.
+    fn pack_versions(
+        &self,
+        _project: ProjectRef,
     ) -> BoxFuture<'static, Result<Vec<ContentVersion>, OnlineError>> {
         Box::pin(async { Err(OnlineError::Unavailable) })
     }
