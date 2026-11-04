@@ -7,6 +7,7 @@
 //!
 //! [`InstancesModel::start_op`]: crate::instances::InstancesModel::start_op
 
+pub(crate) mod diagnosis_view;
 pub mod log_view;
 pub mod op_runner;
 pub mod prelaunch_dialog;

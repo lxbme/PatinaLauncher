@@ -613,3 +613,30 @@ installation:
   selection: "安装文件"
   permissions: "文件变更"
   required_download: "需要手动下载"
+
+diagnosis:
+  evidence: "关键报错"
+  view_log: "查看日志"
+  java:
+    title: "Java 版本不匹配"
+    both: "某个类需要 Java %{required} 或以上，此运行时最高支持 Java %{supported}。请结合游戏或整合包要求，在实例设置中选择兼容的 Java。"
+    required: "某个类需要 Java %{required} 或以上。请结合游戏或整合包要求，在实例设置中选择兼容的 Java。"
+    unknown: "运行时不支持该类文件版本。请在实例设置中检查 Java 与游戏或整合包的兼容性。"
+  argument:
+    title: "JVM 参数被拒绝"
+    body: "Java 拒绝了参数「%{argument}」。请检查实例和全局 JVM 参数。"
+  heap:
+    title: "Java 堆内存不足"
+    body: "Java 报告堆内存已耗尽。如系统资源允许，可适当提高实例的内存上限。"
+  reservation:
+    title: "Java 堆内存预留失败"
+    body: "Java 无法预留所需的堆内存。请检查内存上限，继续增大可能加重此问题。"
+  native:
+    title: "JVM 原生内存分配失败"
+    body: "JVM 无法分配原生内存，并非 Java 堆内存不足。请关闭不必要的应用并检查内存设置。"
+  permission:
+    title: "文件访问被拒绝"
+    body: "文件操作被拒绝。请检查相关位置的访问权限，以及是否被其他应用占用。"
+  disk:
+    title: "存储空间不足"
+    body: "文件操作报告可用空间已耗尽。请检查该操作所用存储位置的剩余空间。"

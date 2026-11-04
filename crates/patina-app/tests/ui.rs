@@ -10458,3 +10458,6 @@ mod java_download;
 
 #[path = "modpacks/ui.rs"]
 mod modpacks;
+
+#[path = "launch/diagnosis.rs"]
+mod diagnosis;

@@ -1,5 +1,6 @@
 pub mod account;
 pub mod args;
+pub mod diagnosis;
 
 #[cfg(feature = "dev-offline")]
 pub use account::dev_offline_account;

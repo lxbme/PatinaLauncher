@@ -50,6 +50,8 @@ impl InstanceActivity {
         // A failure from an earlier attempt goes; so does a crash notice.
         self.ops.remove(id);
         let token = self.next_token();
+        self.begin_diagnosis_attempt(id, token);
+        self.set_crash_log(id, None, cx);
         let core = Core::global(cx);
         let (service, store) = (core.accounts(), core.store.clone());
         let (cancel, token_cancel) = tokio::sync::watch::channel(false);
@@ -232,6 +234,7 @@ impl InstanceActivity {
         if flow.pending.is_some() {
             let token = flow.token;
             self.end_flow(id, token, cx);
+            self.clear_diagnosis(id);
         }
     }
 
@@ -329,6 +332,7 @@ impl InstanceActivity {
         cx: &mut Context<Self>,
     ) {
         let token = self.next_token();
+        self.begin_diagnosis_attempt(id, token);
         let (pid, killer, logs) = (session.pid(), session.killer(), session.logs());
         // The previous run's forwarding stops before its buffer is reused.
         self.log_forwards.remove(id);
@@ -371,15 +375,19 @@ impl InstanceActivity {
             Ok(exit) if exit.crashed => {
                 tracing::warn!(id, code = ?exit.code, "the game crashed");
                 self.set_crash_log(id, exit.saved_log.clone(), cx);
+                let path = exit.saved_log.clone();
                 self.running.insert(id.to_string(), RunState::Exited(exit));
+                self.diagnose_saved_log(id, token, path, cx);
             }
             Ok(exit) => {
                 tracing::info!(id, code = ?exit.code, "the game exited");
                 self.running.remove(id);
+                self.clear_diagnosis(id);
             }
             Err(error) => {
                 tracing::warn!(id, %error, "waiting for the game failed");
                 self.running.remove(id);
+                self.clear_diagnosis(id);
             }
         }
         cx.notify();
@@ -583,6 +591,7 @@ impl InstanceActivity {
     pub fn dismiss_exit(&mut self, id: &str, cx: &mut Context<Self>) {
         if matches!(self.running.get(id), Some(RunState::Exited(_))) {
             self.running.remove(id);
+            self.clear_diagnosis(id);
             cx.notify();
         }
     }

@@ -23,6 +23,7 @@ use crate::launch::{
     LaunchEvent, LogBuffer, OpError, OpFix, OpKind, OpState, ProgressTracker, RetryAction, RunState,
 };
 
+mod diagnosis;
 mod launch;
 
 /// Identifies one operation when it finishes.
@@ -115,6 +116,7 @@ pub struct InstanceActivity {
     op_changes: HashMap<String, u64>,
     /// The crash log saved after the last run of an instance, if it crashed.
     crash_logs: HashMap<String, PathBuf>,
+    diagnoses: HashMap<String, diagnosis::DiagnosisEntry>,
 }
 
 impl EventEmitter<ActivityEvent> for InstanceActivity {}
@@ -160,6 +162,7 @@ impl InstanceActivity {
             logs: HashMap::new(),
             op_changes: HashMap::new(),
             crash_logs: HashMap::new(),
+            diagnoses: HashMap::new(),
         }
     }
 
@@ -207,6 +210,8 @@ impl InstanceActivity {
         self.logs.retain(|id, _| kept(id));
         self.op_changes.retain(|id, _| kept(id));
         self.crash_logs.retain(|id, _| kept(id));
+        self.diagnoses
+            .retain(|id, _| find_entry(&list, id).is_some());
         // A crash notice has nothing to hang on to either; a game that runs
         // stays (it ends by itself).
         self.running.retain(|id, state| {
@@ -233,13 +238,14 @@ impl InstanceActivity {
         self.loaded = true;
     }
 
-    fn sizes(&self) -> [usize; 5] {
+    fn sizes(&self) -> [usize; 6] {
         [
             self.ops.len(),
             self.logs.len(),
             self.op_changes.len(),
             self.crash_logs.len(),
             self.running.len(),
+            self.diagnoses.len(),
         ]
     }
 
@@ -533,6 +539,9 @@ impl InstanceActivity {
                     on_fail(self, Some(&error), cx);
                     let fix = error.fix();
                     self.insert_failed(id, token, kind, message, retry, fix);
+                    if kind == OpKind::Launch {
+                        self.diagnose_launch_error(id, error, cx);
+                    }
                 }
             }
         }
@@ -571,6 +580,7 @@ impl InstanceActivity {
     pub fn dismiss_op(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.ops.get(id).is_some_and(|e| !e.state.is_running()) {
             self.ops.remove(id);
+            self.clear_diagnosis(id);
             cx.notify();
         }
     }

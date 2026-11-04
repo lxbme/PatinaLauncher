@@ -220,6 +220,15 @@ impl InstancesModel {
         self.activity.read(cx).run_state(id)
     }
 
+    /// The explanation of the current failed attempt only.
+    pub fn diagnosis<'a>(
+        &self,
+        id: &str,
+        cx: &'a App,
+    ) -> Option<&'a patina_core::launch::diagnosis::Diagnosis> {
+        self.activity.read(cx).diagnosis(id)
+    }
+
     /// Whether a game of instance `id` runs (here or in another Patina
     /// process).
     pub fn is_running(&self, id: &str, cx: &App) -> bool {

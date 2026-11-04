@@ -202,6 +202,18 @@ impl OpError {
         }
     }
 
+    /// Uses only direct safe technical errors; authenticated wrappers stay redacted.
+    pub fn launch_diagnosis(&self) -> Option<patina_core::launch::diagnosis::Diagnosis> {
+        use patina_core::launch::diagnosis::{EvidenceContext, analyze};
+        match self {
+            Self::Session(SessionError::Io { error, .. })
+            | Self::Session(SessionError::Prepare(PrepareError::Io { error, .. })) => {
+                analyze(error, EvidenceContext::TerminalError)
+            }
+            _ => None,
+        }
+    }
+
     /// The fix to offer for this error, if one applies.
     pub fn fix(&self) -> Option<OpFix> {
         match self {
@@ -236,6 +248,42 @@ mod tests {
     use patina_core::locks::Busy;
 
     use super::*;
+
+    #[test]
+    fn diagnosis_launch_error_adapter_preserves_redaction() {
+        use patina_core::launch::diagnosis::DiagnosisKind;
+        let safe = OpError::Session(SessionError::Io {
+            path: "fixture".into(),
+            error: "Permission denied (os error 13)".into(),
+        });
+        assert_eq!(
+            safe.launch_diagnosis().unwrap().kind(),
+            DiagnosisKind::PermissionDenied
+        );
+        let prepare = OpError::Session(SessionError::Prepare(PrepareError::Io {
+            path: "/synthetic".into(),
+            error: "No space left on device (os error 28)".into(),
+        }));
+        assert_eq!(
+            prepare.launch_diagnosis().unwrap().kind(),
+            DiagnosisKind::DiskFull
+        );
+        for error in [
+            OpError::Message("Permission denied (os error 13)".into()),
+            OpError::Session(SessionError::AlreadyRunning("fixture".into())),
+            OpError::Session(SessionError::Io {
+                path: "fixture".into(),
+                error: "connection reset".into(),
+            }),
+            OpError::Authenticated(AuthenticatedLaunchError::Session(SessionError::Io {
+                path: "fixture".into(),
+                error: "Permission denied (os error 13) SESSION_SECRET_SENTINEL".into(),
+            })),
+            OpError::Authenticated(AuthenticatedLaunchError::Auth(AuthError::CredentialMissing)),
+        ] {
+            assert!(error.launch_diagnosis().is_none());
+        }
+    }
 
     #[test]
     fn authenticated_errors_keep_recovery_classification() {

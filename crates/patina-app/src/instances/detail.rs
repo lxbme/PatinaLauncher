@@ -150,6 +150,8 @@ fn walk_due(walked_at: Option<Instant>, now: Instant) -> bool {
 pub struct DetailView {
     model: Entity<InstancesModel>,
     tab: DetailTab,
+    diagnosis_identity: Option<(String, u64)>,
+    diagnosis_expanded: bool,
     stats: StatsState,
     stats_task: Task<()>,
     /// The log tab of the selected instance, made when it is first shown.
@@ -205,6 +207,8 @@ impl DetailView {
         let mut this = Self {
             model,
             tab: DetailTab::default(),
+            diagnosis_identity: None,
+            diagnosis_expanded: false,
             stats: StatsState::default(),
             stats_task: Task::ready(()),
             log: None,
@@ -512,6 +516,16 @@ impl DetailView {
     /// changed. One read at a time per instance; a newer one for another
     /// instance makes the older result stale.
     fn sync_stats(&mut self, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let identity = model.selected().and_then(|id| {
+            let activity = model.activity().read(cx);
+            activity.diagnosis(id)?;
+            Some((id.to_string(), activity.diagnosis_token(id)?))
+        });
+        if self.diagnosis_identity != identity {
+            self.diagnosis_identity = identity;
+            self.diagnosis_expanded = false;
+        }
         self.sync_log(cx);
         self.sync_versions(cx);
         let model = self.model.read(cx);
@@ -687,7 +701,17 @@ impl DetailView {
                     model.op(&instance.id, cx),
                     model.run_state(&instance.id, cx),
                 ) {
+                    (Some(OpState::Failed { .. }), _)
+                        if model.diagnosis(&instance.id, cx).is_some() =>
+                    {
+                        d
+                    }
                     (Some(op), _) => d.child(self.render_op(&instance.id, op, cx)),
+                    (None, Some(RunState::Exited(_)))
+                        if model.diagnosis(&instance.id, cx).is_some() =>
+                    {
+                        d
+                    }
                     (None, Some(RunState::Exited(exit))) => {
                         d.child(self.render_crash(&instance.id, exit.saved_log.clone(), cx))
                     }
@@ -970,6 +994,110 @@ impl DetailView {
         }
     }
 
+    fn render_diagnosis(&self, id: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let model = self.model.read(cx);
+        let diagnosis = model.diagnosis(id, cx)?;
+        let token = model.activity().read(cx).diagnosis_token(id)?;
+        let identity = (id.to_string(), token);
+        let expanded =
+            self.diagnosis_identity.as_ref() == Some(&identity) && self.diagnosis_expanded;
+        let toggle = Button::new("diagnosis-evidence-toggle")
+            .toggled(expanded)
+            .ghost()
+            .small()
+            .icon(if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .label(t!("diagnosis.evidence").to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.diagnosis_identity.as_ref() == Some(&identity) {
+                    this.diagnosis_expanded = !this.diagnosis_expanded;
+                    cx.notify();
+                }
+            }));
+        let log = model
+            .crash_log(id, cx)
+            .filter(|_| matches!(model.run_state(id, cx), Some(RunState::Exited(_))))
+            .map(|_| {
+                let key = id.to_string();
+                Button::new("diagnosis-view-log")
+                    .small()
+                    .label(t!("diagnosis.view_log").to_string())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let model = this.model.read(cx);
+                        if model.selected() == Some(key.as_str())
+                            && model.activity().read(cx).diagnosis_token(&key) == Some(token)
+                            && model.diagnosis(&key, cx).is_some()
+                        {
+                            this.set_tab_in(DetailTab::Log, window, cx);
+                        }
+                    }))
+            });
+        let (model_entity, key) = (self.model.clone(), id.to_string());
+        let (action, dismiss) = match model.op(id, cx) {
+            Some(OpState::Failed { retry, fix, .. }) => {
+                let action = match fix {
+                    Some(fix) => {
+                        let (model, key) = (model_entity.clone(), key.clone());
+                        Some(
+                            Button::new("instance-op-fix")
+                                .small()
+                                .label(fix.label())
+                                .on_click(move |_, _, cx| {
+                                    model.update(cx, |m, cx| m.apply_fix(&key, cx));
+                                }),
+                        )
+                    }
+                    None => retry.is_some().then(|| {
+                        let (model, key) = (model_entity.clone(), key.clone());
+                        Button::new("instance-op-retry")
+                            .small()
+                            .label(t!("ops.retry").to_string())
+                            .on_click(move |_, _, cx| {
+                                model.update(cx, |m, cx| m.retry_op(&key, cx));
+                            })
+                    }),
+                };
+                let dismiss = Button::new("instance-op-dismiss")
+                    .ghost()
+                    .small()
+                    .label(t!("ops.dismiss").to_string())
+                    .on_click(move |_, _, cx| {
+                        model_entity.update(cx, |m, cx| m.dismiss_op(&key, cx));
+                    });
+                (action, dismiss)
+            }
+            _ => (
+                None,
+                Button::new("instance-crash-dismiss")
+                    .ghost()
+                    .small()
+                    .label(t!("ops.dismiss").to_string())
+                    .on_click(move |_, _, cx| {
+                        model_entity.update(cx, |m, cx| m.dismiss_exit(&key, cx));
+                    }),
+            ),
+        };
+        Some(
+            crate::launch::diagnosis_view::render_diagnosis(
+                diagnosis,
+                expanded,
+                toggle,
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .children(log)
+                    .children(action)
+                    .child(dismiss)
+                    .into_any_element(),
+                cx,
+            )
+            .into_any_element(),
+        )
+    }
+
     fn render_tabs(&self, instance: &Instance, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (fg, muted, border) = (theme.foreground, theme.muted_foreground, theme.border);
@@ -1126,6 +1254,7 @@ impl Render for DetailView {
             .size_full()
             .bg(bg)
             .child(self.render_header(&instance, cx))
+            .children(self.render_diagnosis(&instance.id, cx))
             .child(self.render_tabs(&instance, cx))
             .child(
                 div()

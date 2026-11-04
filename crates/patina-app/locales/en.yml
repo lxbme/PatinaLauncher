@@ -613,3 +613,30 @@ installation:
   selection: "Files to install"
   permissions: "File changes"
   required_download: "Manual download required"
+
+diagnosis:
+  evidence: "Key error"
+  view_log: "View log"
+  java:
+    title: "Java version mismatch"
+    both: "A class requires Java %{required} or later; this runtime supports up to Java %{supported}. Select a compatible Java in instance settings, considering the game or modpack requirements."
+    required: "A class requires Java %{required} or later. Select a compatible Java in instance settings, considering the game or modpack requirements."
+    unknown: "The runtime rejected a class file version. Check Java compatibility with the game or modpack in instance settings."
+  argument:
+    title: "JVM argument rejected"
+    body: "Java rejected “%{argument}”. Check the instance and global JVM arguments."
+  heap:
+    title: "Java heap exhausted"
+    body: "Java reported that its heap is full. If system resources allow, consider raising the instance memory limit."
+  reservation:
+    title: "Java heap reservation failed"
+    body: "Java could not reserve the requested heap. Check the memory limit; increasing it may make this worse."
+  native:
+    title: "JVM native memory allocation failed"
+    body: "The JVM could not allocate native memory, not Java heap space. Close unneeded applications and check the memory settings."
+  permission:
+    title: "File access denied"
+    body: "A file operation was denied. Check access permissions for the affected location and whether another application is using it."
+  disk:
+    title: "Storage space exhausted"
+    body: "A file operation reported no space left. Check available space on the storage used by the failed operation."
