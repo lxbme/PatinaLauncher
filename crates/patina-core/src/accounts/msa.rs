@@ -156,6 +156,37 @@ impl MsaClient {
         Self::new(http, clock)
     }
 
+    pub(crate) async fn appearance_profile(
+        &self,
+        access_token: SecretString,
+        cancel: CancelToken,
+    ) -> Result<AuthResponse, AuthError> {
+        self.http
+            .send(AuthRequest::Profile { access_token }, cancel)
+            .await
+    }
+
+    pub(crate) async fn upload_skin(
+        &self,
+        access_token: SecretString,
+        skin: super::appearance::SkinUpload,
+        cancel: CancelToken,
+    ) -> Result<AuthResponse, AuthError> {
+        self.http
+            .send(AuthRequest::UploadSkin { access_token, skin }, cancel)
+            .await
+    }
+    pub(crate) async fn change_cape(
+        &self,
+        access_token: SecretString,
+        id: Option<String>,
+        cancel: CancelToken,
+    ) -> Result<AuthResponse, AuthError> {
+        self.http
+            .send(AuthRequest::ChangeCape { access_token, id }, cancel)
+            .await
+    }
+
     pub(crate) fn sign_in(
         &self,
         events: UnboundedSender<LoginEvent>,

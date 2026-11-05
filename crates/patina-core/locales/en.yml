@@ -1,4 +1,9 @@
 errors:
+  appearance:
+    too_large: "The PNG is larger than 256 KiB."
+    invalid_png: "The PNG could not be decoded."
+    dimensions: "Use a 64×64 or 64×32 skin PNG, or a 64×32 cape."
+    legacy_slim: "64×32 skins require the classic model."
   auth:
     cancelled: "Sign-in was cancelled."
     expired: "The sign-in code expired. Try again."

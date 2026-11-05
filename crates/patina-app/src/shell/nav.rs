@@ -1,7 +1,7 @@
 //! Which page the main window shows ([`Nav`]), its owner ([`ShellState`])
 //! and the shell's navigation commands ([`OpenDownloads`]).
 
-use gpui_kit::{Action, Context};
+use gpui_kit::{Action, Context, EventEmitter};
 use rust_i18n::t;
 
 /// Shows the downloads page, aimed at instance `target` and searching
@@ -17,6 +17,36 @@ pub struct OpenDownloads {
     pub query: Option<String>,
 }
 
+/// Opens an instance or a mod only after the root accepts departure.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Action)]
+#[action(namespace = patina, no_json)]
+pub struct OpenInstance {
+    id: String,
+    mod_file: Option<String>,
+}
+impl OpenInstance {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            mod_file: None,
+        }
+    }
+    pub fn with_mod_file(mut self, file: impl Into<String>) -> Self {
+        self.mod_file = Some(file.into());
+        self
+    }
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn mod_file(&self) -> Option<&str> {
+        self.mod_file.as_deref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NavigationRequested(pub Nav);
+impl EventEmitter<NavigationRequested> for ShellState {}
+
 /// A destination of the left rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Nav {
@@ -24,6 +54,7 @@ pub enum Nav {
     Instances,
     Downloads,
     Accounts,
+    Appearance,
     Settings,
 }
 
@@ -34,6 +65,7 @@ impl Nav {
             Nav::Instances => t!("shell.nav.instances"),
             Nav::Downloads => t!("shell.nav.downloads"),
             Nav::Accounts => t!("shell.nav.accounts"),
+            Nav::Appearance => t!("appearance.title"),
             Nav::Settings => t!("shell.nav.settings"),
         }
         .to_string()
@@ -45,6 +77,7 @@ impl Nav {
             Nav::Instances => "rail-instances",
             Nav::Downloads => "rail-downloads",
             Nav::Accounts => "rail-accounts",
+            Nav::Appearance => "rail-appearance",
             Nav::Settings => "rail-settings",
         }
     }
@@ -55,6 +88,7 @@ impl Nav {
             Nav::Instances => "page-instances",
             Nav::Downloads => "page-downloads",
             Nav::Accounts => "page-accounts",
+            Nav::Appearance => "page-appearance",
             Nav::Settings => "page-settings",
         }
     }
@@ -80,6 +114,17 @@ impl ShellState {
 
     /// Shows `nav`; notifies only if that changes the page.
     pub fn navigate(&mut self, nav: Nav, cx: &mut Context<Self>) {
+        if self.nav == nav {
+            return;
+        }
+        if self.nav == Nav::Appearance {
+            cx.emit(NavigationRequested(nav));
+            return;
+        }
+        self.commit_navigation(nav, cx);
+    }
+
+    pub(crate) fn commit_navigation(&mut self, nav: Nav, cx: &mut Context<Self>) {
         if self.nav == nav {
             return;
         }

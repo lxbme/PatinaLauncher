@@ -26,6 +26,7 @@ use std::{
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc::UnboundedSender, watch};
 use uuid::Uuid;
 
+mod appearance;
 mod skin;
 mod transactions;
 
@@ -120,6 +121,7 @@ struct Inner {
     client: MsaClient,
     skin: super::skin::SkinClient,
     skin_decodes: Arc<tokio::sync::Semaphore>,
+    appearance_writes: std::sync::Mutex<HashSet<String>>,
     #[cfg(test)]
     skin_decode_probe: std::sync::Mutex<Option<Arc<skin::DecodeProbe>>>,
     credentials: Arc<CredentialStore>,
@@ -199,6 +201,7 @@ impl AccountService {
                 client,
                 skin: super::skin::SkinClient::production(),
                 skin_decodes: Arc::new(tokio::sync::Semaphore::new(1)),
+                appearance_writes: std::sync::Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 skin_decode_probe: std::sync::Mutex::new(None),
                 credentials: Arc::new(credentials),

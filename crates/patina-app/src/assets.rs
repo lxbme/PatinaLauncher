@@ -17,7 +17,8 @@ gpui_kit::assets::icon_assets!(
         Package,
         Cpu,
         MemoryStick,
-        SlidersHorizontal
+        SlidersHorizontal,
+        Shirt
     ]
 );
 
@@ -110,11 +111,16 @@ mod tests {
             IconName::Cpu,
             IconName::MemoryStick,
             IconName::SlidersHorizontal,
+            IconName::Shirt,
             IconName::Close,
         ] {
             let path = icon.path();
             assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");
         }
+        let shirt = AppAssets.load(&IconName::Shirt.path()).unwrap().unwrap();
+        let svg = std::str::from_utf8(&shirt).expect("Shirt SVG is UTF-8");
+        assert!(svg.contains("<svg") && svg.contains("</svg>"));
+        assert!(svg.contains("<path"), "Shirt SVG contains drawable paths");
         for name in crate::instances::BUILTIN_ICONS {
             let path = format!("instance-icons/{name}.png");
             assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");

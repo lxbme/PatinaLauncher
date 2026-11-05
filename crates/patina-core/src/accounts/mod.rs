@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub mod appearance;
+#[cfg(test)]
+mod appearance_tests;
 pub(crate) mod credentials;
 #[cfg(test)]
 mod credentials_tests;

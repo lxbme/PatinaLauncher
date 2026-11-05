@@ -101,6 +101,7 @@ impl Render for Rail {
             .child(self.render_item(Nav::Instances, Lucide::Boxes, cx))
             .child(self.render_item(Nav::Downloads, Lucide::Download, cx))
             .child(self.render_item(Nav::Accounts, IconName::CircleUser, cx))
+            .child(self.render_item(Nav::Appearance, Lucide::Shirt, cx))
             .child(div().flex_1())
             .child(self.render_item(Nav::Settings, IconName::Settings, cx))
     }

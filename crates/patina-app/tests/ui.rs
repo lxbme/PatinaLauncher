@@ -10461,3 +10461,6 @@ mod modpacks;
 
 #[path = "launch/diagnosis.rs"]
 mod diagnosis;
+
+#[path = "appearance/ui.rs"]
+mod appearance;

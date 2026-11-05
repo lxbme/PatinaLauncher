@@ -71,6 +71,14 @@ pub(crate) enum AuthRequest {
     Profile {
         access_token: SecretString,
     },
+    UploadSkin {
+        access_token: SecretString,
+        skin: super::appearance::SkinUpload,
+    },
+    ChangeCape {
+        access_token: SecretString,
+        id: Option<String>,
+    },
 }
 
 impl AuthRequest {
@@ -82,7 +90,9 @@ impl AuthRequest {
             Self::Xsts { .. } => AuthStage::Xsts,
             Self::MinecraftToken { .. } => AuthStage::MinecraftToken,
             Self::Entitlement { .. } => AuthStage::Entitlement,
-            Self::Profile { .. } => AuthStage::Profile,
+            Self::Profile { .. } | Self::UploadSkin { .. } | Self::ChangeCape { .. } => {
+                AuthStage::Profile
+            }
         }
     }
 }
@@ -131,6 +141,7 @@ impl AuthHttp {
     fn client() -> Result<Client, AuthError> {
         Client::builder()
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .no_proxy()
@@ -213,6 +224,26 @@ impl AuthHttp {
             AuthRequest::MinecraftToken { user_hash, xsts_token } => self.client.post(url).json(&serde_json::json!({
                 "identityToken": format!("XBL3.0 x={};{}", user_hash.expose(), xsts_token.expose()),
             })),
+            AuthRequest::UploadSkin { access_token, skin } => {
+                let mut url = url;
+                url.set_path(&format!("{}/skins", url.path()));
+                let part = reqwest::multipart::Part::bytes(skin.bytes().to_vec())
+                    .file_name("skin.png").mime_str("image/png")
+                    .map_err(|_| AuthError::InvalidResponse { stage })?;
+                let variant = match skin.model() { super::appearance::SkinModel::Classic => "classic", super::appearance::SkinModel::Slim => "slim" };
+                let form = reqwest::multipart::Form::new().text("variant", variant).part("file", part);
+                let mut bearer = header::HeaderValue::from_str(&format!("Bearer {}", access_token.expose())).map_err(|_| AuthError::InvalidResponse { stage })?;
+                bearer.set_sensitive(true);
+                self.client.post(url).header(header::AUTHORIZATION,bearer).multipart(form)
+            }
+            AuthRequest::ChangeCape { access_token, id } => {
+                let mut url = url;
+                url.set_path(&format!("{}/capes/active", url.path()));
+                let mut bearer = header::HeaderValue::from_str(&format!("Bearer {}", access_token.expose())).map_err(|_| AuthError::InvalidResponse { stage })?;
+                bearer.set_sensitive(true);
+                let request = match id { Some(id) => self.client.put(url).json(&serde_json::json!({"capeId":id})), None => self.client.delete(url) };
+                request.header(header::AUTHORIZATION,bearer)
+            }
             AuthRequest::Entitlement { access_token } | AuthRequest::Profile { access_token } => {
                 let mut bearer = header::HeaderValue::from_str(&format!("Bearer {}", access_token.expose()))
                     .map_err(|_| AuthError::InvalidResponse { stage })?;

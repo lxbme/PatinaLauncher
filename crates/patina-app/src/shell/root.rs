@@ -12,8 +12,10 @@ use gpui_kit::{
     ParentElement, Render, Styled, Subscription, TestSupportExt, WeakEntity, Window, actions, div,
 };
 
-use super::{Nav, OpenDownloads, Rail, ShellState, StatusBar, TitleBarView};
+use super::nav::NavigationRequested;
+use super::{Nav, OpenDownloads, OpenInstance, Rail, ShellState, StatusBar, TitleBarView};
 use crate::accounts::AccountsPage;
+use crate::appearance::{AppearancePage, LeavePolicy, confirm_leave};
 use crate::downloads::DownloadsPage;
 use crate::fonts;
 use crate::instances::{InstancesChanged, InstancesPage};
@@ -41,6 +43,9 @@ pub struct RootView {
     downloads: Entity<DownloadsPage>,
     accounts: Entity<AccountsPage>,
     settings: Entity<SettingsPage>,
+    appearance: Entity<AppearancePage>,
+    pending_destination: Option<Destination>,
+    _navigation: Subscription,
     focus: FocusHandle,
     closing: Rc<Cell<bool>>,
     _observe: Subscription,
@@ -59,6 +64,7 @@ impl RootView {
         let model = instances.read(cx).model().clone();
         let downloads = cx.new(|cx| DownloadsPage::new(model.clone(), window, cx));
         let accounts = cx.new(|cx| AccountsPage::new(window, cx));
+        let appearance = cx.new(|cx| AppearancePage::new(window, cx));
         let settings = cx.new(|cx| SettingsPage::new(model.clone(), window, cx));
         // This app's own instance operations change the status bar's
         // count and size at once, without waiting for its throttle.
@@ -75,13 +81,22 @@ impl RootView {
                 .unwrap_or_else(|| this.focus.clone());
             target.focus(window, cx);
         });
-        let page = instances.downgrade();
-        let settings_page = settings.downgrade();
         let closing = Rc::new(Cell::new(false));
-        window.on_window_should_close(cx, {
-            let closing = closing.clone();
-            move |window, cx| close_after_saving(&page, &settings_page, &closing, window, cx)
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |this, cx| {
+                this.request_leave(Destination::Close, window, cx)
+            })
+            .ok();
+            false
         });
+        let _navigation = cx.subscribe_in(
+            &shell,
+            window,
+            |this, _, event: &NavigationRequested, window, cx| {
+                this.request_leave(Destination::Page(event.0), window, cx);
+            },
+        );
         Self {
             title_bar: cx.new(|cx| {
                 TitleBarView::new(shell.clone(), instances.clone(), focus.clone(), window, cx)
@@ -92,7 +107,10 @@ impl RootView {
             downloads,
             accounts,
             settings,
-            _observe: cx.observe(&shell, |this, shell, cx| {
+            appearance,
+            pending_destination: None,
+            _navigation,
+            _observe: cx.observe_in(&shell, window, |this, shell, window, cx| {
                 let nav = shell.read(cx).nav();
                 this.instances
                     .update(cx, |page, cx| page.set_shown(nav == Nav::Instances, cx));
@@ -100,6 +118,9 @@ impl RootView {
                     Nav::Downloads => this.downloads.update(cx, |page, cx| page.shown(cx)),
                     Nav::Accounts => this.accounts.update(cx, |page, cx| page.shown(cx)),
                     Nav::Settings => this.settings.update(cx, |page, cx| page.shown(cx)),
+                    Nav::Appearance => this
+                        .appearance
+                        .update(cx, |page, cx| page.shown(window, cx)),
                     Nav::Instances => {}
                 }
                 cx.notify();
@@ -137,6 +158,10 @@ impl RootView {
         &self.accounts
     }
 
+    pub fn appearance(&self) -> &Entity<AppearancePage> {
+        &self.appearance
+    }
+
     pub fn settings(&self) -> &Entity<SettingsPage> {
         &self.settings
     }
@@ -172,7 +197,7 @@ impl RootView {
                 match after_launch_step(setting, *record_saved, busy) {
                     AfterLaunchStep::Stay => {}
                     AfterLaunchStep::Minimize => window.minimize_window(),
-                    AfterLaunchStep::Quit => cx.quit(),
+                    AfterLaunchStep::Quit => self.request_leave(Destination::Close, window, cx),
                     AfterLaunchStep::Skip(key) => {
                         let text = t!(key).to_string();
                         window.push_notification(Notification::warning(text), cx);
@@ -191,22 +216,134 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (target, query) = (action.target.as_deref(), action.query.as_deref());
-        self.downloads
-            .update(cx, |page, cx| page.open(target, query, window, cx));
-        self.shell
-            .update(cx, |s, cx| s.navigate(Nav::Downloads, cx));
+        self.request_leave(Destination::Downloads(action.clone()), window, cx);
+    }
+
+    fn open_instance(
+        &mut self,
+        action: &OpenInstance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_leave(Destination::Instance(action.clone()), window, cx);
     }
 
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
-        if close_after_saving(
-            &self.instances.downgrade(),
-            &self.settings.downgrade(),
-            &self.closing,
-            window,
-            cx,
-        ) {
-            window.remove_window();
+        self.request_leave(Destination::Close, window, cx);
+    }
+
+    fn request_leave(
+        &mut self,
+        destination: Destination,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_destination.is_some() {
+            return;
+        }
+        let policy = if self.shell.read(cx).nav() == Nav::Appearance {
+            self.appearance.read(cx).model().leave_policy()
+        } else {
+            LeavePolicy::Allow
+        };
+        if policy == LeavePolicy::Allow {
+            self.commit_destination(destination, window, cx);
+            return;
+        }
+        let name = self
+            .appearance
+            .read(cx)
+            .model()
+            .selected_name()
+            .unwrap_or_default()
+            .to_owned();
+        self.pending_destination = Some(destination);
+        let weak = cx.weak_entity();
+        let cancel_weak = weak.clone();
+        let confirm = Rc::new(move |window: &mut Window, cx: &mut App| {
+            weak.update(cx, |this, cx| {
+                if let Some(destination) = this.pending_destination.take() {
+                    this.commit_destination(destination, window, cx);
+                }
+            })
+            .ok();
+        });
+        let cancel = Rc::new(move |_: &mut Window, cx: &mut App| {
+            cancel_weak
+                .update(cx, |this, _| this.pending_destination = None)
+                .ok();
+        });
+        if !confirm_leave(policy, &name, confirm, cancel, window, cx) {
+            self.pending_destination = None;
+        }
+    }
+
+    fn commit_destination(
+        &mut self,
+        destination: Destination,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Destination::Instance(action) = &destination {
+            let model = self.instances.read(cx).model();
+            if !matches!(
+                model.read(cx).entry(action.id()),
+                Some(crate::instances::Entry::Healthy(_))
+            ) {
+                window.push_notification(
+                    Notification::warning(t!("shell.search.gone", name = action.id()).to_string()),
+                    cx,
+                );
+                return;
+            }
+        }
+        if self.shell.read(cx).nav() == Nav::Appearance {
+            self.appearance.update(cx, |page, cx| page.hidden(cx));
+        }
+        match destination {
+            Destination::Page(nav) => self.shell.update(cx, |s, cx| s.commit_navigation(nav, cx)),
+            Destination::Downloads(action) => {
+                self.downloads.update(cx, |page, cx| {
+                    page.open(
+                        action.target.as_deref(),
+                        action.query.as_deref(),
+                        window,
+                        cx,
+                    )
+                });
+                self.shell
+                    .update(cx, |s, cx| s.commit_navigation(Nav::Downloads, cx));
+            }
+            Destination::Instance(action) => {
+                let model = self.instances.read(cx).model().clone();
+                model.update(cx, |m, cx| m.select(action.id(), cx));
+                self.shell
+                    .update(cx, |s, cx| s.commit_navigation(Nav::Instances, cx));
+                if let Some(file) = action.mod_file() {
+                    let detail = self.instances.read(cx).detail().clone();
+                    detail.update(cx, |detail, cx| detail.show_mod(file, window, cx));
+                } else {
+                    let focus = self
+                        .instances
+                        .read(cx)
+                        .list()
+                        .read(cx)
+                        .focus_handle()
+                        .clone();
+                    focus.focus(window, cx);
+                }
+            }
+            Destination::Close => {
+                if close_after_saving(
+                    &self.instances.downgrade(),
+                    &self.settings.downgrade(),
+                    &self.closing,
+                    window,
+                    cx,
+                ) {
+                    window.remove_window();
+                }
+            }
         }
     }
 
@@ -227,9 +364,18 @@ impl RootView {
             Nav::Instances => page.child(self.instances.clone()).into_any_element(),
             Nav::Downloads => page.child(self.downloads.clone()).into_any_element(),
             Nav::Accounts => page.child(self.accounts.clone()).into_any_element(),
+            Nav::Appearance => page.child(self.appearance.clone()).into_any_element(),
             Nav::Settings => page.child(self.settings.clone()).into_any_element(),
         }
     }
+}
+
+#[derive(Clone)]
+enum Destination {
+    Page(Nav),
+    Downloads(OpenDownloads),
+    Instance(OpenInstance),
+    Close,
 }
 
 /// What the window does once a game has started.
@@ -325,6 +471,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_downloads))
+            .on_action(cx.listener(Self::open_instance))
             .size_full()
             .bg(bg)
             .text_color(fg)

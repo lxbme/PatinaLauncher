@@ -1,4 +1,9 @@
 errors:
+  appearance:
+    too_large: "PNG 超过 256 KiB。"
+    invalid_png: "无法解码此 PNG。"
+    dimensions: "皮肤须为 64×64 或 64×32 PNG，披风须为 64×32。"
+    legacy_slim: "64×32 皮肤仅支持经典模型。"
   auth:
     cancelled: "登录已取消。"
     expired: "登录代码已过期，请重试。"

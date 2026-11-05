@@ -34,7 +34,7 @@ pub use model::{
 pub use popup::search_row_id;
 
 use crate::instances::{Entry, InstancesPage, labelled};
-use crate::shell::{Nav, OpenDownloads, ShellState};
+use crate::shell::{OpenDownloads, ShellState};
 
 actions!(
     search,
@@ -72,7 +72,6 @@ pub fn init(cx: &mut App) {
 pub struct GlobalSearch {
     model: Entity<SearchModel>,
     input: Entity<InputState>,
-    shell: Entity<ShellState>,
     page: Entity<InstancesPage>,
     /// Whether the popup is on show (it also needs results to show).
     open: bool,
@@ -97,7 +96,7 @@ impl GlobalSearch {
     /// The search over `page`'s instances; `shell` is navigated to show a
     /// chosen result; `home_focus` is the shell's own focus.
     pub fn new(
-        shell: Entity<ShellState>,
+        _shell: Entity<ShellState>,
         page: Entity<InstancesPage>,
         home_focus: FocusHandle,
         window: &mut Window,
@@ -114,7 +113,6 @@ impl GlobalSearch {
         Self {
             model,
             input,
-            shell,
             page,
             open: false,
             cursor: 0,
@@ -299,11 +297,7 @@ impl GlobalSearch {
                     return;
                 }
                 self.return_focus = None;
-                model.update(cx, |m, cx| m.select(&id, cx));
-                self.shell
-                    .update(cx, |s, cx| s.navigate(Nav::Instances, cx));
-                let list = self.page.read(cx).list().read(cx).focus_handle().clone();
-                list.focus(window, cx);
+                window.dispatch_action(Box::new(crate::shell::OpenInstance::new(id)), cx);
             }
             SearchItem::Mod {
                 instance_id,
@@ -314,11 +308,10 @@ impl GlobalSearch {
                     return;
                 }
                 self.return_focus = None;
-                model.update(cx, |m, cx| m.select(&instance_id, cx));
-                self.shell
-                    .update(cx, |s, cx| s.navigate(Nav::Instances, cx));
-                let detail = self.page.read(cx).detail().clone();
-                detail.update(cx, |d, cx| d.show_mod(&file_name, window, cx));
+                window.dispatch_action(
+                    Box::new(crate::shell::OpenInstance::new(instance_id).with_mod_file(file_name)),
+                    cx,
+                );
             }
             SearchItem::Online => {
                 window.dispatch_action(

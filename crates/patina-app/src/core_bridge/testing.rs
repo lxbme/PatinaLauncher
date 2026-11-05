@@ -613,3 +613,23 @@ pub fn network_core_without_credentials(rt: Handle, data: DataDirs) -> Core {
     )
     .expect("network acceptance core starts")
 }
+
+/// Supplies a fixture-selected path to the same bounded file pipeline used by the native picker.
+/// This bypasses only the platform file dialog; it does not substitute bytes or page state.
+pub fn appearance_select_file(
+    page: &gpui_kit::Entity<crate::appearance::AppearancePage>,
+    path: std::path::PathBuf,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    page.update(cx, |page, cx| {
+        if let Some(ticket) = page.model().ticket() {
+            page.load_skin_file(ticket, path, window, cx);
+        }
+    });
+}
+
+/// Native-fixture observation only: no input, render scheduling, or image retention.
+pub fn appearance_render_count(page: &crate::appearance::AppearancePage) -> u64 {
+    page.renders_for_test()
+}
